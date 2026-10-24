@@ -749,7 +749,7 @@ impl eframe::App for App {
             });
         });
         if self.last_error != self.last_logged_error {
-            if !self.last_error.is_empty() {
+            if !self.last_error.is_empty() && !self.last_error.starts_with("클라이언트 오류:") {
                 self.state.lock().unwrap_or_else(std::sync::PoisonError::into_inner).note(format!("화면 오류: {}", self.last_error));
             }
             self.last_logged_error = self.last_error.clone();

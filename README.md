@@ -16,7 +16,7 @@ cargo build --release -p effectcraft-cli
 ```
 
 Windows용 릴리스 ZIP에는 `effectcraft-farm.exe`와 `effectcraft-cli.exe`가 함께 들어 있습니다. 소스에서 빌드할 때는 두 실행 파일을 같은 폴더에 두거나 앱에서 CLI 파일을 지정하세요.
-호스트와 모든 클라이언트에는 같은 버전의 Render Farm 앱과 EffectCraft CLI를 설치하세요. 0.5.0의 전송 프로토콜은 이전 버전과 호환되지 않으며, 버전이 다르면 연결 시 오류를 표시합니다.
+호스트와 모든 클라이언트에는 같은 버전의 Render Farm 앱과 EffectCraft CLI를 설치하세요. 0.5.1의 전송 프로토콜은 0.5.0과 같지만, 호스트 연결 안정성 수정이 포함되어 있으므로 모든 PC를 함께 업데이트하세요. 더 이전 버전은 연결 시 호환 오류를 표시합니다.
 앱 화면의 한글은 운영체제에 설치된 글꼴을 사용합니다. Windows에서는 맑은 고딕을 자동으로 불러옵니다.
 
 ## 사용 순서

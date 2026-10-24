@@ -949,6 +949,9 @@ fn receive_bundle(reader: &mut BufReader<TcpStream>, config: &mut Config, messag
 }
 
 fn serve_worker(mut stream: TcpStream, peer: SocketAddr, config: &Config, job: &Job, state: &Shared, stop: &AtomicBool) -> Result<(), String> {
+    // On Windows, sockets accepted by a nonblocking listener can remain
+    // nonblocking. The protocol uses blocking reads and writes on this stream.
+    stream.set_nonblocking(false).map_err(|e| format!("클라이언트 소켓 설정: {e}"))?;
     stream.set_read_timeout(Some(Duration::from_secs(3600))).map_err(|e| e.to_string())?;
     let mut reader = BufReader::new(stream.try_clone().map_err(|e| e.to_string())?);
     let (name, given_token, protocol) = match receive(&mut reader)? {
@@ -1716,18 +1719,19 @@ mod tests {
             ..State::default()
         }));
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        listener.set_nonblocking(true).unwrap();
         let address = listener.local_addr().unwrap();
+        let mut client = TcpStream::connect(address).unwrap();
+        let (stream, peer) = listener.accept().unwrap();
+        stream.set_nonblocking(true).unwrap();
         let server_state = state.clone();
         let server_job = job.clone();
         let server_config = config.clone();
-        let server = thread::spawn(move || {
-            let (stream, peer) = listener.accept().unwrap();
-            serve_worker(stream, peer, &server_config, &server_job, &server_state, &AtomicBool::new(false))
-        });
-        let mut client = TcpStream::connect(address).unwrap();
+        let server = thread::spawn(move || serve_worker(stream, peer, &server_config, &server_job, &server_state, &AtomicBool::new(false)));
         let mut reader = BufReader::new(client.try_clone().unwrap());
         send(&mut client, &Message::Hello { token: "password".into(), name: "test-worker".into(), protocol: PROTOCOL_VERSION }).unwrap();
         assert!(matches!(receive(&mut reader), Ok(Message::Ready { comp }) if comp == "Test"));
+        thread::sleep(Duration::from_millis(100));
         send(&mut client, &Message::Request).unwrap();
         assert!(matches!(receive(&mut reader), Ok(Message::Wait)));
         lock(&state).dispatch_enabled = true;
