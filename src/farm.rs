@@ -4,7 +4,7 @@ use std::net::{SocketAddr, TcpListener, TcpStream};
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, Mutex, PoisonError};
+use std::sync::{Arc, Mutex, OnceLock, PoisonError};
 use std::thread;
 use std::time::Duration;
 
@@ -23,7 +23,10 @@ fn project_hash(bytes: &[u8]) -> String {
 const MAX_LINE: usize = 4096;
 const MAX_FRAMES: i64 = 100_000;
 const MAX_WORKERS: usize = 64;
-const PROTOCOL_VERSION: u32 = 2;
+const PROTOCOL_VERSION: u32 = 3;
+const MAX_TRANSFER_FILE: u64 = 32 * 1024 * 1024 * 1024;
+const MAX_TRANSFER_TOTAL: u64 = 256 * 1024 * 1024 * 1024;
+const MAX_TRANSFER_FILES: usize = 20_000;
 const PNG_HEADER: &[u8] = b"\x89PNG\r\n\x1a\n";
 
 fn comp_frame_count(rate: FrameRate, duration: Tick) -> Result<i64, String> {
@@ -167,6 +170,7 @@ pub struct State {
     disabled_workers: Vec<String>,
     pub total: i64,
     pub output: PathBuf,
+    bundle: Arc<OnceLock<Result<Arc<TransferBundle>, String>>>,
 }
 
 pub type Shared = Arc<Mutex<State>>;
@@ -185,13 +189,33 @@ impl State {
 enum Message {
     Hello {
         token: String,
-        hash: String,
         name: String,
         #[serde(default)]
         protocol: u32,
     },
     Ready {
         comp: String,
+    },
+    Bundle {
+        comp: String,
+        project_len: u64,
+        project_sha256: String,
+        file_count: usize,
+        total: i64,
+        fps_num: i64,
+        fps_den: i64,
+        width: u32,
+        height: u32,
+    },
+    File {
+        name: String,
+        len: u64,
+        sha256: String,
+    },
+    Frame {
+        frame: i64,
+        len: u64,
+        sha256: String,
     },
     Request,
     Assign {
@@ -225,6 +249,14 @@ fn log(state: &Shared, message: impl Into<String>) {
 }
 
 pub fn read_job(config: &Config) -> Result<Job, String> {
+    read_job_impl(config, true)
+}
+
+fn read_job_without_preflight(config: &Config) -> Result<Job, String> {
+    read_job_impl(config, false)
+}
+
+fn read_job_impl(config: &Config, preflight: bool) -> Result<Job, String> {
     if config.token.trim().len() < 8 {
         return Err("접속 암호는 8자 이상이어야 합니다".into());
     }
@@ -241,14 +273,16 @@ pub fn read_job(config: &Config) -> Result<Job, String> {
     let rate = comp.frame_rate;
     let total = comp_frame_count(rate, comp.duration)?;
     if !config.output.is_dir() {
-        return Err(format!("공유 출력 폴더가 없습니다: {}", config.output.display()));
+        return Err(format!("프레임 저장 폴더가 없습니다: {}", config.output.display()));
     }
     let start = config.range_start;
     let end = if config.range_end == 0 { total } else { config.range_end };
     if start < 0 || end <= start || end > total {
         return Err(format!("렌더 범위는 0 이상 {total} 이하이며 시작 < 끝이어야 합니다"));
     }
-    preflight_resources(&project, **comp_id, &config.project)?;
+    if preflight {
+        preflight_resources(&project, **comp_id, &config.project)?;
+    }
     Ok(Job {
         hash: project_hash(&bytes),
         comp: config.comp.clone(),
@@ -289,10 +323,6 @@ fn read_project_bytes(path: &Path) -> Result<Vec<u8>, String> {
         return Err("프로젝트가 100MB 제한을 넘습니다".into());
     }
     Ok(bytes)
-}
-
-fn project_file_hash(path: &Path) -> Result<String, String> {
-    read_project_bytes(path).map(|bytes| project_hash(&bytes))
 }
 
 /// Check files and fonts used by the selected comp before any frame is assigned.
@@ -396,6 +426,167 @@ fn check_font(family: &str, style: &str, missing: &mut BTreeSet<String>) {
     }
 }
 
+struct TransferFile {
+    name: String,
+    source: PathBuf,
+    len: u64,
+    sha256: String,
+}
+
+struct TransferBundle {
+    project: Vec<u8>,
+    project_sha256: String,
+    files: Vec<TransferFile>,
+}
+
+#[derive(Default)]
+struct BundleBuilder {
+    files: Vec<TransferFile>,
+    names: BTreeMap<PathBuf, String>,
+    bytes: u64,
+}
+
+fn file_sha256(path: &Path) -> Result<String, String> {
+    let mut file = std::fs::File::open(path).map_err(|e| format!("파일 열기 {}: {e}", path.display()))?;
+    let mut hash = Sha256::new();
+    let mut buf = [0_u8; 128 * 1024];
+    loop {
+        let n = file.read(&mut buf).map_err(|e| format!("파일 읽기 {}: {e}", path.display()))?;
+        if n == 0 {
+            break;
+        }
+        hash.update(&buf[..n]);
+    }
+    Ok(format!("{:x}", hash.finalize()))
+}
+
+impl BundleBuilder {
+    fn add(&mut self, source: PathBuf, folder: &str) -> Result<String, String> {
+        let source = std::fs::canonicalize(&source).map_err(|e| format!("소스 경로 {}: {e}", source.display()))?;
+        if let Some(name) = self.names.get(&source) {
+            return Ok(name.clone());
+        }
+        if self.files.len() >= MAX_TRANSFER_FILES {
+            return Err("전송할 파일이 20,000개를 넘습니다".into());
+        }
+        let len = std::fs::metadata(&source).map_err(|e| format!("소스 정보 {}: {e}", source.display()))?.len();
+        self.bytes = self.bytes.checked_add(len).ok_or("전송 크기가 너무 큽니다")?;
+        if len > MAX_TRANSFER_FILE || self.bytes > MAX_TRANSFER_TOTAL {
+            return Err("소스 파일 또는 전송 합계가 크기 제한을 넘습니다".into());
+        }
+        let extension = source
+            .extension()
+            .and_then(|e| e.to_str())
+            .filter(|e| !e.is_empty() && e.len() <= 12 && e.bytes().all(|c| c.is_ascii_alphanumeric()))
+            .unwrap_or("bin");
+        let name = format!("{folder}/asset_{:06}.{extension}", self.files.len());
+        let sha256 = file_sha256(&source)?;
+        self.files.push(TransferFile { name: name.clone(), source: source.clone(), len, sha256 });
+        self.names.insert(source, name.clone());
+        Ok(name)
+    }
+}
+
+fn selected_items(project: &Project, root: ItemId) -> Result<Vec<ItemId>, String> {
+    let mut seen = BTreeSet::new();
+    let mut pending = vec![(root, 0_usize)];
+    while let Some((id, depth)) = pending.pop() {
+        if !seen.insert(id) {
+            continue;
+        }
+        if depth > 64 || seen.len() > MAX_TRANSFER_FILES {
+            return Err("프로젝트 참조가 너무 깊거나 많습니다".into());
+        }
+        let item = project.item(id).ok_or_else(|| format!("참조 항목 {}가 없습니다", id.0))?;
+        if let ItemKind::Comp(comp) = &item.kind {
+            for layer in &comp.layers {
+                if let Some(source) = layer.source.item() {
+                    pending.push((source, depth + 1));
+                }
+            }
+        }
+    }
+    Ok(seen.into_iter().collect())
+}
+
+fn rewrite_footage(footage: &mut Footage, project_path: &Path, builder: &mut BundleBuilder) -> Result<(), String> {
+    if footage.kind == FootageKind::Data && footage.data.is_some() {
+        return Ok(());
+    }
+    for stored in std::iter::once(&mut footage.path).chain(footage.sequence.iter_mut()) {
+        if stored.is_empty() {
+            continue;
+        }
+        let source = craft_docpath::resolve(stored, Some(project_path)).map_err(|e| format!("미디어 경로 {stored}: {e}"))?;
+        *stored = builder.add(source, "media")?;
+    }
+    Ok(())
+}
+
+fn add_fonts(root: &PropGroup, builder: &mut BundleBuilder) -> Result<(), String> {
+    let mut pending = vec![(root, 0_usize)];
+    while let Some((group, depth)) = pending.pop() {
+        if depth > 64 {
+            return Err("속성 그룹 중첩이 너무 깊습니다".into());
+        }
+        for node in &group.children {
+            match node {
+                Node::Group(child) => pending.push((child, depth + 1)),
+                Node::Prop(prop) => {
+                    for value in std::iter::once(&prop.value).chain(prop.keys.iter().map(|key| &key.value)) {
+                        if let Value::Text(doc) = value {
+                            for (family, style) in
+                                std::iter::once((&doc.font, &doc.style)).chain(doc.runs.iter().map(|run| (&run.style.font, &run.style.style)))
+                            {
+                                let resolved = effectcraft_text::fonts::resolve(family, style);
+                                if resolved.missing {
+                                    return Err(format!("호스트 글꼴을 찾을 수 없습니다: {family} / {style}"));
+                                }
+                                if let effectcraft_text::fonts::FaceData::File(path) = &effectcraft_text::fonts::face(resolved.face).info.data {
+                                    builder.add(path.clone(), "fonts")?;
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
+fn build_bundle(config: &Config, job: &Job) -> Result<TransferBundle, String> {
+    let bytes = read_project_bytes(&config.project)?;
+    if project_hash(&bytes) != job.hash {
+        return Err("렌더링 중 원본 프로젝트 파일이 변경됐습니다".into());
+    }
+    let source = std::str::from_utf8(&bytes).map_err(|e| format!("프로젝트 문자 인코딩: {e}"))?;
+    let mut project = Project::from_json(source).map_err(|e| format!("프로젝트 열기: {e}"))?;
+    let root = project.comps().find_map(|(id, _)| project.item(*id).filter(|item| item.name == job.comp).map(|_| *id)).ok_or("컴포지션을 찾지 못했습니다")?;
+    let ids = selected_items(&project, root)?;
+    let project_path = std::fs::canonicalize(&config.project).map_err(|e| format!("프로젝트 경로 확인: {e}"))?;
+    let mut builder = BundleBuilder::default();
+    for id in ids {
+        let item = project.item_mut(id).ok_or("참조 항목이 사라졌습니다")?;
+        if let ItemKind::Comp(comp) = &item.kind {
+            for layer in &comp.layers {
+                add_fonts(&layer.props, &mut builder)?;
+            }
+        }
+        if let ItemKind::Footage(footage) = &mut item.kind {
+            rewrite_footage(footage, &project_path, &mut builder)?;
+        }
+        if let Some(proxy) = item.proxy.as_mut().filter(|proxy| proxy.enabled) {
+            rewrite_footage(&mut proxy.footage, &project_path, &mut builder)?;
+        }
+    }
+    let project = project.to_file_json().map_err(|e| format!("전송용 프로젝트 생성: {e}"))?.into_bytes();
+    if project.len() > 100_000_000 {
+        return Err("전송용 프로젝트가 100MB를 넘습니다".into());
+    }
+    Ok(TransferBundle { project_sha256: project_hash(&project), project, files: builder.files })
+}
+
 fn prepare_output(job: &Job) -> Result<(), String> {
     let path = job.output.join("effectcraft-farm.json");
     let expected = Manifest::from(job);
@@ -409,7 +600,7 @@ fn prepare_output(job: &Job) -> Result<(), String> {
             existing.end = existing.frames;
         }
         if existing != expected {
-            return Err("공유 폴더에 다른 프로젝트의 렌더 결과가 있습니다".into());
+            return Err("프레임 저장 폴더에 다른 프로젝트의 렌더 결과가 있습니다".into());
         }
     } else {
         let mut has_frames = false;
@@ -421,7 +612,7 @@ fn prepare_output(job: &Job) -> Result<(), String> {
             }
         }
         if has_frames {
-            return Err("공유 폴더에 작업 정보 없는 기존 frame_ 파일이 있습니다".into());
+            return Err("프레임 저장 폴더에 작업 정보 없는 기존 frame_ 파일이 있습니다".into());
         }
         let bytes = serde_json::to_vec_pretty(&expected).map_err(|e| e.to_string())?;
         std::fs::write(&path, bytes).map_err(|e| format!("작업 정보 저장: {e}"))?;
@@ -495,6 +686,7 @@ pub fn start_coordinator(config: Config, state: Shared, stop: Arc<AtomicBool>) -
         s.assembly_started = false;
         s.final_status = "프레임 렌더링 대기".into();
         s.disabled_workers = config.disabled_workers.clone();
+        s.bundle = Arc::new(OnceLock::new());
     }
     log(&state, format!("호스트 시작: {} / {}–{}프레임", config.address, job.start, job.end));
     match listener.local_addr() {
@@ -556,11 +748,153 @@ fn send(stream: &mut TcpStream, message: &Message) -> Result<(), String> {
     stream.write_all(&bytes).map_err(|e| e.to_string())
 }
 
+fn send_path(stream: &mut TcpStream, path: &Path, expected_len: u64) -> Result<(), String> {
+    let file = std::fs::File::open(path).map_err(|e| format!("전송 파일 열기 {}: {e}", path.display()))?;
+    let copied = std::io::copy(&mut file.take(expected_len.saturating_add(1)), stream).map_err(|e| format!("파일 전송: {e}"))?;
+    if copied != expected_len {
+        return Err(format!("전송 중 파일 크기가 변경됐습니다: {}", path.display()));
+    }
+    Ok(())
+}
+
+fn receive_path(reader: &mut BufReader<TcpStream>, path: &Path, len: u64, sha256: &str) -> Result<(), String> {
+    if len > MAX_TRANSFER_FILE || sha256.len() != 64 || !sha256.bytes().all(|b| b.is_ascii_hexdigit()) {
+        return Err("파일 크기 또는 체크섬이 잘못됐습니다".into());
+    }
+    let mut file = std::fs::OpenOptions::new().write(true).create_new(true).open(path).map_err(|e| format!("수신 파일 만들기 {}: {e}", path.display()))?;
+    let result = (|| -> Result<(), String> {
+        let mut remaining = len;
+        let mut hash = Sha256::new();
+        let mut buf = [0_u8; 128 * 1024];
+        while remaining > 0 {
+            let limit = usize::try_from(remaining.min(buf.len() as u64)).map_err(|e| e.to_string())?;
+            let n = reader.read(&mut buf[..limit]).map_err(|e| format!("파일 수신: {e}"))?;
+            if n == 0 {
+                return Err("파일 수신 중 연결이 끊겼습니다".into());
+            }
+            file.write_all(&buf[..n]).map_err(|e| format!("수신 파일 저장: {e}"))?;
+            hash.update(&buf[..n]);
+            remaining -= n as u64;
+        }
+        file.sync_all().map_err(|e| format!("수신 파일 확정: {e}"))?;
+        if format!("{:x}", hash.finalize()) != sha256.to_ascii_lowercase() {
+            return Err("수신 파일 SHA-256이 다릅니다".into());
+        }
+        Ok(())
+    })();
+    drop(file);
+    if result.is_err() {
+        let _ = std::fs::remove_file(path);
+    }
+    result
+}
+
+fn send_bundle(stream: &mut TcpStream, bundle: &TransferBundle, job: &Job) -> Result<(), String> {
+    send(
+        stream,
+        &Message::Bundle {
+            comp: job.comp.clone(),
+            project_len: bundle.project.len() as u64,
+            project_sha256: bundle.project_sha256.clone(),
+            file_count: bundle.files.len(),
+            total: job.total,
+            fps_num: job.rate.num,
+            fps_den: job.rate.den,
+            width: job.width,
+            height: job.height,
+        },
+    )?;
+    stream.write_all(&bundle.project).map_err(|e| format!("프로젝트 전송: {e}"))?;
+    for file in &bundle.files {
+        send(stream, &Message::File { name: file.name.clone(), len: file.len, sha256: file.sha256.clone() })?;
+        send_path(stream, &file.source, file.len)?;
+    }
+    Ok(())
+}
+
+struct TempWorkspace {
+    root: PathBuf,
+    cleaned: bool,
+}
+
+impl TempWorkspace {
+    fn new() -> Result<Self, String> {
+        let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_err(|e| format!("임시 폴더 시간: {e}"))?.as_nanos();
+        let root = std::env::temp_dir().join(format!("effectcraft-farm-worker-{}-{now}", std::process::id()));
+        std::fs::create_dir(&root).map_err(|e| format!("클라이언트 임시 폴더 만들기: {e}"))?;
+        Ok(Self { root, cleaned: false })
+    }
+
+    fn cleanup(&mut self) -> Result<(), String> {
+        std::fs::remove_dir_all(&self.root).map_err(|e| format!("클라이언트 임시 데이터 삭제 {}: {e}", self.root.display()))?;
+        self.cleaned = true;
+        Ok(())
+    }
+}
+
+impl Drop for TempWorkspace {
+    fn drop(&mut self) {
+        if !self.cleaned {
+            let _ = std::fs::remove_dir_all(&self.root);
+        }
+    }
+}
+
+fn safe_bundle_name(name: &str) -> bool {
+    let path = Path::new(name);
+    let mut parts = path.components();
+    matches!(parts.next(), Some(std::path::Component::Normal(first)) if first == "media" || first == "fonts")
+        && matches!(parts.next(), Some(std::path::Component::Normal(_)))
+        && parts.next().is_none()
+        && name.len() <= 100
+}
+
+fn receive_bundle(reader: &mut BufReader<TcpStream>, config: &mut Config, message: Message) -> Result<(TempWorkspace, Job), String> {
+    let Message::Bundle { comp, project_len, project_sha256, file_count, total, fps_num, fps_den, width, height } = message else {
+        return Err("전송용 프로젝트 정보가 없습니다".into());
+    };
+    if project_len > 100_000_000 || file_count > MAX_TRANSFER_FILES || project_sha256.len() != 64 || !project_sha256.bytes().all(|b| b.is_ascii_hexdigit()) {
+        return Err("전송용 프로젝트 크기 또는 정보가 잘못됐습니다".into());
+    }
+    let workspace = TempWorkspace::new()?;
+    let project_path = workspace.root.join("project.ecproj");
+    receive_path(reader, &project_path, project_len, &project_sha256)?;
+    let mut total_bytes = project_len;
+    for _ in 0..file_count {
+        let Message::File { name, len, sha256 } = receive(reader)? else {
+            return Err("소스 파일 정보가 잘못됐습니다".into());
+        };
+        if !safe_bundle_name(&name) {
+            return Err("허용되지 않는 소스 파일 이름입니다".into());
+        }
+        total_bytes = total_bytes.checked_add(len).ok_or("전송 크기가 너무 큽니다")?;
+        if total_bytes > MAX_TRANSFER_TOTAL {
+            return Err("전송 합계가 크기 제한을 넘습니다".into());
+        }
+        let target = workspace.root.join(&name);
+        let parent = target.parent().ok_or("소스 폴더가 없습니다")?;
+        std::fs::create_dir_all(parent).map_err(|e| format!("소스 폴더 만들기: {e}"))?;
+        receive_path(reader, &target, len, &sha256)?;
+    }
+    let output = workspace.root.join("frames");
+    std::fs::create_dir(&output).map_err(|e| format!("임시 프레임 폴더 만들기: {e}"))?;
+    config.project = project_path;
+    config.output = output;
+    config.comp = comp;
+    config.range_start = 0;
+    config.range_end = total;
+    let job = read_job_without_preflight(config)?;
+    if job.total != total || job.rate.num != fps_num || job.rate.den != fps_den || job.width != width || job.height != height {
+        return Err("호스트 작업 설정이 전송된 프로젝트와 다릅니다".into());
+    }
+    Ok((workspace, job))
+}
+
 fn serve_worker(mut stream: TcpStream, peer: SocketAddr, config: &Config, job: &Job, state: &Shared, stop: &AtomicBool) -> Result<(), String> {
     stream.set_read_timeout(Some(Duration::from_secs(3600))).map_err(|e| e.to_string())?;
     let mut reader = BufReader::new(stream.try_clone().map_err(|e| e.to_string())?);
-    let (name, hash, given_token, protocol) = match receive(&mut reader)? {
-        Message::Hello { token, hash, name, protocol } => (name, hash, token, protocol),
+    let (name, given_token, protocol) = match receive(&mut reader)? {
+        Message::Hello { token, name, protocol, .. } => (name, token, protocol),
         _ => return Err("인증 메시지가 필요합니다".into()),
     };
     if protocol != PROTOCOL_VERSION {
@@ -572,8 +906,8 @@ fn serve_worker(mut stream: TcpStream, peer: SocketAddr, config: &Config, job: &
         )?;
         return Err("호환되지 않는 클라이언트 버전".into());
     }
-    if given_token != config.token || hash != job.hash || name.len() > 80 {
-        send(&mut stream, &Message::Error { detail: "접속 암호 또는 프로젝트가 올바르지 않습니다".into() })?;
+    if given_token != config.token || name.len() > 80 {
+        send(&mut stream, &Message::Error { detail: "접속 암호가 올바르지 않습니다".into() })?;
         return Err("접속 정보 검증 실패".into());
     }
     let ip = peer.ip().to_string();
@@ -611,6 +945,8 @@ fn serve_worker(mut stream: TcpStream, peer: SocketAddr, config: &Config, job: &
     }
     log(state, format!("{label} 연결"));
     let mut assigned: Option<(i64, i64)> = None;
+    let mut prepared = false;
+    let mut received_frames = 0_i64;
     let result = (|| -> Result<(), String> {
         loop {
             match receive(&mut reader) {
@@ -619,10 +955,30 @@ fn serve_worker(mut stream: TcpStream, peer: SocketAddr, config: &Config, job: &
                         send(&mut stream, &Message::Finished)?;
                         break Ok(());
                     }
+                    let may_prepare = {
+                        let s = lock(state);
+                        s.dispatch_enabled
+                            && s.worker_info.get(&worker_id).is_some_and(|worker| worker.enabled)
+                            && s.chunks.iter().any(|chunk| chunk.status == ChunkStatus::Pending)
+                            && s.chunks.iter().filter(|chunk| chunk.status == ChunkStatus::Running).count() < s.max_workers
+                    };
+                    if may_prepare && !prepared {
+                        log(state, format!("{label}: 프로젝트와 소스 전송 중"));
+                        let cache = { lock(state).bundle.clone() };
+                        let bundle = cache.get_or_init(|| build_bundle(config, job).map(Arc::new)).clone();
+                        let transfer = bundle.and_then(|bundle| send_bundle(&mut stream, &bundle, job));
+                        if let Err(error) = transfer {
+                            let _ = send(&mut stream, &Message::Error { detail: error.clone() });
+                            return Err(error);
+                        }
+                        prepared = true;
+                        log(state, format!("{label}: 소스 전송 완료"));
+                        continue;
+                    }
                     let next = {
                         let mut s = lock(state);
                         let finished = s.chunks.iter().all(|c| matches!(c.status, ChunkStatus::Done | ChunkStatus::Failed));
-                        let enabled = s.dispatch_enabled && s.worker_info.get(&worker_id).is_some_and(|w| w.enabled);
+                        let enabled = prepared && s.dispatch_enabled && s.worker_info.get(&worker_id).is_some_and(|w| w.enabled);
                         let available = s.chunks.iter().filter(|c| c.status == ChunkStatus::Running).count() < s.max_workers;
                         if finished {
                             None
@@ -644,6 +1000,7 @@ fn serve_worker(mut stream: TcpStream, peer: SocketAddr, config: &Config, job: &
                     match next {
                         Some((start, end)) => {
                             assigned = next;
+                            received_frames = 0;
                             send(&mut stream, &Message::Assign { start, end, fps_num: job.rate.num, fps_den: job.rate.den, comp: job.comp.clone() })?;
                         }
                         None => {
@@ -657,8 +1014,26 @@ fn serve_worker(mut stream: TcpStream, peer: SocketAddr, config: &Config, job: &
                         }
                     }
                 }
+                Ok(Message::Frame { frame, len, sha256 }) if assigned.is_some() => {
+                    let (start, end) = assigned.ok_or("작업 구간이 없습니다")?;
+                    if frame != start.saturating_add(received_frames) || frame >= end || len > 512 * 1024 * 1024 {
+                        break Err("프레임 번호 또는 크기가 작업 지시와 다릅니다".into());
+                    }
+                    let target = frame_path(&job.output, frame);
+                    let partial = job.output.join(format!("frame_{frame:05}.worker_{worker_id}.partial"));
+                    receive_path(&mut reader, &partial, len, &sha256)?;
+                    if !valid_png(&partial) {
+                        let _ = std::fs::remove_file(&partial);
+                        break Err(format!("수신 프레임 {frame}이 손상됐습니다"));
+                    }
+                    if target.exists() {
+                        std::fs::remove_file(&target).map_err(|e| format!("이전 프레임 교체: {e}"))?;
+                    }
+                    std::fs::rename(&partial, &target).map_err(|e| format!("프레임 확정: {e}"))?;
+                    received_frames += 1;
+                }
                 Ok(Message::Complete { start, end, ok, detail }) if assigned == Some((start, end)) => {
-                    let verified = ok && chunk_complete(&job.output, start, end);
+                    let verified = ok && received_frames == end - start && chunk_complete(&job.output, start, end);
                     {
                         let mut s = lock(state);
                         if let Some(chunk) = s.chunks.iter_mut().find(|c| c.start == start && c.end == end) {
@@ -730,40 +1105,60 @@ pub fn begin_render(config: &Config, job: &Job, state: &Shared) {
 }
 
 pub fn run_worker(config: Config, state: Shared, stop: Arc<AtomicBool>) -> Result<(), String> {
-    let hash = project_file_hash(&config.project)?;
+    if !config.cli.is_file() {
+        return Err(format!("렌더 CLI 파일이 없습니다: {}", config.cli.display()));
+    }
     let mut stream = TcpStream::connect(&config.address).map_err(|e| format!("서버 연결: {e}"))?;
-    stream.set_read_timeout(Some(Duration::from_secs(30))).map_err(|e| e.to_string())?;
+    stream.set_read_timeout(Some(Duration::from_secs(3600))).map_err(|e| e.to_string())?;
     let mut reader = BufReader::new(stream.try_clone().map_err(|e| e.to_string())?);
     let name = std::env::var("COMPUTERNAME").or_else(|_| std::env::var("HOSTNAME")).unwrap_or_else(|_| "worker".into());
-    send(&mut stream, &Message::Hello { token: config.token.clone(), hash, name, protocol: PROTOCOL_VERSION })?;
+    send(&mut stream, &Message::Hello { token: config.token.clone(), name, protocol: PROTOCOL_VERSION })?;
     let comp = match receive(&mut reader)? {
         Message::Ready { comp } => comp,
         Message::Error { detail } => return Err(detail),
         _ => return Err("서버 인증 응답이 잘못됐습니다".into()),
     };
     let mut config = config;
-    config.comp = comp;
-    let job = match read_job(&config) {
-        Ok(job) => job,
-        Err(error) => {
-            let _ = send(&mut stream, &Message::Error { detail: "클라이언트 리소스 검사 실패".into() });
-            return Err(error);
-        }
-    };
-    log(&state, format!("렌더 준비 완료: {}", job.comp));
+    let mut workspace: Option<TempWorkspace> = None;
+    let mut job: Option<Job> = None;
+    log(&state, format!("호스트 연결 완료 · {comp} · 렌더 지시 대기"));
     while !stop.load(Ordering::Relaxed) {
         send(&mut stream, &Message::Request)?;
         match receive(&mut reader)? {
+            message @ Message::Bundle { .. } if workspace.is_none() => {
+                log(&state, "호스트에서 프로젝트·소스 수신 중");
+                let (received_workspace, received_job) = receive_bundle(&mut reader, &mut config, message)?;
+                if received_job.comp != comp {
+                    return Err("호스트 컴포지션 지시가 변경됐습니다".into());
+                }
+                log(&state, format!("렌더 준비 완료: {}", received_job.comp));
+                job = Some(received_job);
+                workspace = Some(received_workspace);
+            }
             Message::Assign { start, end, fps_num, fps_den, comp } => {
+                let job = job.as_ref().ok_or("호스트 프로젝트를 아직 받지 못했습니다")?;
                 if start < 0 || end <= start || end > job.total || fps_num != job.rate.num || fps_den != job.rate.den || comp != job.comp {
                     return Err("서버 작업 범위 또는 설정이 프로젝트와 다릅니다".into());
                 }
                 log(&state, format!("렌더링: {start}–{end}"));
-                let result = render_chunk(&config, &job, start, end);
+                let result = render_chunk(&config, job, start, end);
                 let (ok, detail) = match result {
                     Ok(()) => (true, "".into()),
                     Err(e) => (false, e),
                 };
+                if ok {
+                    for frame in start..end {
+                        let path = frame_path(&job.output, frame);
+                        let len = std::fs::metadata(&path).map_err(|e| format!("전송 프레임 정보: {e}"))?.len();
+                        if len > 512 * 1024 * 1024 {
+                            return Err(format!("프레임 {frame}이 512MB를 넘습니다"));
+                        }
+                        let sha256 = file_sha256(&path)?;
+                        send(&mut stream, &Message::Frame { frame, len, sha256 })?;
+                        send_path(&mut stream, &path, len)?;
+                        std::fs::remove_file(&path).map_err(|e| format!("전송한 임시 프레임 삭제: {e}"))?;
+                    }
+                }
                 send(&mut stream, &Message::Complete { start, end, ok, detail })?;
                 log(&state, format!("구간 {start}–{end} {} · 다음 작업 대기", if ok { "완료" } else { "실패" }));
             }
@@ -779,6 +1174,10 @@ pub fn run_worker(config: Config, state: Shared, stop: Arc<AtomicBool>) -> Resul
     if stop.load(Ordering::Relaxed) {
         let _ = send(&mut stream, &Message::Disconnect);
     }
+    if let Some(mut workspace) = workspace {
+        workspace.cleanup()?;
+    }
+    log(&state, "클라이언트 임시 프로젝트·소스·프레임 삭제 완료");
     Ok(())
 }
 
@@ -803,6 +1202,12 @@ fn render_chunk(config: &Config, job: &Job, start: i64, end: i64) -> Result<(), 
         .arg(end_s);
     if config.gpu {
         command.arg("--gpu");
+    }
+    if let Some(root) = config.project.parent() {
+        let fonts = root.join("fonts");
+        if fonts.is_dir() {
+            command.env("EFFECTCRAFT_FONT_DIRS", fonts);
+        }
     }
     let output = command.output().map_err(|e| format!("렌더 CLI 실행: {e}"))?;
     if !output.status.success() {
@@ -981,6 +1386,28 @@ mod tests {
     use effectcraft_project::{Comp, ItemKind};
     use effectcraft_time::Tick;
 
+    fn receive_test_bundle(reader: &mut BufReader<TcpStream>) {
+        let Message::Bundle { project_len, file_count, .. } = receive(reader).unwrap() else { panic!("bundle expected") };
+        let mut project = vec![0_u8; project_len as usize];
+        reader.read_exact(&mut project).unwrap();
+        assert!(Project::from_json(std::str::from_utf8(&project).unwrap()).is_ok());
+        for _ in 0..file_count {
+            let Message::File { len, .. } = receive(reader).unwrap() else { panic!("file expected") };
+            std::io::copy(&mut reader.take(len), &mut std::io::sink()).unwrap();
+        }
+    }
+
+    fn send_test_frames(stream: &mut TcpStream, start: i64, end: i64) {
+        for frame in start..end {
+            let mut bytes = PNG_HEADER.to_vec();
+            bytes.extend_from_slice(&[0, 0, 0, 0]);
+            bytes.extend_from_slice(b"IEND");
+            bytes.extend_from_slice(&[0, 0, 0, 0]);
+            send(stream, &Message::Frame { frame, len: bytes.len() as u64, sha256: project_hash(&bytes) }).unwrap();
+            stream.write_all(&bytes).unwrap();
+        }
+    }
+
     #[test]
     fn partial_final_frame_counts_without_requiring_aligned_duration() {
         let rate = FrameRate::new(30_000, 1001);
@@ -1021,6 +1448,18 @@ mod tests {
     fn invalid_png_is_not_complete() {
         let dir = std::env::temp_dir().join(format!("effectcraft-farm-test-{}", std::process::id()));
         assert!(!chunk_complete(&dir, 0, 1));
+    }
+
+    #[test]
+    fn client_workspace_deletes_received_files_and_rejects_traversal_names() {
+        assert!(safe_bundle_name("media/asset_000001.png"));
+        assert!(!safe_bundle_name("media/../secret.txt"));
+        assert!(!safe_bundle_name("C:/secret.txt"));
+        let mut workspace = TempWorkspace::new().unwrap();
+        let path = workspace.root.join("project.ecproj");
+        std::fs::write(&path, b"temporary").unwrap();
+        workspace.cleanup().unwrap();
+        assert!(!path.exists());
     }
 
     #[test]
@@ -1090,20 +1529,13 @@ mod tests {
     fn tcp_worker_receives_and_completes_range() {
         let dir = std::env::temp_dir().join(format!("effectcraft-farm-tcp-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
-        let job = Job {
-            hash: "same-project".into(),
-            comp: "Test".into(),
-            rate: FrameRate::FPS_60,
-            total: 2,
-            start: 0,
-            end: 2,
-            width: 2,
-            height: 2,
-            output: dir.clone(),
-        };
+        let mut project = Project::default();
+        project.add_item("Test", Label::None, None, ItemKind::Comp(Arc::new(Comp::new(2, 2, FrameRate::FPS_60, FrameRate::FPS_60.tick_of(2)))));
+        let project_path = dir.join("test.ecproj");
+        std::fs::write(&project_path, project.to_json()).unwrap();
         let config = Config {
-            project: dir.join("test.ecproj"),
-            cli: dir.join("cli.exe"),
+            project: project_path,
+            cli: std::env::current_exe().unwrap(),
             output: dir.clone(),
             comp: "Test".into(),
             address: "127.0.0.1:0".into(),
@@ -1116,6 +1548,7 @@ mod tests {
             final_video: dir.join("final.mp4"),
             disabled_workers: Vec::new(),
         };
+        let job = read_job(&config).unwrap();
         let state = Arc::new(Mutex::new(State {
             chunks: vec![Chunk { start: 0, end: 2, status: ChunkStatus::Pending, attempts: 0, worker: String::new() }],
             total: 2,
@@ -1135,7 +1568,7 @@ mod tests {
         });
         let mut client = TcpStream::connect(address).unwrap();
         let mut reader = BufReader::new(client.try_clone().unwrap());
-        send(&mut client, &Message::Hello { token: "password".into(), hash: job.hash, name: "test-worker".into(), protocol: PROTOCOL_VERSION }).unwrap();
+        send(&mut client, &Message::Hello { token: "password".into(), name: "test-worker".into(), protocol: PROTOCOL_VERSION }).unwrap();
         assert!(matches!(receive(&mut reader), Ok(Message::Ready { comp }) if comp == "Test"));
         send(&mut client, &Message::Request).unwrap();
         assert!(matches!(receive(&mut reader), Ok(Message::Wait)));
@@ -1148,14 +1581,10 @@ mod tests {
         assert_eq!(set_worker_enabled(&state, worker_id, true).as_deref(), Some("127.0.0.1"));
         assert!(lock(&state).disabled_workers.is_empty());
         send(&mut client, &Message::Request).unwrap();
+        receive_test_bundle(&mut reader);
+        send(&mut client, &Message::Request).unwrap();
         assert!(matches!(receive(&mut reader), Ok(Message::Assign { start: 0, end: 2, .. })));
-        for frame in 0..2 {
-            let mut bytes = PNG_HEADER.to_vec();
-            bytes.extend_from_slice(&[0, 0, 0, 0]);
-            bytes.extend_from_slice(b"IEND");
-            bytes.extend_from_slice(&[0, 0, 0, 0]);
-            std::fs::write(frame_path(&dir, frame), bytes).unwrap();
-        }
+        send_test_frames(&mut client, 0, 2);
         send(&mut client, &Message::Complete { start: 0, end: 2, ok: true, detail: String::new() }).unwrap();
         send(&mut client, &Message::Request).unwrap();
         assert!(matches!(receive(&mut reader), Ok(Message::Finished)));
@@ -1172,13 +1601,19 @@ mod tests {
         let project_path = dir.join("project.ecproj");
         let mut project = Project::default();
         let comp = Comp::new(64, 64, FrameRate::FPS_60, Tick::from_seconds_f64(1.0));
-        project.add_item("Host Choice", Label::None, None, ItemKind::Comp(Arc::new(comp)));
+        let comp_id = project.add_item("Host Choice", Label::None, None, ItemKind::Comp(Arc::new(comp.clone())));
+        let media_path = dir.join("source.png");
+        std::fs::write(&media_path, b"source fixture").unwrap();
+        let footage = Footage { path: media_path.to_string_lossy().into_owned(), kind: FootageKind::Still, ..Footage::default() };
+        let footage_id = project.add_item("Source", Label::None, None, ItemKind::Footage(footage));
+        let layer = effectcraft_project::build::layer(&mut project, &comp, "Source", LayerSource::Footage { item: footage_id }, (64, 64), Some(comp.duration));
+        project.comp_mut(comp_id).unwrap().layers.push(layer);
         std::fs::write(&project_path, project.to_json()).unwrap();
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
         let address = listener.local_addr().unwrap();
         let mut config = Config {
-            project: project_path,
-            cli: std::env::current_exe().unwrap(),
+            project: project_path.clone(),
+            cli: project_path,
             output: dir.clone(),
             comp: "Host Choice".into(),
             address: address.to_string(),
@@ -1192,7 +1627,18 @@ mod tests {
             disabled_workers: Vec::new(),
         };
         let job = read_job(&config).unwrap();
-        let state = Arc::new(Mutex::new(State::default()));
+        let bundle = build_bundle(&config, &job).unwrap();
+        assert_eq!(bundle.files.len(), 1);
+        let transferred = Project::from_json(std::str::from_utf8(&bundle.project).unwrap()).unwrap();
+        let rewritten = transferred.item(footage_id).unwrap();
+        assert!(matches!(&rewritten.kind, ItemKind::Footage(f) if f.path.starts_with("media/asset_")));
+        let state = Arc::new(Mutex::new(State {
+            chunks: vec![Chunk { start: 0, end: 60, status: ChunkStatus::Pending, attempts: 0, worker: String::new() }],
+            dispatch_enabled: true,
+            max_workers: 1,
+            output: dir.clone(),
+            ..State::default()
+        }));
         let stop = Arc::new(AtomicBool::new(false));
         let server_state = state.clone();
         let server_stop = stop.clone();
@@ -1219,15 +1665,90 @@ mod tests {
     }
 
     #[test]
+    fn real_cli_renders_from_host_transfer_without_client_project_or_shared_folder() {
+        let Some(cli) = std::env::var_os("EFFECTCRAFT_FARM_TEST_CLI").map(PathBuf::from) else { return };
+        let suffix = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos();
+        let dir = std::env::temp_dir().join(format!("effectcraft-farm-transfer-render-{}-{suffix}", std::process::id()));
+        std::fs::create_dir(&dir).unwrap();
+        let source = dir.join("source.png");
+        image::RgbaImage::from_pixel(16, 16, image::Rgba([60, 110, 170, 255])).save(&source).unwrap();
+        let mut project = Project::default();
+        let rate = FrameRate::FPS_60;
+        let comp = Comp::new(16, 16, rate, rate.tick_of(2));
+        let comp_id = project.add_item("Transfer Test", Label::None, None, ItemKind::Comp(Arc::new(comp.clone())));
+        let footage =
+            Footage { path: source.to_string_lossy().into_owned(), kind: FootageKind::Still, width: 16, height: 16, has_video: true, ..Footage::default() };
+        let footage_id = project.add_item("Source", Label::None, None, ItemKind::Footage(footage));
+        let layer = effectcraft_project::build::layer(&mut project, &comp, "Source", LayerSource::Footage { item: footage_id }, (16, 16), Some(comp.duration));
+        project.comp_mut(comp_id).unwrap().layers.push(layer);
+        let project_path = dir.join("host.ecproj");
+        std::fs::write(&project_path, project.to_file_json().unwrap()).unwrap();
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        let host = Config {
+            project: project_path,
+            cli: cli.clone(),
+            output: dir.clone(),
+            comp: "Transfer Test".into(),
+            address: address.to_string(),
+            token: "test-password".into(),
+            gpu: false,
+            range_start: 0,
+            range_end: 2,
+            chunk_frames: 2,
+            max_workers: 1,
+            final_video: dir.join("final.mp4"),
+            disabled_workers: Vec::new(),
+        };
+        let job = read_job(&host).unwrap();
+        let state = Arc::new(Mutex::new(State {
+            chunks: vec![Chunk { start: 0, end: 2, status: ChunkStatus::Pending, attempts: 0, worker: String::new() }],
+            total: 2,
+            max_workers: 1,
+            dispatch_enabled: true,
+            assembly_started: true,
+            output: dir.clone(),
+            ..State::default()
+        }));
+        let server_state = state.clone();
+        let server = thread::spawn(move || {
+            let (stream, peer) = listener.accept().unwrap();
+            serve_worker(stream, peer, &host, &job, &server_state, &AtomicBool::new(false))
+        });
+        let client = Config {
+            project: dir.join("missing-client.ecproj"),
+            cli,
+            output: dir.join("missing-shared-folder"),
+            comp: "stale".into(),
+            address: address.to_string(),
+            token: "test-password".into(),
+            gpu: false,
+            range_start: 0,
+            range_end: 0,
+            chunk_frames: 1,
+            max_workers: 1,
+            final_video: dir.join("unused.mp4"),
+            disabled_workers: Vec::new(),
+        };
+        assert!(run_worker(client, state.clone(), Arc::new(AtomicBool::new(false))).is_ok());
+        assert!(server.join().unwrap().is_ok());
+        assert!(chunk_complete(&dir, 0, 2));
+        assert!(lock(&state).messages.iter().any(|message| message.contains("임시 프로젝트·소스·프레임 삭제 완료")));
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
     fn host_caps_simultaneous_workers_and_assigns_next_client() {
         let suffix = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos();
         let dir = std::env::temp_dir().join(format!("effectcraft-farm-multi-{}-{suffix}", std::process::id()));
         std::fs::create_dir(&dir).unwrap();
-        let job =
-            Job { hash: "same".into(), comp: "Test".into(), rate: FrameRate::FPS_60, total: 4, start: 0, end: 4, width: 2, height: 2, output: dir.clone() };
+        let mut project = Project::default();
+        project.add_item("Test", Label::None, None, ItemKind::Comp(Arc::new(Comp::new(2, 2, FrameRate::FPS_60, FrameRate::FPS_60.tick_of(4)))));
+        let project_path = dir.join("source.ecproj");
+        std::fs::write(&project_path, project.to_json()).unwrap();
         let config = Config {
-            project: dir.join("source.ecproj"),
-            cli: dir.join("cli.exe"),
+            project: project_path,
+            cli: std::env::current_exe().unwrap(),
             output: dir.clone(),
             comp: "Test".into(),
             address: "127.0.0.1:0".into(),
@@ -1240,6 +1761,7 @@ mod tests {
             final_video: dir.join("final.mp4"),
             disabled_workers: Vec::new(),
         };
+        let job = read_job(&config).unwrap();
         let state = Arc::new(Mutex::new(State {
             chunks: vec![
                 Chunk { start: 0, end: 2, status: ChunkStatus::Pending, attempts: 0, worker: String::new() },
@@ -1271,24 +1793,20 @@ mod tests {
         let mut first = TcpStream::connect(address).unwrap();
         first.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
         let mut first_reader = BufReader::new(first.try_clone().unwrap());
-        send(&mut first, &Message::Hello { token: "password".into(), hash: "same".into(), name: "first".into(), protocol: PROTOCOL_VERSION }).unwrap();
+        send(&mut first, &Message::Hello { token: "password".into(), name: "first".into(), protocol: PROTOCOL_VERSION }).unwrap();
         assert!(matches!(receive(&mut first_reader), Ok(Message::Ready { comp }) if comp == "Test"));
+        send(&mut first, &Message::Request).unwrap();
+        receive_test_bundle(&mut first_reader);
         send(&mut first, &Message::Request).unwrap();
         assert!(matches!(receive(&mut first_reader), Ok(Message::Assign { start: 0, end: 2, .. })));
         let mut second = TcpStream::connect(address).unwrap();
         second.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
         let mut second_reader = BufReader::new(second.try_clone().unwrap());
-        send(&mut second, &Message::Hello { token: "password".into(), hash: "same".into(), name: "second".into(), protocol: PROTOCOL_VERSION }).unwrap();
+        send(&mut second, &Message::Hello { token: "password".into(), name: "second".into(), protocol: PROTOCOL_VERSION }).unwrap();
         assert!(matches!(receive(&mut second_reader), Ok(Message::Ready { comp }) if comp == "Test"));
         send(&mut second, &Message::Request).unwrap();
         assert!(matches!(receive(&mut second_reader), Ok(Message::Wait)));
-        for frame in 0..2 {
-            let mut bytes = PNG_HEADER.to_vec();
-            bytes.extend_from_slice(&[0, 0, 0, 0]);
-            bytes.extend_from_slice(b"IEND");
-            bytes.extend_from_slice(&[0, 0, 0, 0]);
-            std::fs::write(frame_path(&dir, frame), bytes).unwrap();
-        }
+        send_test_frames(&mut first, 0, 2);
         send(&mut first, &Message::Complete { start: 0, end: 2, ok: true, detail: String::new() }).unwrap();
         for _ in 0..100 {
             if lock(&state).chunks.first().is_some_and(|chunk| chunk.status == ChunkStatus::Done) {
@@ -1298,16 +1816,12 @@ mod tests {
         }
         assert!(lock(&state).chunks.first().is_some_and(|chunk| chunk.status == ChunkStatus::Done));
         send(&mut second, &Message::Request).unwrap();
+        receive_test_bundle(&mut second_reader);
+        send(&mut second, &Message::Request).unwrap();
         assert!(matches!(receive(&mut second_reader), Ok(Message::Assign { start: 2, end: 4, .. })));
         send(&mut first, &Message::Request).unwrap();
         assert!(matches!(receive(&mut first_reader), Ok(Message::Wait)));
-        for frame in 2..4 {
-            let mut bytes = PNG_HEADER.to_vec();
-            bytes.extend_from_slice(&[0, 0, 0, 0]);
-            bytes.extend_from_slice(b"IEND");
-            bytes.extend_from_slice(&[0, 0, 0, 0]);
-            std::fs::write(frame_path(&dir, frame), bytes).unwrap();
-        }
+        send_test_frames(&mut second, 2, 4);
         send(&mut second, &Message::Complete { start: 2, end: 4, ok: true, detail: String::new() }).unwrap();
         for _ in 0..100 {
             if lock(&state).chunks.get(1).is_some_and(|chunk| chunk.status == ChunkStatus::Done) {

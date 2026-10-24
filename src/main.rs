@@ -188,7 +188,7 @@ impl App {
             missing.push("프로젝트 파일");
         }
         if self.settings.output.trim().is_empty() {
-            missing.push("공유 프레임 폴더");
+            missing.push("호스트 프레임 저장 폴더");
         }
         if self.settings.final_video.trim().is_empty() {
             missing.push("최종 MP4 저장 위치");
@@ -432,7 +432,7 @@ impl eframe::App for App {
             ui.label(if self.settings.host {
                 "호스트가 프레임을 배분하고 원본 FPS·해상도로 최종 MP4를 만듭니다."
             } else {
-                "호스트에 연결하고 이 PC의 렌더 소스와 공유 폴더를 준비합니다."
+                "호스트의 작업 지시에 따라 렌더링하고, 프레임을 전송한 뒤 임시 파일을 삭제합니다."
             });
             ui.add_space(8.0);
             ui.horizontal(|ui| {
@@ -526,13 +526,13 @@ impl eframe::App for App {
                     ui.add_space(8.0);
                     ui.group(|ui| {
                         ui.set_width(ui.available_width());
-                        section_title(ui, if self.settings.host { "2 · 프로젝트와 공유 폴더" } else { "2 · 클라이언트 렌더 준비" });
-                        if path_row(ui, "EffectCraft 프로젝트 (.ecproj)", &mut self.settings.project)
-                            && let Some(path) = rfd::FileDialog::new().add_filter("EffectCraft project", &["ecproj"]).pick_file()
-                        {
-                            self.settings.project = path.display().to_string();
-                        }
+                        section_title(ui, if self.settings.host { "2 · 프로젝트와 출력 폴더" } else { "2 · 클라이언트 렌더 준비" });
                         if self.settings.host {
+                            if path_row(ui, "EffectCraft 프로젝트 (.ecproj)", &mut self.settings.project)
+                                && let Some(path) = rfd::FileDialog::new().add_filter("EffectCraft project", &["ecproj"]).pick_file()
+                            {
+                                self.settings.project = path.display().to_string();
+                            }
                             ui.label(egui::RichText::new("렌더할 컴포지션").strong());
                             let previous_comp = self.settings.comp.clone();
                             egui::ComboBox::from_id_salt("composition")
@@ -554,14 +554,15 @@ impl eframe::App for App {
                                 self.catalog_changed = Some(Instant::now());
                             }
                         } else {
-                            ui.small("컴포지션과 렌더 범위는 호스트가 연결 후 전달합니다.");
+                            ui.small("프로젝트·소스·글꼴·컴포지션·프레임 범위는 호스트가 렌더 시작 시 전송합니다.");
                         }
                         if path_row(ui, "렌더 CLI 실행 파일", &mut self.settings.cli)
                             && let Some(path) = rfd::FileDialog::new().pick_file()
                         {
                             self.settings.cli = path.display().to_string();
                         }
-                        if path_row(ui, "공유 프레임 폴더 · 모든 PC에서 접근 가능", &mut self.settings.output)
+                        if self.settings.host
+                            && path_row(ui, "호스트 프레임 저장 폴더", &mut self.settings.output)
                             && let Some(path) = rfd::FileDialog::new().pick_folder()
                         {
                             self.settings.output = path.display().to_string();
@@ -705,7 +706,7 @@ impl eframe::App for App {
                     }
                 });
                 ui.separator();
-                ui.small("클라이언트가 호스트의 로컬 IP로 연결합니다. 두 PC에는 동일한 프로젝트·미디어·글꼴과 공유 폴더 접근 권한이 필요합니다.");
+                ui.small("클라이언트가 호스트의 로컬 IP로 연결합니다. 프로젝트와 참조 소스는 호스트가 전송합니다.");
                 ui.small("설정은 이 PC의 EffectCraft 사용자 설정 폴더에 저장됩니다.");
             });
         });
