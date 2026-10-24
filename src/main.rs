@@ -117,6 +117,23 @@ impl Default for App {
 }
 
 impl App {
+    fn missing_host_settings(&self) -> Vec<&'static str> {
+        let mut missing = Vec::new();
+        if self.settings.project.trim().is_empty() {
+            missing.push("프로젝트 파일");
+        }
+        if self.settings.output.trim().is_empty() {
+            missing.push("공유 프레임 폴더");
+        }
+        if self.settings.final_video.trim().is_empty() {
+            missing.push("최종 MP4 저장 위치");
+        }
+        if self.settings.token.trim().len() < 8 {
+            missing.push("8자 이상 접속 암호");
+        }
+        missing
+    }
+
     fn poll_catalog(&mut self) {
         if !self.settings.host {
             return;
@@ -220,6 +237,13 @@ impl App {
 
     fn start(&mut self) {
         self.last_error.clear();
+        if self.settings.host {
+            let missing = self.missing_host_settings();
+            if !missing.is_empty() {
+                self.last_error = format!("호스트 설정을 완료하세요: {}", missing.join(", "));
+                return;
+            }
+        }
         let selected = self.catalog.iter().find(|comp| comp.name == self.settings.comp);
         let chunk_frames = if self.settings.host {
             let Some(comp) = selected else {
@@ -394,6 +418,12 @@ impl eframe::App for App {
             });
             if !self.last_error.is_empty() {
                 ui.colored_label(egui::Color32::RED, &self.last_error);
+            }
+            if self.settings.host && !self.running {
+                let missing = self.missing_host_settings();
+                if !missing.is_empty() {
+                    ui.colored_label(egui::Color32::YELLOW, format!("호스트 준비에 필요: {}", missing.join(", ")));
+                }
             }
             ui.separator();
             egui::ScrollArea::vertical().auto_shrink([false, false]).show(ui, |ui| {

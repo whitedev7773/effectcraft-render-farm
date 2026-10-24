@@ -12,7 +12,7 @@ use effectcraft_keyframe::Value;
 use effectcraft_project::props::{Node, PropGroup};
 use effectcraft_project::render_queue::sequence_path;
 use effectcraft_project::{Footage, FootageKind, ItemId, ItemKind, LayerSource, Project};
-use effectcraft_time::FrameRate;
+use effectcraft_time::{FrameRate, Tick};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
@@ -25,6 +25,19 @@ const MAX_FRAMES: i64 = 100_000;
 const MAX_WORKERS: usize = 64;
 const PROTOCOL_VERSION: u32 = 2;
 const PNG_HEADER: &[u8] = b"\x89PNG\r\n\x1a\n";
+
+fn comp_frame_count(rate: FrameRate, duration: Tick) -> Result<i64, String> {
+    if rate.num <= 0 || rate.den <= 0 || !rate.as_f64().is_finite() {
+        return Err("잘못된 컴포지션 프레임 레이트입니다".into());
+    }
+    let first_after = rate.frame_at(duration);
+    let total =
+        if rate.tick_of(first_after) < duration { first_after.checked_add(1).ok_or("컴포지션 프레임 수가 너무 큽니다")? } else { first_after };
+    if !(1..=MAX_FRAMES).contains(&total) {
+        return Err(format!("컴포지션 길이는 1~{MAX_FRAMES}프레임이어야 합니다 (현재 {total}프레임)"));
+    }
+    Ok(total)
+}
 
 #[derive(Clone)]
 pub struct Config {
@@ -208,13 +221,7 @@ pub fn read_job(config: &Config) -> Result<Job, String> {
         return Err(format!("컴포지션 이름이 없거나 중복됩니다: {}", config.comp));
     };
     let rate = comp.frame_rate;
-    if rate.num <= 0 || rate.den <= 0 || !rate.as_f64().is_finite() {
-        return Err("잘못된 컴포지션 프레임 레이트입니다".into());
-    }
-    let total = rate.frame_at(comp.duration);
-    if !(1..=MAX_FRAMES).contains(&total) || rate.tick_of(total) != comp.duration {
-        return Err("이 버전은 프레임 경계에서 끝나는 1~100,000프레임 컴포지션을 지원합니다".into());
-    }
+    let total = comp_frame_count(rate, comp.duration)?;
     if !config.output.is_dir() {
         return Err(format!("공유 출력 폴더가 없습니다: {}", config.output.display()));
     }
@@ -246,7 +253,7 @@ pub fn list_compositions(path: &Path) -> Result<Vec<CompInfo>, String> {
         .filter_map(|(id, comp)| {
             let name = project.item(*id)?.name.clone();
             let rate = comp.frame_rate;
-            let frames = if rate.num > 0 && rate.den > 0 && rate.as_f64().is_finite() { rate.frame_at(comp.duration) } else { 0 };
+            let frames = comp_frame_count(rate, comp.duration).unwrap_or(0);
             Some(CompInfo { name, frames, rate: comp.frame_rate, width: comp.width, height: comp.height })
         })
         .collect::<Vec<_>>();
@@ -954,6 +961,15 @@ mod tests {
     use effectcraft_color::Label;
     use effectcraft_project::{Comp, ItemKind};
     use effectcraft_time::Tick;
+
+    #[test]
+    fn partial_final_frame_counts_without_requiring_aligned_duration() {
+        let rate = FrameRate::new(30_000, 1001);
+        let boundary = rate.tick_of(70);
+        assert_eq!(comp_frame_count(rate, boundary).unwrap(), 70);
+        assert_eq!(comp_frame_count(rate, Tick(boundary.0 + 1)).unwrap(), 71);
+        assert!(comp_frame_count(rate, Tick::ZERO).is_err());
+    }
 
     #[test]
     fn missing_media_and_sequence_frame_are_reported() {
