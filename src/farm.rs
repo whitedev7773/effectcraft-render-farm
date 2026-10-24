@@ -23,6 +23,7 @@ fn project_hash(bytes: &[u8]) -> String {
 const MAX_LINE: usize = 4096;
 const MAX_FRAMES: i64 = 100_000;
 const MAX_WORKERS: usize = 64;
+const PROTOCOL_VERSION: u32 = 2;
 const PNG_HEADER: &[u8] = b"\x89PNG\r\n\x1a\n";
 
 #[derive(Clone)]
@@ -53,6 +54,15 @@ pub struct Job {
     pub width: u32,
     pub height: u32,
     pub output: PathBuf,
+}
+
+#[derive(Clone)]
+pub struct CompInfo {
+    pub name: String,
+    pub frames: i64,
+    pub rate: FrameRate,
+    pub width: u32,
+    pub height: u32,
 }
 
 #[derive(Serialize, Deserialize, PartialEq, Eq)]
@@ -142,14 +152,36 @@ impl State {
 #[derive(Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 enum Message {
-    Hello { token: String, hash: String, name: String },
-    Ready,
+    Hello {
+        token: String,
+        hash: String,
+        name: String,
+        #[serde(default)]
+        protocol: u32,
+    },
+    Ready {
+        comp: String,
+    },
     Request,
-    Assign { start: i64, end: i64, fps_num: i64, fps_den: i64, comp: String },
-    Complete { start: i64, end: i64, ok: bool, detail: String },
+    Assign {
+        start: i64,
+        end: i64,
+        fps_num: i64,
+        fps_den: i64,
+        comp: String,
+    },
+    Complete {
+        start: i64,
+        end: i64,
+        ok: bool,
+        detail: String,
+    },
+    Disconnect,
     Wait,
     Finished,
-    Error { detail: String },
+    Error {
+        detail: String,
+    },
 }
 
 fn lock(state: &Shared) -> std::sync::MutexGuard<'_, State> {
@@ -168,13 +200,7 @@ pub fn read_job(config: &Config) -> Result<Job, String> {
     if !config.cli.is_file() {
         return Err(format!("렌더 CLI 파일이 없습니다: {}", config.cli.display()));
     }
-    if std::fs::metadata(&config.project).map_err(|e| format!("프로젝트 정보 읽기: {e}"))?.len() > 100_000_000 {
-        return Err("프로젝트가 100MB 제한을 넘습니다".into());
-    }
-    let bytes = std::fs::read(&config.project).map_err(|e| format!("프로젝트 읽기: {e}"))?;
-    if bytes.len() > 100_000_000 {
-        return Err("프로젝트가 100MB 제한을 넘습니다".into());
-    }
+    let bytes = read_project_bytes(&config.project)?;
     let source = std::str::from_utf8(&bytes).map_err(|e| format!("프로젝트 문자 인코딩: {e}"))?;
     let project = Project::from_json(source).map_err(|e| format!("프로젝트 열기: {e}"))?;
     let matches: Vec<_> = project.comps().filter(|(id, _)| project.item(**id).is_some_and(|item| item.name == config.comp)).collect();
@@ -209,6 +235,38 @@ pub fn read_job(config: &Config) -> Result<Job, String> {
         height: comp.height,
         output: config.output.clone(),
     })
+}
+
+pub fn list_compositions(path: &Path) -> Result<Vec<CompInfo>, String> {
+    let bytes = read_project_bytes(path)?;
+    let source = std::str::from_utf8(&bytes).map_err(|e| format!("프로젝트 문자 인코딩: {e}"))?;
+    let project = Project::from_json(source).map_err(|e| format!("프로젝트 열기: {e}"))?;
+    let mut comps = project
+        .comps()
+        .filter_map(|(id, comp)| {
+            let name = project.item(*id)?.name.clone();
+            let rate = comp.frame_rate;
+            let frames = if rate.num > 0 && rate.den > 0 && rate.as_f64().is_finite() { rate.frame_at(comp.duration) } else { 0 };
+            Some(CompInfo { name, frames, rate: comp.frame_rate, width: comp.width, height: comp.height })
+        })
+        .collect::<Vec<_>>();
+    comps.sort_by(|a, b| a.name.cmp(&b.name));
+    Ok(comps)
+}
+
+fn read_project_bytes(path: &Path) -> Result<Vec<u8>, String> {
+    if std::fs::metadata(path).map_err(|e| format!("프로젝트 정보 읽기: {e}"))?.len() > 100_000_000 {
+        return Err("프로젝트가 100MB 제한을 넘습니다".into());
+    }
+    let bytes = std::fs::read(path).map_err(|e| format!("프로젝트 읽기: {e}"))?;
+    if bytes.len() > 100_000_000 {
+        return Err("프로젝트가 100MB 제한을 넘습니다".into());
+    }
+    Ok(bytes)
+}
+
+fn project_file_hash(path: &Path) -> Result<String, String> {
+    read_project_bytes(path).map(|bytes| project_hash(&bytes))
 }
 
 /// Check files and fonts used by the selected comp before any frame is assigned.
@@ -367,8 +425,8 @@ fn chunk_complete(output: &Path, start: i64, end: i64) -> bool {
 }
 
 pub fn start_coordinator(config: Config, state: Shared, stop: Arc<AtomicBool>) -> Result<Job, String> {
-    if !(1..=3_600).contains(&config.chunk_frames) || !(1..=MAX_WORKERS).contains(&config.max_workers) {
-        return Err("구간 크기는 1~3600프레임, 사용할 PC 수는 1~64대여야 합니다".into());
+    if !(1..=MAX_FRAMES).contains(&config.chunk_frames) || !(1..=MAX_WORKERS).contains(&config.max_workers) {
+        return Err("구간 크기는 1~100,000프레임, 사용할 PC 수는 1~64대여야 합니다".into());
     }
     if !config.final_video.is_absolute() || !config.final_video.parent().is_some_and(Path::is_dir) {
         return Err("최종 MP4의 저장 위치를 선택하세요".into());
@@ -475,10 +533,19 @@ fn send(stream: &mut TcpStream, message: &Message) -> Result<(), String> {
 fn serve_worker(mut stream: TcpStream, peer: SocketAddr, config: &Config, job: &Job, state: &Shared, stop: &AtomicBool) -> Result<(), String> {
     stream.set_read_timeout(Some(Duration::from_secs(3600))).map_err(|e| e.to_string())?;
     let mut reader = BufReader::new(stream.try_clone().map_err(|e| e.to_string())?);
-    let (name, hash, given_token) = match receive(&mut reader)? {
-        Message::Hello { token, hash, name } => (name, hash, token),
+    let (name, hash, given_token, protocol) = match receive(&mut reader)? {
+        Message::Hello { token, hash, name, protocol } => (name, hash, token, protocol),
         _ => return Err("인증 메시지가 필요합니다".into()),
     };
+    if protocol != PROTOCOL_VERSION {
+        send(
+            &mut stream,
+            &Message::Error {
+                detail: "호스트와 클라이언트 앱 버전이 다릅니다. 모든 PC를 최신 버전으로 업데이트하세요".into()
+            },
+        )?;
+        return Err("호환되지 않는 클라이언트 버전".into());
+    }
     if given_token != config.token || hash != job.hash || name.len() > 80 {
         send(&mut stream, &Message::Error { detail: "접속 암호 또는 프로젝트가 올바르지 않습니다".into() })?;
         return Err("접속 정보 검증 실패".into());
@@ -510,7 +577,7 @@ fn serve_worker(mut stream: TcpStream, peer: SocketAddr, config: &Config, job: &
             return Err(detail.into());
         }
     };
-    if let Err(error) = send(&mut stream, &Message::Ready) {
+    if let Err(error) = send(&mut stream, &Message::Ready { comp: job.comp.clone() }) {
         let mut s = lock(state);
         s.workers = s.workers.saturating_sub(1);
         s.worker_info.remove(&worker_id);
@@ -591,6 +658,8 @@ fn serve_worker(mut stream: TcpStream, peer: SocketAddr, config: &Config, job: &
                         maybe_start_assembly(config, job, state);
                     }
                 }
+                Ok(Message::Disconnect) => break Ok(()),
+                Ok(Message::Error { detail }) => break Err(detail),
                 Ok(_) => break Err("예상하지 않은 작업 메시지입니다".into()),
                 Err(e) => break Err(e),
             }
@@ -635,17 +704,27 @@ pub fn begin_render(config: &Config, job: &Job, state: &Shared) {
 }
 
 pub fn run_worker(config: Config, state: Shared, stop: Arc<AtomicBool>) -> Result<(), String> {
-    let job = read_job(&config)?;
+    let hash = project_file_hash(&config.project)?;
     let mut stream = TcpStream::connect(&config.address).map_err(|e| format!("서버 연결: {e}"))?;
     stream.set_read_timeout(Some(Duration::from_secs(30))).map_err(|e| e.to_string())?;
     let mut reader = BufReader::new(stream.try_clone().map_err(|e| e.to_string())?);
     let name = std::env::var("COMPUTERNAME").or_else(|_| std::env::var("HOSTNAME")).unwrap_or_else(|_| "worker".into());
-    send(&mut stream, &Message::Hello { token: config.token.clone(), hash: job.hash.clone(), name })?;
-    match receive(&mut reader)? {
-        Message::Ready => log(&state, "서버 인증 성공"),
+    send(&mut stream, &Message::Hello { token: config.token.clone(), hash, name, protocol: PROTOCOL_VERSION })?;
+    let comp = match receive(&mut reader)? {
+        Message::Ready { comp } => comp,
         Message::Error { detail } => return Err(detail),
         _ => return Err("서버 인증 응답이 잘못됐습니다".into()),
-    }
+    };
+    let mut config = config;
+    config.comp = comp;
+    let job = match read_job(&config) {
+        Ok(job) => job,
+        Err(error) => {
+            let _ = send(&mut stream, &Message::Error { detail: "클라이언트 리소스 검사 실패".into() });
+            return Err(error);
+        }
+    };
+    log(&state, format!("렌더 준비 완료: {}", job.comp));
     while !stop.load(Ordering::Relaxed) {
         send(&mut stream, &Message::Request)?;
         match receive(&mut reader)? {
@@ -660,6 +739,7 @@ pub fn run_worker(config: Config, state: Shared, stop: Arc<AtomicBool>) -> Resul
                     Err(e) => (false, e),
                 };
                 send(&mut stream, &Message::Complete { start, end, ok, detail })?;
+                log(&state, format!("구간 {start}–{end} {} · 다음 작업 대기", if ok { "완료" } else { "실패" }));
             }
             Message::Wait => thread::sleep(Duration::from_secs(1)),
             Message::Finished => {
@@ -669,6 +749,9 @@ pub fn run_worker(config: Config, state: Shared, stop: Arc<AtomicBool>) -> Resul
             Message::Error { detail } => return Err(detail),
             _ => return Err("서버 응답이 잘못됐습니다".into()),
         }
+    }
+    if stop.load(Ordering::Relaxed) {
+        let _ = send(&mut stream, &Message::Disconnect);
     }
     Ok(())
 }
@@ -927,6 +1010,10 @@ mod tests {
         let comp = Comp::new(64, 64, FrameRate::FPS_60, Tick::from_seconds_f64(2.0));
         project.add_item("Test", Label::None, None, ItemKind::Comp(Arc::new(comp)));
         std::fs::write(&project_path, project.to_json()).unwrap();
+        let catalog = list_compositions(&project_path).unwrap();
+        assert_eq!(catalog.len(), 1);
+        assert_eq!(catalog[0].name, "Test");
+        assert_eq!(catalog[0].frames, 120);
         let config = Config {
             project: project_path,
             cli: std::env::current_exe().unwrap(),
@@ -1002,8 +1089,8 @@ mod tests {
         });
         let mut client = TcpStream::connect(address).unwrap();
         let mut reader = BufReader::new(client.try_clone().unwrap());
-        send(&mut client, &Message::Hello { token: "password".into(), hash: job.hash, name: "test-worker".into() }).unwrap();
-        assert!(matches!(receive(&mut reader), Ok(Message::Ready)));
+        send(&mut client, &Message::Hello { token: "password".into(), hash: job.hash, name: "test-worker".into(), protocol: PROTOCOL_VERSION }).unwrap();
+        assert!(matches!(receive(&mut reader), Ok(Message::Ready { comp }) if comp == "Test"));
         send(&mut client, &Message::Request).unwrap();
         assert!(matches!(receive(&mut reader), Ok(Message::Wait)));
         lock(&state).dispatch_enabled = true;
@@ -1028,6 +1115,60 @@ mod tests {
         assert!(matches!(receive(&mut reader), Ok(Message::Finished)));
         assert!(server.join().unwrap().is_ok());
         assert_eq!(snapshot(&state).0, 2);
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn client_uses_host_selected_composition() {
+        let suffix = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos();
+        let dir = std::env::temp_dir().join(format!("effectcraft-farm-host-comp-{}-{suffix}", std::process::id()));
+        std::fs::create_dir(&dir).unwrap();
+        let project_path = dir.join("project.ecproj");
+        let mut project = Project::default();
+        let comp = Comp::new(64, 64, FrameRate::FPS_60, Tick::from_seconds_f64(1.0));
+        project.add_item("Host Choice", Label::None, None, ItemKind::Comp(Arc::new(comp)));
+        std::fs::write(&project_path, project.to_json()).unwrap();
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        let mut config = Config {
+            project: project_path,
+            cli: std::env::current_exe().unwrap(),
+            output: dir.clone(),
+            comp: "Host Choice".into(),
+            address: address.to_string(),
+            token: "test-password".into(),
+            gpu: false,
+            range_start: 0,
+            range_end: 0,
+            chunk_frames: 60,
+            max_workers: 1,
+            final_video: dir.join("final.mp4"),
+            disabled_workers: Vec::new(),
+        };
+        let job = read_job(&config).unwrap();
+        let state = Arc::new(Mutex::new(State::default()));
+        let stop = Arc::new(AtomicBool::new(false));
+        let server_state = state.clone();
+        let server_stop = stop.clone();
+        let host_config = config.clone();
+        let server = thread::spawn(move || {
+            let (stream, peer) = listener.accept().unwrap();
+            serve_worker(stream, peer, &host_config, &job, &server_state, &server_stop)
+        });
+        config.comp = "stale client selection".into();
+        let client_state = state.clone();
+        let client_stop = stop.clone();
+        let client = thread::spawn(move || run_worker(config, client_state, client_stop));
+        for _ in 0..100 {
+            if lock(&state).messages.iter().any(|message| message == "렌더 준비 완료: Host Choice") {
+                break;
+            }
+            thread::sleep(Duration::from_millis(20));
+        }
+        assert!(lock(&state).messages.iter().any(|message| message == "렌더 준비 완료: Host Choice"));
+        stop.store(true, Ordering::Relaxed);
+        assert!(client.join().unwrap().is_ok());
+        assert!(server.join().unwrap().is_ok());
         std::fs::remove_dir_all(dir).unwrap();
     }
 
@@ -1084,15 +1225,15 @@ mod tests {
         let mut first = TcpStream::connect(address).unwrap();
         first.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
         let mut first_reader = BufReader::new(first.try_clone().unwrap());
-        send(&mut first, &Message::Hello { token: "password".into(), hash: "same".into(), name: "first".into() }).unwrap();
-        assert!(matches!(receive(&mut first_reader), Ok(Message::Ready)));
+        send(&mut first, &Message::Hello { token: "password".into(), hash: "same".into(), name: "first".into(), protocol: PROTOCOL_VERSION }).unwrap();
+        assert!(matches!(receive(&mut first_reader), Ok(Message::Ready { comp }) if comp == "Test"));
         send(&mut first, &Message::Request).unwrap();
         assert!(matches!(receive(&mut first_reader), Ok(Message::Assign { start: 0, end: 2, .. })));
         let mut second = TcpStream::connect(address).unwrap();
         second.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
         let mut second_reader = BufReader::new(second.try_clone().unwrap());
-        send(&mut second, &Message::Hello { token: "password".into(), hash: "same".into(), name: "second".into() }).unwrap();
-        assert!(matches!(receive(&mut second_reader), Ok(Message::Ready)));
+        send(&mut second, &Message::Hello { token: "password".into(), hash: "same".into(), name: "second".into(), protocol: PROTOCOL_VERSION }).unwrap();
+        assert!(matches!(receive(&mut second_reader), Ok(Message::Ready { comp }) if comp == "Test"));
         send(&mut second, &Message::Request).unwrap();
         assert!(matches!(receive(&mut second_reader), Ok(Message::Wait)));
         for frame in 0..2 {

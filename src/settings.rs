@@ -2,6 +2,15 @@ use std::path::PathBuf;
 
 use serde::{Deserialize, Serialize};
 
+#[derive(Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Distribution {
+    #[default]
+    Auto,
+    Frames,
+    Percent,
+}
+
 #[derive(Clone, PartialEq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct Settings {
@@ -19,6 +28,8 @@ pub struct Settings {
     pub range_start: i64,
     pub range_end: i64,
     pub chunk_frames: i64,
+    pub distribution: Distribution,
+    pub chunk_percent: f64,
     pub max_workers: usize,
     pub final_video: String,
     pub disabled_workers: Vec<String>,
@@ -35,7 +46,7 @@ impl Default for Settings {
             project: String::new(),
             cli: cli.display().to_string(),
             output: String::new(),
-            comp: "TO RENDER: Black-White Theme".into(),
+            comp: String::new(),
             host_address: "0.0.0.0:9778".into(),
             client_address: "127.0.0.1:9778".into(),
             token: String::new(),
@@ -45,10 +56,41 @@ impl Default for Settings {
             range_start: 0,
             range_end: 0,
             chunk_frames: 300,
+            distribution: Distribution::Auto,
+            chunk_percent: 50.0,
             max_workers: 2,
             final_video: String::new(),
             disabled_workers: Vec::new(),
         }
+    }
+}
+
+impl Settings {
+    pub fn effective_chunk_frames(&self, total_frames: i64) -> Result<i64, String> {
+        let end = if self.range_end == 0 { total_frames } else { self.range_end };
+        if !(1..=100_000).contains(&total_frames) || self.range_start < 0 || end <= self.range_start || end > total_frames {
+            return Err("선택한 컴포지션의 렌더 프레임 범위를 확인하세요".into());
+        }
+        let span = end - self.range_start;
+        let frames = match self.distribution {
+            Distribution::Auto => {
+                if !(1..=64).contains(&self.max_workers) {
+                    return Err("사용할 PC 수는 1~64대여야 합니다".into());
+                }
+                (span + self.max_workers as i64 - 1) / self.max_workers as i64
+            }
+            Distribution::Frames => self.chunk_frames,
+            Distribution::Percent => {
+                if !self.chunk_percent.is_finite() || !(0.01..=100.0).contains(&self.chunk_percent) {
+                    return Err("구간 비율은 0.01~100%여야 합니다".into());
+                }
+                (span as f64 * self.chunk_percent / 100.0).ceil() as i64
+            }
+        };
+        if !(1..=100_000).contains(&frames) {
+            return Err("구간 크기는 1~100,000프레임이어야 합니다".into());
+        }
+        Ok(frames)
     }
 }
 
@@ -140,6 +182,20 @@ fn save_to(dir: &std::path::Path, settings: &mut Settings) -> Result<(), String>
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn distribution_supports_auto_frames_and_percent() {
+        let mut settings = Settings { max_workers: 3, range_start: 100, range_end: 1000, ..Settings::default() };
+        assert_eq!(settings.effective_chunk_frames(1200).unwrap(), 300);
+        settings.distribution = Distribution::Frames;
+        settings.chunk_frames = 240;
+        assert_eq!(settings.effective_chunk_frames(1200).unwrap(), 240);
+        settings.distribution = Distribution::Percent;
+        settings.chunk_percent = 25.0;
+        assert_eq!(settings.effective_chunk_frames(1200).unwrap(), 225);
+        settings.chunk_percent = f64::NAN;
+        assert!(settings.effective_chunk_frames(1200).is_err());
+    }
 
     #[test]
     fn settings_roundtrip_preserves_connection_and_distribution() {

@@ -12,8 +12,8 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 use eframe::egui::{self, FontData, FontDefinitions, FontFamily};
-use farm::{Config, Job, Shared, State};
-use settings::Settings;
+use farm::{CompInfo, Config, Job, Shared, State};
+use settings::{Distribution, Settings};
 
 fn install_ui_font(ctx: &egui::Context) -> Result<(), String> {
     let mut candidates = Vec::new();
@@ -82,6 +82,11 @@ struct App {
     last_discovery: Option<Instant>,
     discovery_status: String,
     last_error: String,
+    catalog_path: String,
+    catalog_changed: Option<Instant>,
+    pending_catalog: Option<Receiver<Result<Vec<CompInfo>, String>>>,
+    catalog: Vec<CompInfo>,
+    catalog_status: String,
 }
 
 impl Default for App {
@@ -102,11 +107,63 @@ impl Default for App {
             last_discovery: None,
             discovery_status: String::new(),
             last_error: warning.unwrap_or_default(),
+            catalog_path: String::new(),
+            catalog_changed: None,
+            pending_catalog: None,
+            catalog: Vec::new(),
+            catalog_status: String::new(),
         }
     }
 }
 
 impl App {
+    fn poll_catalog(&mut self) {
+        if !self.settings.host {
+            return;
+        }
+        if self.catalog_path != self.settings.project {
+            self.catalog_path = self.settings.project.clone();
+            self.catalog_changed = Some(Instant::now());
+            self.pending_catalog = None;
+            self.catalog.clear();
+            self.catalog_status =
+                if self.catalog_path.is_empty() { "프로젝트 파일을 선택하세요".into() } else { "컴포지션을 읽는 중…".into() };
+        }
+        let result = match self.pending_catalog.as_ref().map(Receiver::try_recv) {
+            Some(Ok(result)) => Some(result),
+            Some(Err(TryRecvError::Disconnected)) => Some(Err("프로젝트 읽기 작업이 중단됐습니다".into())),
+            _ => None,
+        };
+        if let Some(result) = result {
+            self.pending_catalog = None;
+            match result {
+                Ok(comps) => {
+                    if !comps.iter().any(|comp| comp.name == self.settings.comp) {
+                        self.settings.comp = comps.first().map(|comp| comp.name.clone()).unwrap_or_default();
+                    }
+                    self.catalog_status = format!("컴포지션 {}개", comps.len());
+                    self.catalog = comps;
+                }
+                Err(error) => {
+                    self.catalog.clear();
+                    self.catalog_status = error;
+                }
+            }
+        }
+        if self.pending_catalog.is_none() && self.catalog_changed.is_some_and(|at| at.elapsed() >= Duration::from_millis(350)) && !self.catalog_path.is_empty()
+        {
+            self.catalog_changed = None;
+            let path = PathBuf::from(&self.catalog_path);
+            let (sender, receiver) = mpsc::channel();
+            self.pending_catalog = Some(receiver);
+            thread::spawn(move || {
+                let result = std::panic::catch_unwind(|| farm::list_compositions(&path))
+                    .unwrap_or_else(|_| Err("프로젝트 분석 중 예상하지 못한 오류가 발생했습니다".into()));
+                let _ = sender.send(result);
+            });
+        }
+    }
+
     fn start_discovery(&mut self) {
         let (sender, receiver) = mpsc::channel();
         self.pending_discovery = Some(receiver);
@@ -163,11 +220,28 @@ impl App {
 
     fn start(&mut self) {
         self.last_error.clear();
+        let selected = self.catalog.iter().find(|comp| comp.name == self.settings.comp);
+        let chunk_frames = if self.settings.host {
+            let Some(comp) = selected else {
+                self.last_error = "프로젝트의 컴포지션 목록을 읽고 렌더할 항목을 선택하세요".into();
+                return;
+            };
+            match self.settings.effective_chunk_frames(comp.frames) {
+                Ok(frames) => frames,
+                Err(error) => {
+                    self.last_error = error;
+                    return;
+                }
+            }
+        } else {
+            self.settings.chunk_frames
+        };
         if let Err(e) = settings::save(&mut self.settings) {
             self.last_error = e;
             return;
         }
-        let config = self.config();
+        let mut config = self.config();
+        config.chunk_frames = chunk_frames;
         self.stop = Arc::new(AtomicBool::new(false));
         self.stopping = false;
         if self.settings.host {
@@ -245,6 +319,7 @@ impl eframe::App for App {
         ui.ctx().request_repaint_after(Duration::from_secs(1));
         self.poll_start();
         self.poll_discovery();
+        self.poll_catalog();
         if self.running && !self.settings.host && !self.worker_active.load(Ordering::Relaxed) {
             self.running = false;
             self.stopping = false;
@@ -263,7 +338,11 @@ impl eframe::App for App {
         let before = self.settings.clone();
         egui::CentralPanel::default().show(ui, |ui| {
             ui.label(egui::RichText::new("EffectCraft · Render Farm").size(23.0).strong().color(egui::Color32::from_rgb(242, 245, 250)));
-            ui.label("여러 PC에서 프레임을 렌더링하고, 호스트에서 원본 FPS·해상도로 최종 MP4를 만듭니다.");
+            ui.label(if self.settings.host {
+                "호스트가 프레임을 배분하고 원본 FPS·해상도로 최종 MP4를 만듭니다."
+            } else {
+                "호스트에 연결하고 이 PC의 렌더 소스와 공유 폴더를 준비합니다."
+            });
             ui.add_space(8.0);
             ui.horizontal(|ui| {
                 if !self.running
@@ -302,7 +381,14 @@ impl eframe::App for App {
                     } else if self.settings.host {
                         "호스트 실행 중"
                     } else {
-                        "클라이언트 연결 중"
+                        let state = self.state.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+                        match state.messages.last().map(String::as_str) {
+                            Some(message) if message.starts_with("렌더링:") => "클라이언트 프레임 렌더링 중",
+                            Some(message) if message.starts_with("렌더 준비 완료:") || message.starts_with("구간 ") => {
+                                "클라이언트 준비 완료 · 작업 대기"
+                            }
+                            _ => "클라이언트 연결 및 리소스 검사 중",
+                        }
                     });
                 }
             });
@@ -343,13 +429,32 @@ impl eframe::App for App {
                     ui.add_space(8.0);
                     ui.group(|ui| {
                         ui.set_width(ui.available_width());
-                        section_title(ui, "2 · 프로젝트와 공유 폴더");
+                        section_title(ui, if self.settings.host { "2 · 프로젝트와 공유 폴더" } else { "2 · 클라이언트 렌더 준비" });
                         if path_row(ui, "EffectCraft 프로젝트 (.ecproj)", &mut self.settings.project)
                             && let Some(path) = rfd::FileDialog::new().add_filter("EffectCraft project", &["ecproj"]).pick_file()
                         {
                             self.settings.project = path.display().to_string();
                         }
-                        text_row(ui, "렌더할 컴포지션", &mut self.settings.comp, false);
+                        if self.settings.host {
+                            ui.label(egui::RichText::new("렌더할 컴포지션").strong());
+                            egui::ComboBox::from_id_salt("composition")
+                                .selected_text(if self.settings.comp.is_empty() { "컴포지션 선택" } else { &self.settings.comp })
+                                .show_ui(ui, |ui| {
+                                    for comp in &self.catalog {
+                                        ui.selectable_value(&mut self.settings.comp, comp.name.clone(), &comp.name);
+                                    }
+                                });
+                            if let Some(comp) = self.catalog.iter().find(|comp| comp.name == self.settings.comp) {
+                                ui.small(format!("{}프레임 · {:.3} FPS · {}×{}", comp.frames, comp.rate.as_f64(), comp.width, comp.height));
+                            } else {
+                                ui.small(&self.catalog_status);
+                            }
+                            if ui.button("프로젝트 목록 새로고침").clicked() {
+                                self.catalog_changed = Some(Instant::now());
+                            }
+                        } else {
+                            ui.small("컴포지션과 렌더 범위는 호스트가 연결 후 전달합니다.");
+                        }
                         if path_row(ui, "렌더 CLI 실행 파일", &mut self.settings.cli)
                             && let Some(path) = rfd::FileDialog::new().pick_file()
                         {
@@ -367,20 +472,50 @@ impl eframe::App for App {
                         ui.group(|ui| {
                             ui.set_width(ui.available_width());
                             section_title(ui, "3 · 렌더 범위와 분배");
+                            let total = self.catalog.iter().find(|comp| comp.name == self.settings.comp).map_or(100_000, |comp| comp.frames.max(1));
                             egui::Grid::new("render_options").num_columns(2).spacing([20.0, 10.0]).show(ui, |ui| {
                                 ui.label("시작 프레임");
-                                ui.add(egui::DragValue::new(&mut self.settings.range_start).range(0..=1_000_000));
+                                ui.add(egui::DragValue::new(&mut self.settings.range_start).range(0..=total));
                                 ui.end_row();
                                 ui.label("끝 프레임 · 미포함, 0은 끝까지");
-                                ui.add(egui::DragValue::new(&mut self.settings.range_end).range(0..=1_000_000));
+                                ui.add(egui::DragValue::new(&mut self.settings.range_end).range(0..=total));
                                 ui.end_row();
                                 ui.label("동시에 사용할 PC 수");
                                 ui.add(egui::DragValue::new(&mut self.settings.max_workers).range(1..=64));
                                 ui.end_row();
-                                ui.label("PC당 작업 구간 · 프레임");
-                                ui.add(egui::DragValue::new(&mut self.settings.chunk_frames).range(1..=3_600));
-                                ui.end_row();
                             });
+                            ui.horizontal(|ui| {
+                                ui.label("구간 분배");
+                                ui.selectable_value(&mut self.settings.distribution, Distribution::Auto, "자동 · PC 수로 균등 분할");
+                                ui.selectable_value(&mut self.settings.distribution, Distribution::Frames, "프레임");
+                                ui.selectable_value(&mut self.settings.distribution, Distribution::Percent, "퍼센트");
+                            });
+                            match self.settings.distribution {
+                                Distribution::Auto => {}
+                                Distribution::Frames => {
+                                    ui.horizontal(|ui| {
+                                        ui.label("구간당 프레임");
+                                        ui.add(egui::DragValue::new(&mut self.settings.chunk_frames).range(1..=100_000));
+                                    });
+                                }
+                                Distribution::Percent => {
+                                    ui.horizontal(|ui| {
+                                        ui.label("전체 선택 범위 중 구간당 비율");
+                                        ui.add(egui::DragValue::new(&mut self.settings.chunk_percent).range(0.01..=100.0).suffix("%"));
+                                    });
+                                }
+                            }
+                            if let Some(comp) = self.catalog.iter().find(|comp| comp.name == self.settings.comp)
+                                && let Ok(frames) = self.settings.effective_chunk_frames(comp.frames)
+                            {
+                                let end = if self.settings.range_end == 0 { comp.frames } else { self.settings.range_end };
+                                let span = end - self.settings.range_start;
+                                let chunks = (span + frames - 1) / frames;
+                                ui.small(format!(
+                                    "{}–{} · 총 {}프레임 → 구간당 최대 {}프레임, {}개 구간",
+                                    self.settings.range_start, end, span, frames, chunks
+                                ));
+                            }
                             ui.checkbox(&mut self.settings.local_worker, "호스트 PC도 렌더링에 참여");
                             if path_row(ui, "최종 MP4 저장 위치", &mut self.settings.final_video)
                                 && let Some(path) = rfd::FileDialog::new().add_filter("MP4 video", &["mp4"]).save_file()
@@ -401,7 +536,7 @@ impl eframe::App for App {
                         self.stopping = false;
                     }
                 }
-                if total > 0 {
+                if self.settings.host && total > 0 {
                     section_title(ui, "진행 상황");
                     ui.add(egui::ProgressBar::new((done as f32 / total as f32).clamp(0.0, 1.0)).text(format!("{done} / {total} 프레임")));
                     ui.label(format!("연결된 PC: {connected} · 실패한 구간: {failed} · 동시 사용 한도: {}", self.settings.max_workers));
