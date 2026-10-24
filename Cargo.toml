@@ -1,0 +1,21 @@
+[package]
+name = "effectcraft-farm"
+description = "LAN render coordinator and worker desktop app for EffectCraft"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.95"
+license = "MIT OR Apache-2.0"
+repository = "https://github.com/whitedev7773/effectcraft-render-farm"
+
+[dependencies]
+eframe = { version = "0.36", default-features = false, features = ["default_fonts", "glow", "x11", "wayland"] }
+effectcraft-project = { git = "https://github.com/storytold/effectcraft", rev = "ef74d82902ba486891b02afa87e42963cc9b84cc" }
+effectcraft-time = { git = "https://github.com/storytold/effectcraft", rev = "ef74d82902ba486891b02afa87e42963cc9b84cc" }
+rfd = "0.17"
+serde = { version = "1", features = ["derive", "rc"] }
+serde_json = { version = "1", features = ["float_roundtrip"] }
+sha2 = "0.10"
+
+[dev-dependencies]
+effectcraft-color = { git = "https://github.com/storytold/effectcraft", rev = "ef74d82902ba486891b02afa87e42963cc9b84cc" }
+image = { version = "0.25", default-features = false, features = ["png", "jpeg"] }
