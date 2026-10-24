@@ -49,7 +49,7 @@ impl Default for Settings {
             output: String::new(),
             comp: String::new(),
             host_address: "0.0.0.0:9778".into(),
-            client_address: "127.0.0.1:9778".into(),
+            client_address: String::new(),
             token: String::new(),
             gpu: false,
             host: true,
@@ -104,6 +104,10 @@ fn directory() -> Result<PathBuf, String> {
     #[cfg(all(not(windows), not(target_os = "macos")))]
     let base = std::env::var_os("XDG_CONFIG_HOME").map(PathBuf::from).or_else(|| std::env::var_os("HOME").map(|p| PathBuf::from(p).join(".config")));
     base.map(|p| p.join("EffectCraft").join("render-farm")).ok_or("사용자 설정 폴더를 찾을 수 없습니다".into())
+}
+
+pub fn log_path() -> Result<PathBuf, String> {
+    Ok(directory()?.join("render-farm.log"))
 }
 
 fn slots(dir: &std::path::Path) -> [PathBuf; 2] {

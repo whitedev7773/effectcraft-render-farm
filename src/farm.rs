@@ -2,7 +2,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::io::{BufRead, BufReader, Read, Seek, SeekFrom, Write};
 use std::net::{SocketAddr, TcpListener, TcpStream};
 use std::path::{Path, PathBuf};
-use std::process::Command;
+use std::process::{Command, Stdio};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, OnceLock, PoisonError};
 use std::thread;
@@ -23,7 +23,7 @@ fn project_hash(bytes: &[u8]) -> String {
 const MAX_LINE: usize = 4096;
 const MAX_FRAMES: i64 = 100_000;
 const MAX_WORKERS: usize = 64;
-const PROTOCOL_VERSION: u32 = 3;
+const PROTOCOL_VERSION: u32 = 4;
 const MAX_TRANSFER_FILE: u64 = 32 * 1024 * 1024 * 1024;
 const MAX_TRANSFER_TOTAL: u64 = 256 * 1024 * 1024 * 1024;
 const MAX_TRANSFER_FILES: usize = 20_000;
@@ -154,6 +154,8 @@ pub struct WorkerInfo {
     pub enabled: bool,
     pub connected: bool,
     pub assigned: Option<(i64, i64)>,
+    pub current_done: i64,
+    pub completed_frames: i64,
 }
 
 #[derive(Default)]
@@ -171,13 +173,43 @@ pub struct State {
     pub total: i64,
     pub output: PathBuf,
     bundle: Arc<OnceLock<Result<Arc<TransferBundle>, String>>>,
+    pub local_progress: Option<(i64, i64, i64)>,
+    pub log_path: Option<PathBuf>,
+    log_error_reported: bool,
 }
 
 pub type Shared = Arc<Mutex<State>>;
 
+fn append_log(path: &Path, message: &str) -> Result<(), String> {
+    let parent = path.parent().ok_or("로그 폴더가 없습니다")?;
+    std::fs::create_dir_all(parent).map_err(|e| format!("로그 폴더 만들기: {e}"))?;
+    if std::fs::metadata(path).is_ok_and(|metadata| metadata.len() > 5_000_000) {
+        let previous = path.with_extension("old.log");
+        if previous.exists() {
+            std::fs::remove_file(&previous).map_err(|e| format!("이전 로그 정리: {e}"))?;
+        }
+        std::fs::rename(path, previous).map_err(|e| format!("로그 교체: {e}"))?;
+    }
+    let mut file = std::fs::OpenOptions::new().create(true).append(true).open(path).map_err(|e| format!("로그 열기: {e}"))?;
+    let seconds = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap_or_default().as_secs();
+    writeln!(file, "[{seconds}] {message}").map_err(|e| format!("로그 쓰기: {e}"))
+}
+
 impl State {
+    pub fn with_log_path(path: Option<PathBuf>) -> Self {
+        Self { log_path: path, ..Self::default() }
+    }
+
     pub fn note(&mut self, message: impl Into<String>) {
-        self.messages.push(message.into());
+        let message = message.into();
+        if let Some(path) = &self.log_path
+            && let Err(error) = append_log(path, &message)
+            && !self.log_error_reported
+        {
+            self.log_error_reported = true;
+            self.messages.push(format!("로그 파일 저장 실패: {error}"));
+        }
+        self.messages.push(message);
         if self.messages.len() > 100 {
             self.messages.remove(0);
         }
@@ -216,6 +248,11 @@ enum Message {
         frame: i64,
         len: u64,
         sha256: String,
+    },
+    Progress {
+        start: i64,
+        end: i64,
+        done: i64,
     },
     Request,
     Assign {
@@ -641,6 +678,27 @@ fn chunk_complete(output: &Path, start: i64, end: i64) -> bool {
     (start..end).all(|frame| valid_png(&frame_path(output, frame)))
 }
 
+fn connect_to_host(address: &str) -> Result<TcpStream, String> {
+    let target = address
+        .trim()
+        .parse::<SocketAddr>()
+        .map_err(|_| format!("호스트 주소 '{address}'가 올바르지 않습니다. 호스트 PC의 고정 LAN IP와 포트를 입력하세요 (예: 192.168.0.10:9778)"))?;
+    TcpStream::connect_timeout(&target, Duration::from_secs(6)).map_err(|error| {
+        let reason = match error.kind() {
+            std::io::ErrorKind::ConnectionRefused => "호스트가 이 IP:포트에서 대기하지 않습니다. 호스트 앱에서 '호스트 열기'가 완료됐는지 확인하세요.",
+            std::io::ErrorKind::TimedOut => "연결 시간이 초과됐습니다. 두 PC의 LAN 연결, 호스트 IP, Windows 방화벽의 TCP 9778 허용을 확인하세요.",
+            std::io::ErrorKind::AddrNotAvailable => "이 PC에서 해당 주소로 연결할 수 없습니다. 호스트 PC의 LAN IP를 확인하세요.",
+            _ => "호스트 IP와 포트, LAN 연결, 방화벽 설정을 확인하세요.",
+        };
+        let loopback = if target.ip().is_loopback() {
+            " 127.0.0.1은 이 클라이언트 PC 자신입니다. 다른 PC의 호스트에는 호스트의 LAN IP를 입력하세요."
+        } else {
+            ""
+        };
+        format!("호스트 연결 실패 ({target}): {error}. {reason}{loopback}")
+    })
+}
+
 pub fn start_coordinator(config: Config, state: Shared, stop: Arc<AtomicBool>) -> Result<Job, String> {
     if !(1..=MAX_FRAMES).contains(&config.chunk_frames) || !(1..=MAX_WORKERS).contains(&config.max_workers) {
         return Err("구간 크기는 1~100,000프레임, 사용할 PC 수는 1~64대여야 합니다".into());
@@ -926,7 +984,10 @@ fn serve_worker(mut stream: TcpStream, peer: SocketAddr, config: &Config, job: &
             let id = s.next_worker_id;
             s.workers += 1;
             let enabled = !s.disabled_workers.contains(&ip) && !s.disabled_workers.contains(&label);
-            s.worker_info.insert(id, WorkerInfo { id, ip: ip.clone(), label: label.clone(), enabled, connected: true, assigned: None });
+            s.worker_info.insert(
+                id,
+                WorkerInfo { id, ip: ip.clone(), label: label.clone(), enabled, connected: true, assigned: None, current_done: 0, completed_frames: 0 },
+            );
             Ok(id)
         }
     };
@@ -991,6 +1052,7 @@ fn serve_worker(mut stream: TcpStream, peer: SocketAddr, config: &Config, job: &
                             let range = (chunk.start, chunk.end);
                             if let Some(info) = s.worker_info.get_mut(&worker_id) {
                                 info.assigned = Some(range);
+                                info.current_done = 0;
                             }
                             Some(range)
                         } else {
@@ -1014,6 +1076,18 @@ fn serve_worker(mut stream: TcpStream, peer: SocketAddr, config: &Config, job: &
                         }
                     }
                 }
+                Ok(Message::Progress { start, end, done }) if assigned == Some((start, end)) => {
+                    if done < 0 || done > end - start {
+                        break Err("클라이언트 진행률이 작업 범위를 벗어났습니다".into());
+                    }
+                    let mut s = lock(state);
+                    if let Some(info) = s.worker_info.get_mut(&worker_id) {
+                        if done < info.current_done {
+                            break Err("클라이언트 진행률이 역행했습니다".into());
+                        }
+                        info.current_done = done;
+                    }
+                }
                 Ok(Message::Frame { frame, len, sha256 }) if assigned.is_some() => {
                     let (start, end) = assigned.ok_or("작업 구간이 없습니다")?;
                     if frame != start.saturating_add(received_frames) || frame >= end || len > 512 * 1024 * 1024 {
@@ -1031,6 +1105,10 @@ fn serve_worker(mut stream: TcpStream, peer: SocketAddr, config: &Config, job: &
                     }
                     std::fs::rename(&partial, &target).map_err(|e| format!("프레임 확정: {e}"))?;
                     received_frames += 1;
+                    let mut s = lock(state);
+                    if let Some(info) = s.worker_info.get_mut(&worker_id) {
+                        info.current_done = info.current_done.max(received_frames);
+                    }
                 }
                 Ok(Message::Complete { start, end, ok, detail }) if assigned == Some((start, end)) => {
                     let verified = ok && received_frames == end - start && chunk_complete(&job.output, start, end);
@@ -1051,7 +1129,11 @@ fn serve_worker(mut stream: TcpStream, peer: SocketAddr, config: &Config, job: &
                             s.note(format!("{label}: {start}–{end} {} {detail}", if verified { "완료" } else { "실패" }));
                         }
                         if let Some(info) = s.worker_info.get_mut(&worker_id) {
+                            if verified {
+                                info.completed_frames = info.completed_frames.saturating_add(end - start);
+                            }
                             info.assigned = None;
+                            info.current_done = 0;
                         }
                     }
                     assigned = None;
@@ -1077,6 +1159,7 @@ fn serve_worker(mut stream: TcpStream, peer: SocketAddr, config: &Config, job: &
     if let Some(info) = s.worker_info.get_mut(&worker_id) {
         info.connected = false;
         info.assigned = None;
+        info.current_done = 0;
     }
     result
 }
@@ -1108,7 +1191,7 @@ pub fn run_worker(config: Config, state: Shared, stop: Arc<AtomicBool>) -> Resul
     if !config.cli.is_file() {
         return Err(format!("렌더 CLI 파일이 없습니다: {}", config.cli.display()));
     }
-    let mut stream = TcpStream::connect(&config.address).map_err(|e| format!("서버 연결: {e}"))?;
+    let mut stream = connect_to_host(&config.address)?;
     stream.set_read_timeout(Some(Duration::from_secs(3600))).map_err(|e| e.to_string())?;
     let mut reader = BufReader::new(stream.try_clone().map_err(|e| e.to_string())?);
     let name = std::env::var("COMPUTERNAME").or_else(|_| std::env::var("HOSTNAME")).unwrap_or_else(|_| "worker".into());
@@ -1141,10 +1224,13 @@ pub fn run_worker(config: Config, state: Shared, stop: Arc<AtomicBool>) -> Resul
                     return Err("서버 작업 범위 또는 설정이 프로젝트와 다릅니다".into());
                 }
                 log(&state, format!("렌더링: {start}–{end}"));
-                let result = render_chunk(&config, job, start, end);
+                let result = render_chunk(&config, job, start, end, |done| {
+                    lock(&state).local_progress = Some((start, end, done));
+                    send(&mut stream, &Message::Progress { start, end, done })
+                });
                 let (ok, detail) = match result {
                     Ok(()) => (true, "".into()),
-                    Err(e) => (false, e),
+                    Err(e) => (false, e.chars().take(1800).collect::<String>()),
                 };
                 if ok {
                     for frame in start..end {
@@ -1159,8 +1245,12 @@ pub fn run_worker(config: Config, state: Shared, stop: Arc<AtomicBool>) -> Resul
                         std::fs::remove_file(&path).map_err(|e| format!("전송한 임시 프레임 삭제: {e}"))?;
                     }
                 }
-                send(&mut stream, &Message::Complete { start, end, ok, detail })?;
-                log(&state, format!("구간 {start}–{end} {} · 다음 작업 대기", if ok { "완료" } else { "실패" }));
+                send(&mut stream, &Message::Complete { start, end, ok, detail: detail.clone() })?;
+                if ok {
+                    log(&state, format!("구간 {start}–{end} 완료 · 다음 작업 대기"));
+                } else {
+                    log(&state, format!("구간 {start}–{end} 실패: {detail}"));
+                }
             }
             Message::Wait => thread::sleep(Duration::from_secs(1)),
             Message::Finished => {
@@ -1181,7 +1271,7 @@ pub fn run_worker(config: Config, state: Shared, stop: Arc<AtomicBool>) -> Resul
     Ok(())
 }
 
-fn render_chunk(config: &Config, job: &Job, start: i64, end: i64) -> Result<(), String> {
+fn render_chunk(config: &Config, job: &Job, start: i64, end: i64, mut progress: impl FnMut(i64) -> Result<(), String>) -> Result<(), String> {
     // A tiny bias below each boundary ensures the CLI's f64-to-Tick conversion
     // cannot advance a boundary by one tick and skip its frame.
     let start_s = format!("{:.9}", (job.rate.tick_of(start).seconds() - 0.000_001).max(0.0));
@@ -1209,12 +1299,49 @@ fn render_chunk(config: &Config, job: &Job, start: i64, end: i64) -> Result<(), 
             command.env("EFFECTCRAFT_FONT_DIRS", fonts);
         }
     }
-    let output = command.output().map_err(|e| format!("렌더 CLI 실행: {e}"))?;
-    if !output.status.success() {
-        let stderr = String::from_utf8_lossy(&output.stderr);
-        let tail: String = stderr.chars().rev().take(500).collect::<String>().chars().rev().collect();
-        return Err(format!("CLI 종료 {}: {tail}", output.status));
+    let stderr_path = config.output.join(format!("cli_{start}_{end}.stderr"));
+    let stderr_file = std::fs::File::create(&stderr_path).map_err(|e| format!("CLI 오류 기록 파일 만들기: {e}"))?;
+    command.stdout(Stdio::null()).stderr(Stdio::from(stderr_file));
+    let mut child = command.spawn().map_err(|e| format!("렌더 CLI 실행: {e}"))?;
+    let mut next = start;
+    let mut last_progress = -1_i64;
+    let status = loop {
+        let current = match child.try_wait() {
+            Ok(status) => status,
+            Err(error) => {
+                let _ = child.kill();
+                let _ = child.wait();
+                return Err(format!("렌더 CLI 상태 확인: {error}"));
+            }
+        };
+        while next < end && valid_png(&frame_path(&config.output, next)) {
+            next += 1;
+        }
+        let done = next - start;
+        if done != last_progress {
+            if let Err(error) = progress(done) {
+                let _ = child.kill();
+                let _ = child.wait();
+                return Err(error);
+            }
+            last_progress = done;
+        }
+        if let Some(status) = current {
+            break status;
+        }
+        thread::sleep(Duration::from_millis(400));
+    };
+    if !status.success() {
+        let mut file = std::fs::File::open(&stderr_path).map_err(|e| format!("CLI 오류 기록 읽기: {e}"))?;
+        let len = file.metadata().map_err(|e| format!("CLI 오류 기록 정보: {e}"))?.len();
+        file.seek(SeekFrom::Start(len.saturating_sub(4000))).map_err(|e| format!("CLI 오류 기록 위치: {e}"))?;
+        let mut bytes = Vec::new();
+        file.take(4000).read_to_end(&mut bytes).map_err(|e| format!("CLI 오류 기록 읽기: {e}"))?;
+        let tail = String::from_utf8_lossy(&bytes);
+        let _ = std::fs::remove_file(&stderr_path);
+        return Err(format!("CLI 종료 {status}: {tail}"));
     }
+    let _ = std::fs::remove_file(&stderr_path);
     if !chunk_complete(&config.output, start, end) {
         return Err("CLI는 종료됐지만 일부 PNG 프레임이 없거나 손상됐습니다".into());
     }
@@ -1368,15 +1495,23 @@ pub fn worker_snapshot(state: &Shared) -> (Vec<WorkerInfo>, String) {
 }
 
 pub fn snapshot(state: &Shared) -> (i64, i64, usize, usize, Vec<String>, PathBuf) {
-    let (done, running, total, workers, failed, messages, output) = {
-        let s = lock(state);
-        let done = s.chunks.iter().filter(|c| c.status == ChunkStatus::Done).map(|c| c.end - c.start).sum::<i64>();
-        let running = s.chunks.iter().filter(|c| c.status == ChunkStatus::Running).map(|c| (c.start, c.end)).collect::<Vec<_>>();
-        let failed = s.chunks.iter().filter(|c| c.status == ChunkStatus::Failed).count();
-        (done, running, s.total, s.workers, failed, s.messages.clone(), s.output.clone())
-    };
-    let in_progress = running.into_iter().map(|(start, end)| (start..end).filter(|frame| valid_png(&frame_path(&output, *frame))).count() as i64).sum::<i64>();
-    (done.saturating_add(in_progress).min(total), total, workers, failed, messages, output)
+    let s = lock(state);
+    let mut done = 0_i64;
+    let mut failed = 0_usize;
+    let running = s.worker_info.values().filter_map(|worker| worker.assigned.map(|range| (range, worker.current_done))).collect::<BTreeMap<_, _>>();
+    for chunk in &s.chunks {
+        match chunk.status {
+            ChunkStatus::Done => done = done.saturating_add(chunk.end - chunk.start),
+            ChunkStatus::Running => {
+                if let Some(progress) = running.get(&(chunk.start, chunk.end)) {
+                    done = done.saturating_add((*progress).clamp(0, chunk.end - chunk.start));
+                }
+            }
+            ChunkStatus::Failed => failed += 1,
+            ChunkStatus::Pending => {}
+        }
+    }
+    (done.min(s.total), s.total, s.workers, failed, s.messages.clone(), s.output.clone())
 }
 
 #[cfg(test)]
@@ -1395,6 +1530,18 @@ mod tests {
             let Message::File { len, .. } = receive(reader).unwrap() else { panic!("file expected") };
             std::io::copy(&mut reader.take(len), &mut std::io::sink()).unwrap();
         }
+    }
+
+    #[test]
+    fn connection_errors_explain_invalid_address_and_closed_local_port() {
+        let invalid = connect_to_host("not an address").err().unwrap();
+        assert!(invalid.contains("LAN IP"));
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        drop(listener);
+        let closed = connect_to_host(&address.to_string()).err().unwrap();
+        assert!(closed.contains("호스트 열기"));
+        assert!(closed.contains("127.0.0.1"));
     }
 
     fn send_test_frames(stream: &mut TcpStream, start: i64, end: i64) {
@@ -1448,6 +1595,17 @@ mod tests {
     fn invalid_png_is_not_complete() {
         let dir = std::env::temp_dir().join(format!("effectcraft-farm-test-{}", std::process::id()));
         assert!(!chunk_complete(&dir, 0, 1));
+    }
+
+    #[test]
+    fn errors_are_saved_to_a_diagnostic_log() {
+        let suffix = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos();
+        let dir = std::env::temp_dir().join(format!("effectcraft-farm-log-{}-{suffix}", std::process::id()));
+        let path = dir.join("render-farm.log");
+        let mut state = State::with_log_path(Some(path.clone()));
+        state.note("CLI 종료 실패: sample error");
+        assert!(std::fs::read_to_string(&path).unwrap().contains("CLI 종료 실패: sample error"));
+        std::fs::remove_dir_all(dir).unwrap();
     }
 
     #[test]
@@ -1584,12 +1742,22 @@ mod tests {
         receive_test_bundle(&mut reader);
         send(&mut client, &Message::Request).unwrap();
         assert!(matches!(receive(&mut reader), Ok(Message::Assign { start: 0, end: 2, .. })));
+        send(&mut client, &Message::Progress { start: 0, end: 2, done: 1 }).unwrap();
+        for _ in 0..100 {
+            if snapshot(&state).0 == 1 {
+                break;
+            }
+            thread::sleep(Duration::from_millis(10));
+        }
+        assert_eq!(snapshot(&state).0, 1);
+        assert_eq!(worker_snapshot(&state).0.first().unwrap().current_done, 1);
         send_test_frames(&mut client, 0, 2);
         send(&mut client, &Message::Complete { start: 0, end: 2, ok: true, detail: String::new() }).unwrap();
         send(&mut client, &Message::Request).unwrap();
         assert!(matches!(receive(&mut reader), Ok(Message::Finished)));
         assert!(server.join().unwrap().is_ok());
         assert_eq!(snapshot(&state).0, 2);
+        assert_eq!(worker_snapshot(&state).0.first().unwrap().completed_frames, 2);
         std::fs::remove_dir_all(dir).unwrap();
     }
 
@@ -1733,6 +1901,8 @@ mod tests {
         assert!(run_worker(client, state.clone(), Arc::new(AtomicBool::new(false))).is_ok());
         assert!(server.join().unwrap().is_ok());
         assert!(chunk_complete(&dir, 0, 2));
+        assert_eq!(worker_snapshot(&state).0.first().unwrap().completed_frames, 2);
+        assert_eq!(lock(&state).local_progress, Some((0, 2, 2)));
         assert!(lock(&state).messages.iter().any(|message| message.contains("임시 프로젝트·소스·프레임 삭제 완료")));
         std::fs::remove_dir_all(dir).unwrap();
     }

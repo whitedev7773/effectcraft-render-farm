@@ -133,6 +133,7 @@ struct App {
     last_discovery: Option<Instant>,
     discovery_status: String,
     last_error: String,
+    last_logged_error: String,
     catalog_path: String,
     catalog_changed: Option<Instant>,
     pending_catalog: Option<Receiver<Result<Vec<CompInfo>, String>>>,
@@ -152,7 +153,7 @@ impl Default for App {
             stopping: false,
             stop: Arc::new(AtomicBool::new(false)),
             worker_active: Arc::new(AtomicBool::new(false)),
-            state: Arc::new(Mutex::new(State::default())),
+            state: Arc::new(Mutex::new(State::with_log_path(settings::log_path().ok()))),
             job: None,
             pending_start: None,
             pending_config: None,
@@ -161,6 +162,7 @@ impl Default for App {
             last_discovery: None,
             discovery_status: String::new(),
             last_error: warning.unwrap_or_default(),
+            last_logged_error: String::new(),
             catalog_path,
             catalog_changed,
             pending_catalog: None,
@@ -407,7 +409,7 @@ impl App {
 
 impl eframe::App for App {
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
-        ui.ctx().request_repaint_after(Duration::from_secs(1));
+        ui.ctx().request_repaint_after(Duration::from_millis(500));
         self.poll_start();
         self.poll_discovery();
         self.poll_catalog();
@@ -483,6 +485,11 @@ impl eframe::App for App {
                     });
                 }
             });
+            if self.running && self.settings.host {
+                ui.small(format!("TCP 수신 중: {} · 클라이언트에는 이 PC의 고정 LAN IP와 위 수신 포트를 입력하세요", self.settings.host_address));
+            } else if !self.settings.host && self.settings.client_address.trim_start().starts_with("127.") {
+                ui.colored_label(egui::Color32::YELLOW, "127.0.0.1은 이 클라이언트 PC 자신입니다. 호스트가 다른 PC라면 호스트 PC의 고정 LAN IP를 입력하세요.");
+            }
             if !self.last_error.is_empty() {
                 ui.colored_label(egui::Color32::RED, &self.last_error);
             }
@@ -508,6 +515,7 @@ impl eframe::App for App {
                             ui.small("0.0.0.0은 이 PC의 모든 네트워크 주소에서 연결을 받습니다.");
                         } else {
                             text_row(ui, "호스트의 고정 IP:포트", &mut self.settings.client_address, false);
+                            ui.small("예: 192.168.0.10:9778 · 호스트에서 '호스트 열기'를 완료한 뒤 연결하세요.");
                             ui.horizontal(|ui| {
                                 if ui.button("LAN에서 다시 검색").clicked() && self.pending_discovery.is_none() {
                                     self.start_discovery();
@@ -671,30 +679,57 @@ impl eframe::App for App {
                 }
                 if self.settings.host && total > 0 {
                     section_title(ui, "진행 상황");
-                    ui.add(egui::ProgressBar::new((done as f32 / total as f32).clamp(0.0, 1.0)).text(format!("{done} / {total} 프레임")));
+                    ui.add(
+                        egui::ProgressBar::new((done as f32 / total as f32).clamp(0.0, 1.0))
+                            .text(format!("전체 {done} / {total} 프레임 · {:.1}%", done as f64 * 100.0 / total as f64)),
+                    );
                     ui.label(format!("연결된 PC: {connected} · 실패한 구간: {failed} · 동시 사용 한도: {}", self.settings.max_workers));
                     ui.label(&final_status);
                 }
+                if !self.settings.host
+                    && let Some((start, end, done)) = self.state.lock().unwrap_or_else(std::sync::PoisonError::into_inner).local_progress
+                {
+                    let span = end - start;
+                    if span > 0 {
+                        section_title(ui, "이 PC 렌더 진행률");
+                        ui.add(egui::ProgressBar::new((done as f32 / span as f32).clamp(0.0, 1.0)).text(format!("{start}–{end} · {done} / {span} 프레임")));
+                    }
+                }
                 if self.settings.host {
                     ui.separator();
-                    section_title(ui, "연결된 PC");
+                    section_title(ui, "PC별 진행률");
                     if !workers.iter().any(|worker| worker.connected) {
                         ui.label("연결된 PC가 없습니다. 클라이언트에서 이 호스트의 고정 IP로 연결하세요.");
                     }
-                    for worker in workers.iter().filter(|worker| worker.connected) {
-                        ui.horizontal(|ui| {
-                            let mut enabled = worker.enabled;
-                            if ui.checkbox(&mut enabled, &worker.label).changed()
-                                && let Some(ip) = farm::set_worker_enabled(&self.state, worker.id, enabled)
-                            {
-                                self.settings.disabled_workers.retain(|saved| saved != &ip && saved != &worker.label);
-                                if !enabled {
-                                    self.settings.disabled_workers.push(ip);
+                    for worker in &workers {
+                        ui.group(|ui| {
+                            ui.set_width(ui.available_width());
+                            ui.horizontal(|ui| {
+                                let mut enabled = worker.enabled;
+                                if ui.checkbox(&mut enabled, &worker.label).changed()
+                                    && let Some(ip) = farm::set_worker_enabled(&self.state, worker.id, enabled)
+                                {
+                                    self.settings.disabled_workers.retain(|saved| saved != &ip && saved != &worker.label);
+                                    if !enabled {
+                                        self.settings.disabled_workers.push(ip);
+                                    }
                                 }
-                            }
+                                if !worker.connected {
+                                    ui.small("연결 끊김");
+                                }
+                            });
                             if let Some((start, end)) = worker.assigned {
-                                ui.label(format!("{start}–{end}"));
+                                let span = end - start;
+                                if span > 0 {
+                                    ui.add(
+                                        egui::ProgressBar::new((worker.current_done as f32 / span as f32).clamp(0.0, 1.0))
+                                            .text(format!("현재 {start}–{end} · {} / {span} 프레임", worker.current_done)),
+                                    );
+                                }
+                            } else {
+                                ui.small("현재 작업 대기");
                             }
+                            ui.small(format!("이 PC에서 완료: {}프레임", worker.completed_frames));
                         });
                     }
                 }
@@ -708,8 +743,17 @@ impl eframe::App for App {
                 ui.separator();
                 ui.small("클라이언트가 호스트의 로컬 IP로 연결합니다. 프로젝트와 참조 소스는 호스트가 전송합니다.");
                 ui.small("설정은 이 PC의 EffectCraft 사용자 설정 폴더에 저장됩니다.");
+                if let Ok(path) = settings::log_path() {
+                    ui.small(format!("로그 파일: {}", path.display()));
+                }
             });
         });
+        if self.last_error != self.last_logged_error {
+            if !self.last_error.is_empty() {
+                self.state.lock().unwrap_or_else(std::sync::PoisonError::into_inner).note(format!("화면 오류: {}", self.last_error));
+            }
+            self.last_logged_error = self.last_error.clone();
+        }
         if self.settings != before {
             self.save_settings();
         }
