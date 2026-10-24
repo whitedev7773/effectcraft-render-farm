@@ -9,7 +9,10 @@ repository = "https://github.com/whitedev7773/effectcraft-render-farm"
 
 [dependencies]
 eframe = { version = "0.36", default-features = false, features = ["default_fonts", "glow", "x11", "wayland"] }
+craft-docpath = { git = "https://github.com/storytold/craft-libs", rev = "82a24b006eefa036b43c09a67fb9a3fbd17ffe63" }
+effectcraft-keyframe = { git = "https://github.com/storytold/effectcraft", rev = "ef74d82902ba486891b02afa87e42963cc9b84cc" }
 effectcraft-project = { git = "https://github.com/storytold/effectcraft", rev = "ef74d82902ba486891b02afa87e42963cc9b84cc" }
+effectcraft-text = { git = "https://github.com/storytold/effectcraft", rev = "ef74d82902ba486891b02afa87e42963cc9b84cc" }
 effectcraft-time = { git = "https://github.com/storytold/effectcraft", rev = "ef74d82902ba486891b02afa87e42963cc9b84cc" }
 rfd = "0.17"
 serde = { version = "1", features = ["derive", "rc"] }

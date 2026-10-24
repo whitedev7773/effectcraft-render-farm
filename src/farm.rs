@@ -1,4 +1,4 @@
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::io::{BufRead, BufReader, Read, Seek, SeekFrom, Write};
 use std::net::{SocketAddr, TcpListener, TcpStream};
 use std::path::{Path, PathBuf};
@@ -8,8 +8,10 @@ use std::sync::{Arc, Mutex, PoisonError};
 use std::thread;
 use std::time::Duration;
 
+use effectcraft_keyframe::Value;
+use effectcraft_project::props::{Node, PropGroup};
 use effectcraft_project::render_queue::sequence_path;
-use effectcraft_project::{Footage, FootageKind, ItemKind, LayerSource, Project};
+use effectcraft_project::{Footage, FootageKind, ItemId, ItemKind, LayerSource, Project};
 use effectcraft_time::FrameRate;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
@@ -176,7 +178,7 @@ pub fn read_job(config: &Config) -> Result<Job, String> {
     let source = std::str::from_utf8(&bytes).map_err(|e| format!("프로젝트 문자 인코딩: {e}"))?;
     let project = Project::from_json(source).map_err(|e| format!("프로젝트 열기: {e}"))?;
     let matches: Vec<_> = project.comps().filter(|(id, _)| project.item(**id).is_some_and(|item| item.name == config.comp)).collect();
-    let [(_, comp)] = matches.as_slice() else {
+    let [(comp_id, comp)] = matches.as_slice() else {
         return Err(format!("컴포지션 이름이 없거나 중복됩니다: {}", config.comp));
     };
     let rate = comp.frame_rate;
@@ -195,6 +197,7 @@ pub fn read_job(config: &Config) -> Result<Job, String> {
     if start < 0 || end <= start || end > total {
         return Err(format!("렌더 범위는 0 이상 {total} 이하이며 시작 < 끝이어야 합니다"));
     }
+    preflight_resources(&project, **comp_id, &config.project)?;
     Ok(Job {
         hash: project_hash(&bytes),
         comp: config.comp.clone(),
@@ -206,6 +209,107 @@ pub fn read_job(config: &Config) -> Result<Job, String> {
         height: comp.height,
         output: config.output.clone(),
     })
+}
+
+/// Check files and fonts used by the selected comp before any frame is assigned.
+fn preflight_resources(project: &Project, root: ItemId, project_path: &Path) -> Result<(), String> {
+    let project_path = std::path::absolute(project_path).map_err(|e| format!("프로젝트 경로 확인: {e}"))?;
+    let mut seen = BTreeSet::new();
+    let mut pending = vec![(root, 0_usize)];
+    let mut missing = BTreeSet::new();
+    while let Some((id, depth)) = pending.pop() {
+        if !seen.insert(id) {
+            continue;
+        }
+        if depth > 64 {
+            return Err("컴포지션 중첩이 64단계를 넘습니다".into());
+        }
+        let Some(item) = project.item(id) else {
+            return Err(format!("프로젝트의 참조 항목을 찾을 수 없습니다: {}", id.0));
+        };
+        match &item.kind {
+            ItemKind::Comp(comp) => {
+                if let Some(proxy) = item.proxy.as_ref().filter(|p| p.enabled) {
+                    check_footage(&proxy.footage, &project_path, &mut missing);
+                }
+                for layer in &comp.layers {
+                    collect_fonts(&layer.props, &mut missing)?;
+                    if let Some(source) = layer.source.item() {
+                        pending.push((source, depth + 1));
+                    }
+                }
+            }
+            ItemKind::Footage(footage) => {
+                check_footage(footage, &project_path, &mut missing);
+                if let Some(proxy) = item.proxy.as_ref().filter(|p| p.enabled) {
+                    check_footage(&proxy.footage, &project_path, &mut missing);
+                }
+            }
+            ItemKind::Folder | ItemKind::Solid(_) => {}
+        }
+        if missing.len() > 1000 {
+            return Err("누락된 미디어 또는 글꼴이 1,000개를 넘습니다".into());
+        }
+    }
+    if missing.is_empty() {
+        Ok(())
+    } else {
+        let details = missing.iter().take(20).cloned().collect::<Vec<_>>().join("\n");
+        let more = if missing.len() > 20 { format!("\n외 {}개", missing.len() - 20) } else { String::new() };
+        Err(format!("이 PC에서 렌더에 필요한 리소스 {}개를 찾지 못했습니다:\n{details}{more}", missing.len()))
+    }
+}
+
+fn check_footage(footage: &Footage, project_path: &Path, missing: &mut BTreeSet<String>) {
+    if footage.kind == FootageKind::Data && footage.data.is_some() {
+        return;
+    }
+    if footage.path.is_empty() && footage.sequence.is_empty() && footage.data.is_none() {
+        missing.insert("미디어 경로가 비어 있음".into());
+    }
+    for stored in std::iter::once(&footage.path).chain(&footage.sequence).filter(|path| !path.is_empty()) {
+        let document = project_path.to_string_lossy();
+        match craft_docpath::resolve(stored, Some(Path::new(document.as_ref()))) {
+            Ok(path) if path.is_file() => {}
+            Ok(path) => {
+                missing.insert(format!("미디어: {} ({})", stored, path.display()));
+            }
+            Err(reason) => {
+                missing.insert(format!("미디어 경로: {stored} ({reason})"));
+            }
+        }
+    }
+}
+
+fn collect_fonts(root: &PropGroup, missing: &mut BTreeSet<String>) -> Result<(), String> {
+    let mut pending = vec![(root, 0_usize)];
+    while let Some((group, depth)) = pending.pop() {
+        if depth > 64 {
+            return Err("속성 그룹 중첩이 64단계를 넘습니다".into());
+        }
+        for node in &group.children {
+            match node {
+                Node::Group(child) => pending.push((child, depth + 1)),
+                Node::Prop(prop) => {
+                    for value in std::iter::once(&prop.value).chain(prop.keys.iter().map(|key| &key.value)) {
+                        if let Value::Text(doc) = value {
+                            check_font(&doc.font, &doc.style, missing);
+                            for run in &doc.runs {
+                                check_font(&run.style.font, &run.style.style, missing);
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
+fn check_font(family: &str, style: &str, missing: &mut BTreeSet<String>) {
+    if effectcraft_text::fonts::resolve(family, style).missing {
+        missing.insert(format!("글꼴: {family} / {style}"));
+    }
 }
 
 fn prepare_output(job: &Job) -> Result<(), String> {
@@ -767,6 +871,24 @@ mod tests {
     use effectcraft_color::Label;
     use effectcraft_project::{Comp, ItemKind};
     use effectcraft_time::Tick;
+
+    #[test]
+    fn missing_media_and_sequence_frame_are_reported() {
+        let project = std::env::temp_dir().join("farm-preflight-example.ecproj");
+        let mut footage = Footage { path: "missing-video.mov".into(), ..Footage::default() };
+        footage.sequence.push("missing-frame.png".into());
+        let mut missing = BTreeSet::new();
+        check_footage(&footage, &project, &mut missing);
+        assert_eq!(missing.len(), 2);
+        assert!(missing.iter().any(|entry| entry.contains("missing-frame.png")));
+    }
+
+    #[test]
+    fn unavailable_font_is_reported_before_render() {
+        let mut missing = BTreeSet::new();
+        check_font("EffectCraft Definitely Missing Test Font 8765", "Regular", &mut missing);
+        assert!(missing.iter().any(|entry| entry.contains("EffectCraft Definitely Missing Test Font 8765")));
+    }
 
     #[test]
     fn chunk_partition_has_no_gaps() {

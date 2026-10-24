@@ -245,6 +245,14 @@ impl eframe::App for App {
         ui.ctx().request_repaint_after(Duration::from_secs(1));
         self.poll_start();
         self.poll_discovery();
+        if self.running && !self.settings.host && !self.worker_active.load(Ordering::Relaxed) {
+            self.running = false;
+            self.stopping = false;
+            let state = self.state.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+            if let Some(message) = state.messages.last().filter(|message| message.starts_with("클라이언트 오류:")) {
+                self.last_error = message.clone();
+            }
+        }
         if !self.settings.host
             && !self.running
             && self.pending_discovery.is_none()
