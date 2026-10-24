@@ -67,6 +67,57 @@ fn primary_button(label: &str) -> egui::Button<'_> {
     egui::Button::new(egui::RichText::new(label).strong().color(egui::Color32::WHITE)).fill(egui::Color32::from_rgb(35, 103, 169))
 }
 
+#[derive(Clone, Copy)]
+enum RangeHandle {
+    Start,
+    End,
+}
+
+fn range_bar(ui: &mut egui::Ui, start: &mut i64, end: &mut i64, total: i64, work: (i64, i64), handle: &mut Option<RangeHandle>) {
+    if total < 1 {
+        return;
+    }
+    let (rect, response) = ui.allocate_exact_size(egui::vec2(ui.available_width().max(120.0), 44.0), egui::Sense::click_and_drag());
+    let left = rect.left() + 12.0;
+    let right = rect.right() - 12.0;
+    let width = (right - left).max(1.0);
+    let x = |frame: i64| left + width * (frame.clamp(0, total) as f32 / total as f32);
+    let center = rect.center().y;
+    let painter = ui.painter();
+    painter.rect_filled(egui::Rect::from_min_max(egui::pos2(left, center - 5.0), egui::pos2(right, center + 5.0)), 5.0, egui::Color32::from_gray(67));
+    painter.rect_filled(
+        egui::Rect::from_min_max(egui::pos2(x(work.0), center - 5.0), egui::pos2(x(work.1), center + 5.0)),
+        5.0,
+        egui::Color32::from_rgb(82, 96, 111),
+    );
+    painter.rect_filled(
+        egui::Rect::from_min_max(egui::pos2(x(*start), center - 5.0), egui::pos2(x(*end), center + 5.0)),
+        5.0,
+        egui::Color32::from_rgb(55, 146, 227),
+    );
+    for frame in [*start, *end] {
+        painter.circle_filled(egui::pos2(x(frame), center), 9.0, egui::Color32::WHITE);
+        painter.circle_stroke(egui::pos2(x(frame), center), 9.0, egui::Stroke::new(2.0, egui::Color32::from_rgb(35, 103, 169)));
+    }
+    if (response.drag_started() || response.clicked())
+        && let Some(pointer) = response.interact_pointer_pos()
+    {
+        *handle = Some(if (pointer.x - x(*start)).abs() <= (pointer.x - x(*end)).abs() { RangeHandle::Start } else { RangeHandle::End });
+    }
+    if (response.dragged() || response.clicked())
+        && let (Some(pointer), Some(selected)) = (response.interact_pointer_pos(), *handle)
+    {
+        let frame = (((pointer.x - left) / width).clamp(0.0, 1.0) * total as f32).round() as i64;
+        match selected {
+            RangeHandle::Start => *start = frame.clamp(0, end.saturating_sub(1)),
+            RangeHandle::End => *end = frame.clamp(start.saturating_add(1), total),
+        }
+    }
+    if response.drag_stopped() || response.clicked() {
+        *handle = None;
+    }
+}
+
 struct App {
     settings: Settings,
     running: bool,
@@ -87,11 +138,14 @@ struct App {
     pending_catalog: Option<Receiver<Result<Vec<CompInfo>, String>>>,
     catalog: Vec<CompInfo>,
     catalog_status: String,
+    range_handle: Option<RangeHandle>,
 }
 
 impl Default for App {
     fn default() -> Self {
         let (settings, warning) = settings::load();
+        let catalog_path = settings.project.clone();
+        let catalog_changed = (!catalog_path.is_empty()).then(Instant::now);
         Self {
             settings,
             running: false,
@@ -107,16 +161,27 @@ impl Default for App {
             last_discovery: None,
             discovery_status: String::new(),
             last_error: warning.unwrap_or_default(),
-            catalog_path: String::new(),
-            catalog_changed: None,
+            catalog_path,
+            catalog_changed,
             pending_catalog: None,
             catalog: Vec::new(),
             catalog_status: String::new(),
+            range_handle: None,
         }
     }
 }
 
 impl App {
+    fn sync_selected_comp_range(&mut self) {
+        if let Some(comp) = self.catalog.iter().find(|comp| comp.name == self.settings.comp)
+            && self.settings.range_comp != comp.name
+        {
+            self.settings.range_start = comp.work_start;
+            self.settings.range_end = comp.work_end;
+            self.settings.range_comp = comp.name.clone();
+        }
+    }
+
     fn missing_host_settings(&self) -> Vec<&'static str> {
         let mut missing = Vec::new();
         if self.settings.project.trim().is_empty() {
@@ -143,6 +208,7 @@ impl App {
             self.catalog_changed = Some(Instant::now());
             self.pending_catalog = None;
             self.catalog.clear();
+            self.settings.range_comp.clear();
             self.catalog_status =
                 if self.catalog_path.is_empty() { "프로젝트 파일을 선택하세요".into() } else { "컴포지션을 읽는 중…".into() };
         }
@@ -160,6 +226,7 @@ impl App {
                     }
                     self.catalog_status = format!("컴포지션 {}개", comps.len());
                     self.catalog = comps;
+                    self.sync_selected_comp_range();
                 }
                 Err(error) => {
                     self.catalog.clear();
@@ -467,6 +534,7 @@ impl eframe::App for App {
                         }
                         if self.settings.host {
                             ui.label(egui::RichText::new("렌더할 컴포지션").strong());
+                            let previous_comp = self.settings.comp.clone();
                             egui::ComboBox::from_id_salt("composition")
                                 .selected_text(if self.settings.comp.is_empty() { "컴포지션 선택" } else { &self.settings.comp })
                                 .show_ui(ui, |ui| {
@@ -474,6 +542,9 @@ impl eframe::App for App {
                                         ui.selectable_value(&mut self.settings.comp, comp.name.clone(), &comp.name);
                                     }
                                 });
+                            if self.settings.comp != previous_comp {
+                                self.sync_selected_comp_range();
+                            }
                             if let Some(comp) = self.catalog.iter().find(|comp| comp.name == self.settings.comp) {
                                 ui.small(format!("{}프레임 · {:.3} FPS · {}×{}", comp.frames, comp.rate.as_f64(), comp.width, comp.height));
                             } else {
@@ -502,18 +573,49 @@ impl eframe::App for App {
                         ui.group(|ui| {
                             ui.set_width(ui.available_width());
                             section_title(ui, "3 · 렌더 범위와 분배");
-                            let total = self.catalog.iter().find(|comp| comp.name == self.settings.comp).map_or(100_000, |comp| comp.frames.max(1));
+                            let selected = self.catalog.iter().find(|comp| comp.name == self.settings.comp);
+                            let total = selected.map_or(100_000, |comp| comp.frames.max(1));
+                            if let Some(comp) = selected {
+                                ui.small(format!("작업 영역: {}–{} / 전체 {}프레임", comp.work_start, comp.work_end, comp.frames));
+                                let display_end = if self.settings.range_end == 0 { total } else { self.settings.range_end };
+                                self.settings.range_end = display_end.clamp(1, total);
+                                self.settings.range_start = self.settings.range_start.clamp(0, self.settings.range_end - 1);
+                                range_bar(
+                                    ui,
+                                    &mut self.settings.range_start,
+                                    &mut self.settings.range_end,
+                                    total,
+                                    (comp.work_start, comp.work_end),
+                                    &mut self.range_handle,
+                                );
+                                ui.horizontal(|ui| {
+                                    if ui.button("작업 영역으로 초기화").clicked() {
+                                        self.settings.range_start = comp.work_start;
+                                        self.settings.range_end = comp.work_end;
+                                    }
+                                    if ui.button("전체 컴포지션").clicked() {
+                                        self.settings.range_start = 0;
+                                        self.settings.range_end = total;
+                                    }
+                                });
+                            } else {
+                                ui.small("프로젝트와 컴포지션을 선택하면 렌더 범위 바가 표시됩니다.");
+                            }
                             egui::Grid::new("render_options").num_columns(2).spacing([20.0, 10.0]).show(ui, |ui| {
                                 ui.label("시작 프레임");
-                                ui.add(egui::DragValue::new(&mut self.settings.range_start).range(0..=total));
+                                ui.add(egui::DragValue::new(&mut self.settings.range_start).range(0..=total.saturating_sub(1)));
                                 ui.end_row();
-                                ui.label("끝 프레임 · 미포함, 0은 끝까지");
-                                ui.add(egui::DragValue::new(&mut self.settings.range_end).range(0..=total));
+                                ui.label("끝 프레임 · 미포함");
+                                ui.add(egui::DragValue::new(&mut self.settings.range_end).range(1..=total));
                                 ui.end_row();
                                 ui.label("동시에 사용할 PC 수");
                                 ui.add(egui::DragValue::new(&mut self.settings.max_workers).range(1..=64));
                                 ui.end_row();
                             });
+                            if selected.is_some() {
+                                self.settings.range_end = self.settings.range_end.clamp(1, total);
+                                self.settings.range_start = self.settings.range_start.clamp(0, self.settings.range_end - 1);
+                            }
                             ui.horizontal(|ui| {
                                 ui.label("구간 분배");
                                 ui.selectable_value(&mut self.settings.distribution, Distribution::Auto, "자동 · PC 수로 균등 분할");

@@ -27,6 +27,7 @@ pub struct Settings {
     pub local_worker: bool,
     pub range_start: i64,
     pub range_end: i64,
+    pub range_comp: String,
     pub chunk_frames: i64,
     pub distribution: Distribution,
     pub chunk_percent: f64,
@@ -55,6 +56,7 @@ impl Default for Settings {
             local_worker: true,
             range_start: 0,
             range_end: 0,
+            range_comp: String::new(),
             chunk_frames: 300,
             distribution: Distribution::Auto,
             chunk_percent: 50.0,
@@ -203,6 +205,7 @@ mod tests {
             client_address: "192.168.1.7:9778".into(),
             range_start: 120,
             range_end: 960,
+            range_comp: "Test".into(),
             max_workers: 5,
             disabled_workers: vec!["192.168.1.8".into()],
             ..Settings::default()

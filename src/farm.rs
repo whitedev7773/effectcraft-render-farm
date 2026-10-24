@@ -39,6 +39,22 @@ fn comp_frame_count(rate: FrameRate, duration: Tick) -> Result<i64, String> {
     Ok(total)
 }
 
+fn ceil_frame(rate: FrameRate, tick: Tick) -> i64 {
+    let frame = rate.frame_at(tick);
+    if rate.tick_of(frame) < tick { frame.saturating_add(1) } else { frame }
+}
+
+fn work_frame_range(rate: FrameRate, duration: Tick, work_area: (Tick, Tick), total: i64) -> (i64, i64) {
+    let start = work_area.0.max(Tick::ZERO).min(duration);
+    let end = work_area.1.max(Tick::ZERO).min(duration);
+    if end <= start {
+        return (0, total);
+    }
+    let first = ceil_frame(rate, start).clamp(0, total);
+    let last = ceil_frame(rate, end).clamp(0, total);
+    if first >= last { (0, total) } else { (first, last) }
+}
+
 #[derive(Clone)]
 pub struct Config {
     pub project: PathBuf,
@@ -76,6 +92,8 @@ pub struct CompInfo {
     pub rate: FrameRate,
     pub width: u32,
     pub height: u32,
+    pub work_start: i64,
+    pub work_end: i64,
 }
 
 #[derive(Serialize, Deserialize, PartialEq, Eq)]
@@ -254,7 +272,8 @@ pub fn list_compositions(path: &Path) -> Result<Vec<CompInfo>, String> {
             let name = project.item(*id)?.name.clone();
             let rate = comp.frame_rate;
             let frames = comp_frame_count(rate, comp.duration).unwrap_or(0);
-            Some(CompInfo { name, frames, rate: comp.frame_rate, width: comp.width, height: comp.height })
+            let (work_start, work_end) = if frames > 0 { work_frame_range(rate, comp.duration, comp.work_area, frames) } else { (0, 0) };
+            Some(CompInfo { name, frames, rate, width: comp.width, height: comp.height, work_start, work_end })
         })
         .collect::<Vec<_>>();
     comps.sort_by(|a, b| a.name.cmp(&b.name));
@@ -1017,19 +1036,30 @@ mod tests {
     }
 
     #[test]
+    fn work_area_uses_ceil_frame_boundaries_and_invalid_area_falls_back() {
+        let rate = FrameRate::FPS_60;
+        let duration = rate.tick_of(1000);
+        assert_eq!(work_frame_range(rate, duration, (rate.tick_of(100), rate.tick_of(900)), 1000), (100, 900));
+        assert_eq!(work_frame_range(rate, duration, (rate.tick_of(100) + Tick::from_seconds_f64(0.001), rate.tick_of(900)), 1000), (101, 900));
+        assert_eq!(work_frame_range(rate, duration, (rate.tick_of(900), rate.tick_of(100)), 1000), (0, 1000));
+    }
+
+    #[test]
     fn project_validation_and_manifest_reject_mixed_jobs() {
         let suffix = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos();
         let dir = std::env::temp_dir().join(format!("effectcraft-farm-{}-{suffix}", std::process::id()));
         std::fs::create_dir(&dir).unwrap();
         let project_path = dir.join("test.ecproj");
         let mut project = Project::default();
-        let comp = Comp::new(64, 64, FrameRate::FPS_60, Tick::from_seconds_f64(2.0));
+        let mut comp = Comp::new(64, 64, FrameRate::FPS_60, Tick::from_seconds_f64(2.0));
+        comp.work_area = (FrameRate::FPS_60.tick_of(30), FrameRate::FPS_60.tick_of(90));
         project.add_item("Test", Label::None, None, ItemKind::Comp(Arc::new(comp)));
         std::fs::write(&project_path, project.to_json()).unwrap();
         let catalog = list_compositions(&project_path).unwrap();
         assert_eq!(catalog.len(), 1);
         assert_eq!(catalog[0].name, "Test");
         assert_eq!(catalog[0].frames, 120);
+        assert_eq!((catalog[0].work_start, catalog[0].work_end), (30, 90));
         let config = Config {
             project: project_path,
             cli: std::env::current_exe().unwrap(),
