@@ -532,7 +532,7 @@ dependencies = [
 
 [[package]]
 name = "effectcraft-farm"
-version = "0.10.2"
+version = "0.10.3"
 dependencies = [
  "craft-docpath",
  "effectcraft-color",

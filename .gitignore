@@ -2,6 +2,7 @@
 *.mp4
 *.png
 !/assets/app-icon/*.png
+!/assets/ui/icons/*.png
 *.ecproj
 *.wav
 *.zip

@@ -42,6 +42,14 @@
         <File Source="$(var.Root)\LICENSE-APACHE" Name="Farm-LICENSE-APACHE" />
         <RegistryValue Root="HKCU" Key="Software\EffectCraft\RenderFarmInstaller" Name="ApacheLicense" Value="1" Type="integer" KeyPath="yes" />
       </Component>
+      <Component Directory="INSTALLFOLDER" Id="WantedSansLicense" Guid="5F7C4F83-A984-4E66-B0BD-972040CA0F9D">
+        <File Source="$(var.Root)\assets\ui\OFL.txt" Name="WantedSans-OFL.txt" />
+        <RegistryValue Root="HKCU" Key="Software\EffectCraft\RenderFarmInstaller" Name="WantedSansLicense" Value="1" Type="integer" KeyPath="yes" />
+      </Component>
+      <Component Directory="INSTALLFOLDER" Id="GravityIconsLicense" Guid="01F30FE6-E905-483D-92B4-C4FB96B7C268">
+        <File Source="$(var.Root)\assets\ui\icons\LICENSE" Name="GravityIcons-LICENSE.txt" />
+        <RegistryValue Root="HKCU" Key="Software\EffectCraft\RenderFarmInstaller" Name="GravityIconsLicense" Value="1" Type="integer" KeyPath="yes" />
+      </Component>
     </Feature>
   </Package>
 </Wix>

@@ -28,7 +28,7 @@ Rust 1.95 이상에서 `cargo build --release`로 앱을 빌드합니다. Window
 pwsh packaging/windows/package.ps1
 ```
 
-빌드 스크립트는 x64 GUI 실행 파일을 정적 CRT로 빌드하고, .NET 8 런타임에서 실행하는 WiX 5.0.2 포터블 도구를 SHA-256 검증 후 사용합니다. WiX를 시스템에 설치하지 않습니다. 출력은 `target/release-v버전/`의 MSI와 `SHA256SUMS.txt`입니다. 패키지 파일 목록은 Farm 실행 파일, README, 두 라이선스로 고정되어 있으며 EffectCraft 실행 파일과 CLI를 포함하지 않습니다.
+빌드 스크립트는 x64 GUI 실행 파일을 정적 CRT로 빌드하고, .NET 8 런타임에서 실행하는 WiX 5.0.2 포터블 도구를 SHA-256 검증 후 사용합니다. WiX를 시스템에 설치하지 않습니다. 출력은 `target/release-v버전/`의 MSI와 `SHA256SUMS.txt`입니다. 패키지에는 Farm 실행 파일, README, Farm 라이선스 두 개와 UI 자산 라이선스 두 개가 포함되며 EffectCraft 실행 파일과 CLI는 포함하지 않습니다.
 
 ## 사용 순서
 

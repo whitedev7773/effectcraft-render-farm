@@ -11,7 +11,7 @@ $view = $db.OpenView('SELECT `FileName` FROM `File`')
 $files = @()
 while ($record = $view.Fetch()) { $files += ($record.StringData(1) -split '\|')[-1] }
 [void]$view.Close()
-if ($files.Count -ne 4 -or $files -contains 'effectcraft-cli.exe' -or $files -notcontains 'effectcraft-farm.exe') { throw 'Unexpected MSI payload' }
+if ($files.Count -ne 6 -or $files -contains 'effectcraft-cli.exe' -or $files -notcontains 'effectcraft-farm.exe' -or $files -notcontains 'WantedSans-OFL.txt' -or $files -notcontains 'GravityIcons-LICENSE.txt') { throw 'Unexpected MSI payload' }
 $iconView = $db.OpenView('SELECT `Data` FROM `Icon` WHERE `Name`=''FarmIcon.ico''')
 [void]$iconView.Execute()
 $iconRecord = $iconView.Fetch()

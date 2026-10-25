@@ -22,37 +22,30 @@ use farm::{CompInfo, Config, Job, Shared, State};
 use settings::{Distribution, Settings};
 
 fn install_ui_font(ctx: &egui::Context) -> Result<(), String> {
-    let mut candidates = Vec::new();
-    if cfg!(windows) {
-        let windows = std::env::var_os("WINDIR").map(PathBuf::from).unwrap_or_else(|| PathBuf::from(r"C:\Windows"));
-        candidates.push(windows.join("Fonts").join("malgun.ttf"));
-    } else if cfg!(target_os = "macos") {
-        candidates.push(PathBuf::from("/System/Library/Fonts/AppleSDGothicNeo.ttc"));
-    } else {
-        candidates.extend(["/usr/share/fonts/opentype/noto/NotoSansCJK-Regular.ttc", "/usr/share/fonts/truetype/nanum/NanumGothic.ttf"].map(PathBuf::from));
-    }
-    let bytes = candidates
-        .iter()
-        .filter_map(|path| std::fs::read(path).ok())
-        .find(|bytes| !bytes.is_empty() && bytes.len() <= 40_000_000)
-        .ok_or_else(|| "한글 글꼴을 찾지 못했습니다. 시스템에 한글 글꼴을 설치한 뒤 다시 실행하세요.".to_string())?;
     let mut fonts = FontDefinitions::default();
-    fonts.font_data.insert("korean-system".into(), std::sync::Arc::new(FontData::from_owned(bytes)));
-    for family in [FontFamily::Proportional, FontFamily::Monospace] {
-        fonts.families.entry(family).or_default().push("korean-system".into());
-    }
+    fonts.font_data.insert("wanted-sans".into(), std::sync::Arc::new(FontData::from_static(include_bytes!("../assets/ui/WantedSans-Regular.ttf"))));
+    fonts.families.entry(FontFamily::Proportional).or_default().insert(0, "wanted-sans".into());
     ctx.set_fonts(fonts);
     ctx.set_theme(egui::Theme::Dark);
     let mut style = (*ctx.style_of(egui::Theme::Dark)).clone();
     style.spacing.item_spacing = egui::vec2(10.0, 9.0);
     style.spacing.button_padding = egui::vec2(12.0, 7.0);
-    style.spacing.interact_size.y = 30.0;
-    style.visuals.panel_fill = egui::Color32::from_rgb(14, 17, 22);
-    style.visuals.override_text_color = Some(egui::Color32::from_rgb(234, 239, 247));
-    style.visuals.widgets.inactive.corner_radius = egui::CornerRadius::same(8);
-    style.visuals.widgets.hovered.corner_radius = egui::CornerRadius::same(8);
-    style.visuals.widgets.active.corner_radius = egui::CornerRadius::same(8);
-    style.visuals.selection.bg_fill = egui::Color32::from_rgb(42, 79, 128);
+    style.spacing.interact_size.y = 34.0;
+    style.visuals.panel_fill = egui::Color32::from_rgb(6, 6, 7);
+    style.visuals.window_fill = egui::Color32::from_rgb(24, 24, 27);
+    style.visuals.extreme_bg_color = egui::Color32::from_rgb(35, 35, 37);
+    style.visuals.faint_bg_color = egui::Color32::from_rgb(35, 35, 37);
+    style.visuals.override_text_color = Some(egui::Color32::from_rgb(252, 252, 252));
+    style.visuals.widgets.inactive.bg_fill = egui::Color32::from_rgb(35, 35, 37);
+    style.visuals.widgets.hovered.bg_fill = egui::Color32::from_rgb(48, 48, 51);
+    style.visuals.widgets.active.bg_fill = egui::Color32::from_rgb(58, 58, 62);
+    style.visuals.widgets.inactive.bg_stroke = egui::Stroke::new(1.0, egui::Color32::from_rgb(40, 40, 44));
+    style.visuals.widgets.hovered.bg_stroke = egui::Stroke::new(1.0, egui::Color32::from_rgb(66, 66, 72));
+    style.visuals.widgets.active.bg_stroke = egui::Stroke::new(1.0, egui::Color32::from_rgb(4, 133, 247));
+    style.visuals.widgets.inactive.corner_radius = egui::CornerRadius::same(12);
+    style.visuals.widgets.hovered.corner_radius = egui::CornerRadius::same(12);
+    style.visuals.widgets.active.corner_radius = egui::CornerRadius::same(12);
+    style.visuals.selection.bg_fill = egui::Color32::from_rgb(4, 93, 171);
     ctx.set_style_of(egui::Theme::Dark, style);
     Ok(())
 }
@@ -77,7 +70,7 @@ fn section_title(ui: &mut egui::Ui, title: &str) {
 }
 
 fn primary_button(label: &str) -> egui::Button<'_> {
-    egui::Button::new(egui::RichText::new(label).strong().color(egui::Color32::WHITE)).fill(egui::Color32::from_rgb(35, 103, 169))
+    egui::Button::new(egui::RichText::new(label).strong().color(egui::Color32::WHITE)).fill(egui::Color32::from_rgb(4, 133, 247))
 }
 
 #[derive(Clone, Copy)]
@@ -662,12 +655,6 @@ fn main() {
             app.settings.cli = installation.cli.display().to_string();
             app.state.lock().unwrap_or_else(std::sync::PoisonError::into_inner).note(format!("설치된 EffectCraft 감지: {}", installation.root.display()));
             app.save_settings();
-            cc.egui_ctx.set_visuals(egui::Visuals::dark());
-            cc.egui_ctx.style_mut_of(egui::Theme::Dark, |style| {
-                style.spacing.item_spacing = egui::vec2(10.0, 8.0);
-                style.spacing.button_padding = egui::vec2(12.0, 8.0);
-                style.visuals.selection.bg_fill = egui::Color32::from_rgb(45, 100, 175);
-            });
             if let Err(error) = install_ui_font(&cc.egui_ctx) {
                 app.last_error = error;
             }
