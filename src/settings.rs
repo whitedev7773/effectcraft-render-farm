@@ -14,6 +14,7 @@ pub enum Distribution {
 #[derive(Clone, PartialEq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct RenderOptions {
+    pub automatic: bool,
     pub nvenc: bool,
     pub ffmpeg: String,
     pub adaptive: bool,
@@ -31,6 +32,7 @@ pub struct RenderOptions {
 impl Default for RenderOptions {
     fn default() -> Self {
         Self {
+            automatic: true,
             nvenc: true,
             ffmpeg: String::new(),
             adaptive: true,
@@ -261,15 +263,19 @@ mod tests {
         legacy.as_object_mut().unwrap().remove("gpu_defaults_applied");
         legacy["gpu"] = false.into();
         legacy["render"].as_object_mut().unwrap().remove("nvenc");
+        legacy["render"].as_object_mut().unwrap().remove("automatic");
         std::fs::write(dir.join("settings-a.json"), serde_json::to_vec(&legacy).unwrap()).unwrap();
         let (mut settings, warning) = load_from(&dir);
         assert!(warning.is_none());
         assert!(settings.gpu);
         assert!(settings.gpu_defaults_applied);
         assert!(settings.render.nvenc);
+        assert!(settings.render.automatic);
         settings.gpu = false;
+        settings.render.automatic = false;
         save_to(&dir, &mut settings).unwrap();
         assert!(!load_from(&dir).0.gpu);
+        assert!(!load_from(&dir).0.render.automatic);
         assert!(dir.canonicalize().unwrap().starts_with(std::env::temp_dir().canonicalize().unwrap()));
         std::fs::remove_dir_all(dir).unwrap();
     }

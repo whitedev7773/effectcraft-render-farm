@@ -34,7 +34,7 @@ fn project_hash(bytes: &[u8]) -> String {
 const MAX_LINE: usize = 4096;
 const MAX_FRAMES: i64 = 100_000;
 const MAX_WORKERS: usize = 64;
-const PROTOCOL_VERSION: u32 = 5;
+const PROTOCOL_VERSION: u32 = 6;
 const MAX_TRANSFER_FILE: u64 = 32 * 1024 * 1024 * 1024;
 const MAX_TRANSFER_TOTAL: u64 = 256 * 1024 * 1024 * 1024;
 const MAX_TRANSFER_FILES: usize = 20_000;
@@ -178,6 +178,7 @@ pub struct WorkerInfo {
     pub transfer_seconds: f64,
     pub preview: Option<Preview>,
     pub ready: bool,
+    pub profile: String,
 }
 
 // Workers always take from one shared queue. Split only unassigned work, so
@@ -186,10 +187,12 @@ fn claim_chunk(s: &mut State, worker_id: u64, label: &str, options: &RenderOptio
     let index = s.chunks.iter().position(|c| c.status == ChunkStatus::Pending)?;
     let chunk = &s.chunks[index];
     let mut size = chunk.end - chunk.start;
-    if options.adaptive {
+    if options.adaptive || options.automatic {
         let fps = s.worker_info.get(&worker_id).map_or(0.0, |w| w.fps);
         if fps > 0.0 {
             size = size.min((fps * options.target_seconds as f64).ceil().max(1.0) as i64);
+        } else if options.automatic {
+            size = size.min(12);
         }
         let pending = s.chunks.iter().filter(|c| c.status == ChunkStatus::Pending).map(|c| c.end - c.start).sum::<i64>();
         let participants =
@@ -240,6 +243,7 @@ pub struct State {
     pub log_path: Option<PathBuf>,
     log_error_reported: bool,
     pub local_preview: Option<Preview>,
+    pub local_profile: String,
     pub started: Option<Instant>,
     pub finished_elapsed: Option<Duration>,
 }
@@ -354,6 +358,9 @@ enum Message {
         len: usize,
     },
     Request,
+    Profile {
+        detail: String,
+    },
     Assign {
         start: i64,
         end: i64,
@@ -849,6 +856,12 @@ pub fn render_preview(config: &Config, frame: i64) -> Result<Preview, String> {
     }
     let result = command.output().map_err(|e| format!("미리보기 CLI 실행: {e}"))?;
     if !result.status.success() {
+        if config.render.automatic && config.gpu {
+            let mut cpu = config.clone();
+            cpu.gpu = false;
+            cpu.render.automatic = false;
+            return render_preview(&cpu, frame);
+        }
         return Err(format!("미리보기 실패: {}", String::from_utf8_lossy(&result.stderr).chars().take(1500).collect::<String>()));
     }
     make_preview(&path, frame)
@@ -1221,6 +1234,7 @@ fn serve_worker(mut stream: TcpStream, peer: SocketAddr, config: &Config, job: &
                     transfer_seconds: 0.0,
                     preview: None,
                     ready: false,
+                    profile: String::new(),
                 },
             );
             Ok(id)
@@ -1255,9 +1269,10 @@ fn serve_worker(mut stream: TcpStream, peer: SocketAddr, config: &Config, job: &
                         let s = lock(state);
                         s.dispatch_enabled
                             && s.worker_info.get(&worker_id).is_some_and(|worker| worker.enabled)
-                            && s.chunks
-                                .iter()
-                                .any(|chunk| chunk.status == ChunkStatus::Pending || (config.render.adaptive && chunk.status == ChunkStatus::Running))
+                            && s.chunks.iter().any(|chunk| {
+                                chunk.status == ChunkStatus::Pending
+                                    || ((config.render.adaptive || config.render.automatic) && chunk.status == ChunkStatus::Running)
+                            })
                             && s.chunks.iter().filter(|chunk| chunk.status == ChunkStatus::Running).count() < s.max_workers
                     };
                     if may_prepare && !prepared {
@@ -1311,6 +1326,17 @@ fn serve_worker(mut stream: TcpStream, peer: SocketAddr, config: &Config, job: &
                         }
                     }
                 }
+                Ok(Message::Profile { detail }) if prepared && detail.len() <= 1024 => {
+                    let mut s = lock(state);
+                    if let Some(info) = s.worker_info.get_mut(&worker_id) {
+                        info.profile = detail.replace(['\r', '\n'], " ");
+                        // Calibration happens before the first frame, not in the measured render time.
+                        if info.current_done == 0 && assigned.is_some() {
+                            info.started = Some(Instant::now());
+                        }
+                    }
+                    s.event("INFO", "resources", format!("{label}: {detail}"));
+                }
                 Ok(Message::Progress { start, end, done }) if assigned == Some((start, end)) => {
                     if done < 0 || done > end - start {
                         break Err("클라이언트 진행률이 작업 범위를 벗어났습니다".into());
@@ -1324,7 +1350,7 @@ fn serve_worker(mut stream: TcpStream, peer: SocketAddr, config: &Config, job: &
                     }
                     let idle = s.worker_info.values().any(|w| w.id != worker_id && w.connected && w.enabled && w.ready && w.assigned.is_none());
                     let running = s.chunks.iter().filter(|c| c.status == ChunkStatus::Running).count();
-                    let can_share = config.render.adaptive
+                    let can_share = (config.render.adaptive || config.render.automatic)
                         && idle
                         && running < s.max_workers
                         && !s.chunks.iter().any(|c| c.status == ChunkStatus::Pending)
@@ -1407,7 +1433,8 @@ fn serve_worker(mut stream: TcpStream, peer: SocketAddr, config: &Config, job: &
                                 info.completed_frames = info.completed_frames.saturating_add(end - start);
                                 let elapsed = info.started.map_or(0.0, |at| at.elapsed().as_secs_f64());
                                 if elapsed > 0.0 {
-                                    info.fps = (end - start) as f64 / elapsed;
+                                    let measured = (end - start) as f64 / elapsed;
+                                    info.fps = if info.fps > 0.0 { info.fps * 0.3 + measured * 0.7 } else { measured };
                                 }
                             }
                             info.assigned = None;
@@ -1490,6 +1517,8 @@ pub fn run_worker(config: Config, state: Shared, stop: Arc<AtomicBool>) -> Resul
     let mut config = config;
     let mut workspace: Option<TempWorkspace> = None;
     let mut job: Option<Job> = None;
+    let mut calibrated = false;
+    let mut previous_profile = String::new();
     log(&state, format!("호스트 연결 완료 · {comp} · 렌더 지시 대기"));
     while !stop.load(Ordering::Relaxed) {
         send(&mut stream, &Message::Request)?;
@@ -1508,6 +1537,29 @@ pub fn run_worker(config: Config, state: Shared, stop: Arc<AtomicBool>) -> Resul
                 let job = job.as_ref().ok_or("호스트 프로젝트를 아직 받지 못했습니다")?;
                 if start < 0 || end <= start || end > job.total || fps_num != job.rate.num || fps_den != job.rate.den || comp != job.comp {
                     return Err("서버 작업 범위 또는 설정이 프로젝트와 다릅니다".into());
+                }
+                if config.render.automatic && !calibrated {
+                    send(&mut stream, &Message::Profile { detail: "CPU/GPU 자동 성능 비교 중".into() })?;
+                    lock(&state).local_profile = "CPU/GPU 자동 성능 비교 중".into();
+                    match choose_render_gpu(&config, job, start, end, &state, &stop) {
+                        Ok(gpu) => config.gpu = gpu,
+                        Err(_) if stop.load(Ordering::Relaxed) => break,
+                        Err(error) => return Err(error),
+                    }
+                    calibrated = true;
+                }
+                let resources = crate::resources::Resources::detect();
+                if config.render.automatic {
+                    // Lower preview work under memory pressure; image quality is unchanged.
+                    config.render.preview_seconds =
+                        config.render.preview_seconds.max(if resources.available_memory > 0 && resources.available_memory < 2 << 30 { 10 } else { 3 });
+                }
+                let profile = resources.summary(resources.threads(job.width, job.height), config.gpu);
+                lock(&state).local_profile = profile.clone();
+                if profile != previous_profile {
+                    send(&mut stream, &Message::Profile { detail: profile.clone() })?;
+                    lock(&state).event("INFO", "resources", &profile);
+                    previous_profile = profile;
                 }
                 log(&state, format!("렌더링: {start}–{end}"));
                 lock(&state).event(
@@ -1529,6 +1581,7 @@ pub fn run_worker(config: Config, state: Shared, stop: Arc<AtomicBool>) -> Resul
                 let mut last_preview = Instant::now().checked_sub(Duration::from_secs(30)).unwrap_or_else(Instant::now);
                 let mut last_report = Instant::now();
                 let mut preview_error_reported = false;
+                let mut preview_interval = config.render.preview_seconds;
                 let result = render_chunk(&config, job, start, end, |done| {
                     let done = done.min(assigned_end - start);
                     send(&mut stream, &Message::Progress { start, end: assigned_end, done })?;
@@ -1542,11 +1595,9 @@ pub fn run_worker(config: Config, state: Shared, stop: Arc<AtomicBool>) -> Resul
                         _ => return Err("호스트 진행 응답이 잘못됐습니다".into()),
                     }
                     lock(&state).local_progress = Some((start, assigned_end, done));
-                    if done > 0
-                        && config.render.previews
-                        && (last_preview.elapsed().as_secs() >= config.render.preview_seconds as u64 || done == assigned_end - start)
-                    {
+                    if done > 0 && config.render.previews && (last_preview.elapsed().as_secs() >= preview_interval as u64 || done == assigned_end - start) {
                         let frame = start + done - 1;
+                        let preview_started = Instant::now();
                         match make_preview(&frame_path(&job.output, frame), frame) {
                             Ok(preview) => {
                                 send(&mut stream, &Message::Preview { frame, len: preview.jpeg.len() })?;
@@ -1558,6 +1609,12 @@ pub fn run_worker(config: Config, state: Shared, stop: Arc<AtomicBool>) -> Resul
                                 preview_error_reported = true;
                             }
                             Err(_) => {}
+                        }
+                        // Bound future preview overhead to roughly 2% of elapsed time.
+                        if config.render.automatic {
+                            let seconds = (preview_started.elapsed().as_secs_f64() * 50.0).ceil() as u32;
+                            // Applied after this chunk to keep the running render's config immutable.
+                            preview_interval = preview_interval.max(seconds.clamp(3, 30));
                         }
                         last_preview = Instant::now();
                     }
@@ -1589,6 +1646,11 @@ pub fn run_worker(config: Config, state: Shared, stop: Arc<AtomicBool>) -> Resul
                     Ok(assigned_end)
                 });
                 let end = assigned_end;
+                config.render.preview_seconds = preview_interval;
+                if result.is_err() && config.render.automatic && config.gpu {
+                    config.gpu = false;
+                    lock(&state).event("WARN", "autotune", "GPU 렌더 실패: 전송 완료 프레임을 보존하고 다음 배정부터 CPU 경로로 재시도합니다");
+                }
                 let (ok, detail) = match result {
                     Ok(_) => (
                         true,
@@ -1634,7 +1696,56 @@ pub fn run_worker(config: Config, state: Shared, stop: Arc<AtomicBool>) -> Resul
     Ok(())
 }
 
-fn render_chunk(config: &Config, job: &Job, start: i64, end: i64, mut progress: impl FnMut(i64) -> Result<i64, String>) -> Result<i64, String> {
+fn choose_render_gpu(config: &Config, job: &Job, start: i64, end: i64, state: &Shared, stop: &AtomicBool) -> Result<bool, String> {
+    if end - start < 8 {
+        lock(state).event("INFO", "autotune", "짧은 구간: 별도 렌더 비교를 생략하고 GPU 경로를 시도합니다");
+        return Ok(true);
+    }
+    let workspace = TempWorkspace::new()?;
+    let mut sample = config.clone();
+    sample.output = workspace.root.clone();
+    sample.render.poll_ms = 50;
+    let sample_end = (start + 2).min(end);
+    let mut timings = [None, None];
+    lock(state).event("INFO", "autotune", format!("CPU/GPU 자동 비교 시작 · 프레임 {start}–{sample_end} · 경로별 최대 5초"));
+    for (index, gpu) in [false, true].into_iter().enumerate() {
+        if stop.load(Ordering::Relaxed) {
+            return Err("자동 성능 비교 중 중지했습니다".into());
+        }
+        sample.gpu = gpu;
+        let started = Instant::now();
+        let result = render_chunk_controlled(&sample, job, start, sample_end, Some((started + Duration::from_secs(5), stop)), |_| Ok(sample_end));
+        match result {
+            Ok(_) => {
+                timings[index] = Some(started.elapsed().as_secs_f64());
+                lock(state).event("INFO", "autotune", format!("{} 샘플 렌더: {:.3}초", if gpu { "GPU" } else { "CPU" }, started.elapsed().as_secs_f64()));
+            }
+            Err(error) => lock(state).event("WARN", "autotune", format!("{} 샘플 비교 미완료: {error}", if gpu { "GPU" } else { "CPU" })),
+        }
+    }
+    // Prefer a proven path. When both samples exceed the budget, retain GPU and
+    // let a real failure trigger CPU fallback rather than calling timeout a failure.
+    let gpu = match timings {
+        [Some(cpu), Some(gpu)] => gpu < cpu * 0.95,
+        [Some(_), None] => false,
+        [None, Some(_)] | [None, None] => true,
+    };
+    lock(state).event("INFO", "autotune", format!("자동 렌더 경로 선택: {} · 동일 해상도/품질 샘플 비교", if gpu { "GPU" } else { "CPU" }));
+    Ok(gpu)
+}
+
+fn render_chunk(config: &Config, job: &Job, start: i64, end: i64, progress: impl FnMut(i64) -> Result<i64, String>) -> Result<i64, String> {
+    render_chunk_controlled(config, job, start, end, None, progress)
+}
+
+fn render_chunk_controlled(
+    config: &Config,
+    job: &Job,
+    start: i64,
+    end: i64,
+    control: Option<(Instant, &AtomicBool)>,
+    mut progress: impl FnMut(i64) -> Result<i64, String>,
+) -> Result<i64, String> {
     // Remove leftovers from a failed attempt before detecting new completions.
     for frame in start..end {
         let path = frame_path(&config.output, frame);
@@ -1669,6 +1780,10 @@ fn render_chunk(config: &Config, job: &Job, start: i64, end: i64, mut progress: 
     if config.gpu {
         command.arg("--gpu");
     }
+    if config.render.automatic {
+        let resources = crate::resources::Resources::detect();
+        command.env("RAYON_NUM_THREADS", resources.threads(job.width, job.height).to_string());
+    }
     command.arg("--quality").arg(if config.render.draft { "draft" } else { "best" }).arg("--audio").arg("off");
     if let Some(root) = config.project.parent() {
         let fonts = root.join("fonts");
@@ -1684,6 +1799,11 @@ fn render_chunk(config: &Config, job: &Job, start: i64, end: i64, mut progress: 
     let mut last_progress = 0_i64;
     let mut yielded = false;
     let status = loop {
+        if control.is_some_and(|(deadline, stop)| Instant::now() >= deadline || stop.load(Ordering::Relaxed)) {
+            let _ = child.kill();
+            let _ = child.wait();
+            return Err("성능 비교 제한 시간/중지 요청".into());
+        }
         let current = match child.try_wait() {
             Ok(status) => status,
             Err(error) => {
@@ -1829,18 +1949,23 @@ fn assemble_final(config: &Config, job: &Job, state: &Shared) -> Result<(), Stri
     if config.final_video.exists() {
         return Err("최종 MP4가 이미 있습니다. 덮어쓰지 않았습니다".into());
     }
-    if config.render.nvenc {
+    if config.render.nvenc || config.render.automatic {
         match crate::encoding::locate(&config.render.ffmpeg, &config.cli) {
             Ok(ffmpeg) => return assemble_ffmpeg(config, job, state, &ffmpeg),
             Err(reason) => lock(state).event("WARN", "encoder", format!("{reason} · EffectCraft 출력 경로로 전환")),
         }
     }
     log(state, "최종 인코더: EffectCraft 기본 H.264");
-    assemble_legacy(config, job)
+    let mut legacy = config.clone();
+    if config.render.automatic {
+        // The fallback only assembles existing PNGs; it must also work on a CPU-only host.
+        legacy.gpu = false;
+    }
+    assemble_legacy(&legacy, job)
 }
 
 fn assemble_ffmpeg(config: &Config, job: &Job, state: &Shared, ffmpeg: &Path) -> Result<(), String> {
-    use crate::encoding::{Encoder, Video};
+    use crate::encoding::Video;
     let project = assembly_project(config, job)?;
     let (comp_id, comp) = project.comps().find(|(id, _)| project.item(**id).is_some_and(|item| item.name == job.comp)).ok_or("컴포지션이 없습니다")?;
     let aspect = comp.pixel_aspect;
@@ -1894,11 +2019,15 @@ fn assemble_ffmpeg(config: &Config, job: &Job, state: &Shared, ffmpeg: &Path) ->
         audio: has_audio.then_some(audio.as_path()),
         output: &partial,
     };
-    let mut encoders = vec![Encoder::Nvenc, Encoder::Cpu];
+    let encoders = if config.render.automatic {
+        crate::encoding::rank_encoders(ffmpeg, &video, &workspace.root, |message| lock(state).event("INFO", "autotune", message))
+    } else {
+        crate::encoding::candidates(job.width, job.height)
+    };
     if !job.width.is_multiple_of(2) || !job.height.is_multiple_of(2) {
         lock(state).event("WARN", "encoder", "홀수 해상도를 변경하지 않기 위해 CPU YUV444 인코딩을 사용합니다");
-        encoders.remove(0);
     }
+    let mut last_error = String::new();
     for encoder in encoders {
         let started = Instant::now();
         log(
@@ -1928,11 +2057,13 @@ fn assemble_ffmpeg(config: &Config, job: &Job, state: &Shared, ffmpeg: &Path) ->
                 log(state, format!("{} 최종 MP4 완료 · {:.2}초", encoder.name(), started.elapsed().as_secs_f64()));
                 return Ok(());
             }
-            Err(error) if encoder == Encoder::Nvenc => lock(state).event("WARN", "encoder", format!("NVENC 사용 실패 · CPU libx264로 전환: {error}")),
-            Err(error) => return Err(error),
+            Err(error) => {
+                lock(state).event("WARN", "encoder", format!("{} 실패 · 다음 작동 경로로 전환: {error}", encoder.name()));
+                last_error = error;
+            }
         }
     }
-    Err("최종 인코더를 선택할 수 없습니다".into())
+    Err(format!("최종 인코딩 경로가 모두 실패했습니다: {last_error}"))
 }
 
 fn assemble_legacy(config: &Config, job: &Job) -> Result<(), String> {
@@ -2349,7 +2480,7 @@ mod tests {
         image::RgbaImage::from_pixel(16, 16, image::Rgba([60, 110, 170, 255])).save(&source).unwrap();
         let mut project = Project::default();
         let rate = FrameRate::FPS_60;
-        let comp = Comp::new(16, 16, rate, rate.tick_of(2));
+        let comp = Comp::new(16, 16, rate, rate.tick_of(12));
         let comp_id = project.add_item("Transfer Test", Label::None, None, ItemKind::Comp(Arc::new(comp.clone())));
         let footage =
             Footage { path: source.to_string_lossy().into_owned(), kind: FootageKind::Still, width: 16, height: 16, has_video: true, ..Footage::default() };
@@ -2369,8 +2500,8 @@ mod tests {
             token: "test-password".into(),
             gpu: true,
             range_start: 0,
-            range_end: 2,
-            chunk_frames: 2,
+            range_end: 12,
+            chunk_frames: 12,
             max_workers: 1,
             final_video: dir.join("final.mp4"),
             disabled_workers: Vec::new(),
@@ -2378,8 +2509,8 @@ mod tests {
         };
         let job = read_job(&host).unwrap();
         let state = Arc::new(Mutex::new(State {
-            chunks: vec![Chunk { start: 0, end: 2, status: ChunkStatus::Pending, attempts: 0, worker: String::new() }],
-            total: 2,
+            chunks: vec![Chunk { start: 0, end: 12, status: ChunkStatus::Pending, attempts: 0, worker: String::new() }],
+            total: 12,
             max_workers: 1,
             dispatch_enabled: true,
             assembly_started: true,
@@ -2411,9 +2542,11 @@ mod tests {
         };
         assert!(run_worker(client, state.clone(), Arc::new(AtomicBool::new(false))).is_ok());
         assert!(server.join().unwrap().is_ok());
-        assert!(chunk_complete(&dir, 0, 2));
-        assert_eq!(worker_snapshot(&state).0.first().unwrap().completed_frames, 2);
-        assert_eq!(lock(&state).local_progress, Some((0, 2, 2)));
+        assert!(chunk_complete(&dir, 0, 12));
+        assert_eq!(worker_snapshot(&state).0.first().unwrap().completed_frames, 12);
+        assert_eq!(lock(&state).local_progress, Some((0, 12, 12)));
+        assert!(lock(&state).messages.iter().any(|message| message.contains("자동 렌더 경로 선택")));
+        assert!(worker_snapshot(&state).0.first().unwrap().profile.contains("RAM"));
         assert!(lock(&state).messages.iter().any(|message| message.contains("임시 프로젝트·소스·프레임 삭제 완료")));
         assert!(worker_snapshot(&state).0.first().unwrap().preview.is_some());
         let preview = render_preview(&preview_config, 1).unwrap();
@@ -2425,6 +2558,9 @@ mod tests {
         assert_eq!(rendered_end, 1);
         assert!(valid_png(&frame_path(&preview_config.output, 0)));
         assert!(!frame_path(&preview_config.output, 1).exists());
+        let started = Instant::now();
+        assert!(render_chunk_controlled(&preview_config, &preview_job, 0, 2, Some((started, &AtomicBool::new(false))), |_| Ok(2)).is_err());
+        assert!(started.elapsed() < Duration::from_secs(2));
         std::fs::remove_dir_all(dir).unwrap();
     }
 

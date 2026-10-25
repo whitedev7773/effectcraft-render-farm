@@ -41,6 +41,8 @@ pub fn locate(configured: &str, cli: &Path) -> Result<PathBuf, String> {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Encoder {
     Nvenc,
+    Amf,
+    Qsv,
     Cpu,
 }
 
@@ -48,9 +50,68 @@ impl Encoder {
     pub fn name(self) -> &'static str {
         match self {
             Self::Nvenc => "h264_nvenc",
+            Self::Amf => "h264_amf",
+            Self::Qsv => "h264_qsv",
             Self::Cpu => "libx264",
         }
     }
+}
+
+pub fn candidates(width: u32, height: u32) -> Vec<Encoder> {
+    if !width.is_multiple_of(2) || !height.is_multiple_of(2) { vec![Encoder::Cpu] } else { vec![Encoder::Nvenc, Encoder::Amf, Encoder::Qsv, Encoder::Cpu] }
+}
+
+/// Try the actual input and output settings, not just FFmpeg's compiled encoder list.
+/// Probes never touch the final output and cannot stall assembly indefinitely.
+pub fn rank_encoders(ffmpeg: &Path, video: &Video<'_>, scratch: &Path, mut report: impl FnMut(String)) -> Vec<Encoder> {
+    use std::time::{Duration, Instant};
+    let candidates = candidates(video.width, video.height);
+    if candidates.len() == 1 || video.end - video.start <= 24 {
+        report("짧은 영상/홀수 해상도: 추가 비교 비용을 줄이고 실제 인코딩 성공 여부로 선택".into());
+        return candidates;
+    }
+    let output = scratch.join("encoder-probe.mp4");
+    let errors = scratch.join("encoder-probe.stderr");
+    let sample = Video { end: (video.start + 8).min(video.end), audio: None, output: &output, ..*video };
+    let mut measured = Vec::new();
+    for encoder in candidates {
+        let attempt = (|| -> Result<f64, String> {
+            if output.exists() {
+                std::fs::remove_file(&output).map_err(|e| e.to_string())?;
+            }
+            let mut command = command(ffmpeg, &sample, encoder);
+            command.stdin(Stdio::null()).stdout(Stdio::null()).stderr(Stdio::from(std::fs::File::create(&errors).map_err(|e| e.to_string())?));
+            let started = Instant::now();
+            let mut child = command.spawn().map_err(|e| e.to_string())?;
+            loop {
+                match child.try_wait() {
+                    Ok(Some(status)) if status.success() && std::fs::metadata(&output).is_ok_and(|m| m.len() > 128) => {
+                        return Ok(started.elapsed().as_secs_f64());
+                    }
+                    Ok(Some(_)) => return Err(stderr_tail(&errors)),
+                    Ok(None) if started.elapsed() < Duration::from_secs(3) => std::thread::sleep(Duration::from_millis(10)),
+                    result => {
+                        let _ = child.kill();
+                        let _ = child.wait();
+                        return Err(result.err().map_or_else(|| "비교 제한 시간 3초 초과".into(), |e| e.to_string()));
+                    }
+                }
+            }
+        })();
+        match attempt {
+            Ok(seconds) => {
+                report(format!("{} 샘플 {}프레임: {seconds:.3}초", encoder.name(), sample.end - sample.start));
+                measured.push((encoder, seconds));
+            }
+            Err(error) => report(format!("{} 비교 제외: {error}", encoder.name())),
+        }
+    }
+    measured.sort_by(|a, b| a.1.total_cmp(&b.1));
+    let mut ranked: Vec<_> = measured.into_iter().map(|(encoder, _)| encoder).collect();
+    if !ranked.contains(&Encoder::Cpu) {
+        ranked.push(Encoder::Cpu);
+    }
+    ranked
 }
 
 pub struct Video<'a> {
@@ -75,6 +136,8 @@ fn command(ffmpeg: &Path, video: &Video<'_>, encoder: Encoder) -> Command {
     let pattern = PathBuf::from(directory).join("frame_%05d.png");
     command
         .args(["-hide_banner", "-nostdin", "-loglevel", "warning", "-y", "-progress", "pipe:1", "-nostats"])
+        .arg("-filter_threads")
+        .arg(crate::resources::Resources::detect().threads(video.width, video.height).to_string())
         .arg("-framerate")
         .arg(&rate)
         .arg("-start_number")
@@ -98,8 +161,15 @@ fn command(ffmpeg: &Path, video: &Video<'_>, encoder: Encoder) -> Command {
         Encoder::Nvenc => {
             command.args(["-preset", "p4", "-tune", "hq", "-rc", "vbr", "-multipass", "disabled", "-rc-lookahead", "0"]);
         }
+        Encoder::Amf => {
+            command.args(["-usage", "transcoding", "-quality", "speed", "-rc", "vbr_peak"]);
+        }
+        Encoder::Qsv => {
+            command.args(["-preset", "veryfast", "-look_ahead", "0"]);
+        }
         Encoder::Cpu => {
             command.args(["-preset", "veryfast"]);
+            command.arg("-threads").arg(crate::resources::Resources::detect().threads(video.width, video.height).to_string());
         }
     }
     command
@@ -164,6 +234,43 @@ pub fn encode(ffmpeg: &Path, video: &Video<'_>, encoder: Encoder, stderr: &Path,
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn actual_input_probes_rank_working_encoders_and_preserve_final_output() {
+        let Some(ffmpeg) = std::env::var_os("EFFECTCRAFT_FARM_TEST_FFMPEG").map(PathBuf::from) else { return };
+        let nonce = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos();
+        let root = std::env::temp_dir().join(format!("farm-encoder-probe-{}-{nonce}", std::process::id()));
+        std::fs::create_dir(&root).unwrap();
+        for frame in 7..39 {
+            image::RgbImage::from_pixel(320, 180, image::Rgb([frame as u8 * 5, 20, 90])).save(root.join(format!("frame_{frame:05}.png"))).unwrap();
+        }
+        let output = root.join("final.mp4");
+        std::fs::write(&output, b"existing output must survive probes").unwrap();
+        let video = Video {
+            directory: &root,
+            start: 7,
+            end: 39,
+            rate: FrameRate::new(30000, 1001),
+            width: 320,
+            height: 180,
+            pixel_aspect: 1.2,
+            bitrate: 16000,
+            audio: None,
+            output: &output,
+        };
+        let mut events = Vec::new();
+        let ranked = rank_encoders(&ffmpeg, &video, &root, |message| events.push(message));
+        assert!(ranked.contains(&Encoder::Cpu));
+        assert_eq!(events.len(), 4);
+        let selected = ranked[0];
+        assert!(events.iter().any(|message| message.starts_with(&format!("{} 샘플", selected.name()))));
+        assert_eq!(std::fs::read(&output).unwrap(), b"existing output must survive probes");
+        let encoded = root.join("selected.mp4");
+        encode(&ffmpeg, &Video { output: &encoded, ..video }, selected, &root.join("selected.stderr"), |_| {}).unwrap();
+        assert!(std::fs::metadata(encoded).unwrap().len() > 128);
+        assert!(root.canonicalize().unwrap().starts_with(std::env::temp_dir().canonicalize().unwrap()));
+        std::fs::remove_dir_all(root).unwrap();
+    }
 
     #[test]
     fn preserves_rational_rate_range_and_audio_mapping() {

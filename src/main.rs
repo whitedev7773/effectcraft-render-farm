@@ -5,6 +5,7 @@ mod discovery;
 mod encoding;
 mod farm;
 mod installation;
+mod resources;
 mod settings;
 mod updater;
 
@@ -432,7 +433,7 @@ impl App {
             range_start: if s.host { s.range_start } else { 0 },
             range_end: if s.host { s.range_end } else { 0 },
             chunk_frames: s.chunk_frames,
-            max_workers: s.max_workers,
+            max_workers: if s.render.automatic { 64 } else { s.max_workers },
             final_video: PathBuf::from(&s.final_video),
             disabled_workers: s.disabled_workers.clone(),
             render: s.render.clone(),
@@ -742,7 +743,9 @@ impl eframe::App for App {
                             {
                                 self.settings.output = path.display().to_string();
                             }
-                            ui.checkbox(&mut self.settings.gpu, "이 PC에서 GPU 가속 렌더링 사용 · 기본 활성화");
+                            ui.checkbox(&mut self.settings.render.automatic, "연결된 PC 자원과 실측 성능에 맞춰 자동 최적화 · 권장");
+                            ui.small("호스트의 자동 모드를 모든 작업 PC에 적용합니다. CPU/GPU·인코더·스레드 수·작업량·미리보기 부하를 자동 조절합니다.");
+                            ui.add_enabled(!self.settings.render.automatic, egui::Checkbox::new(&mut self.settings.gpu, "수동: 이 PC에서 GPU 가속 렌더링 사용"));
                         });
                         if self.settings.host {
                             ui.add_space(8.0);
@@ -785,7 +788,11 @@ impl eframe::App for App {
                                     ui.add(egui::DragValue::new(&mut self.settings.range_end).range(1..=total));
                                     ui.end_row();
                                     ui.label("동시에 사용할 PC 수");
-                                    ui.add(egui::DragValue::new(&mut self.settings.max_workers).range(1..=64));
+                                    if self.settings.render.automatic {
+                                        ui.label("연결된 사용 가능 PC 전체 · 최대 64대");
+                                    } else {
+                                        ui.add(egui::DragValue::new(&mut self.settings.max_workers).range(1..=64));
+                                    }
                                     ui.end_row();
                                 });
                                 if selected.is_some() {
@@ -855,7 +862,7 @@ impl eframe::App for App {
                                 }
                                 ui.collapsing("성능 · 품질 · 미리보기 옵션", |ui| {
                                     let options = &mut self.settings.render;
-                                    ui.checkbox(&mut options.adaptive, "PC 처리 속도에 맞춰 대기 구간 자동 분할");
+                                    ui.add_enabled(!options.automatic, egui::Checkbox::new(&mut options.adaptive, "PC 처리 속도에 맞춰 대기 구간 자동 분할"));
                                     ui.horizontal(|ui| {
                                         ui.label("목표 작업 시간");
                                         ui.add(egui::DragValue::new(&mut options.target_seconds).range(5..=300).suffix("초"));
@@ -870,13 +877,13 @@ impl eframe::App for App {
                                         ui.add(egui::DragValue::new(&mut options.poll_ms).range(50..=2000).suffix("ms"));
                                     });
                                     ui.checkbox(&mut options.draft, "Draft 품질 · 검토용 빠른 렌더링");
-                                    ui.checkbox(&mut options.nvenc, "최종 MP4: FFmpeg로 직접 인코딩 · NVIDIA NVENC 우선");
+                                    ui.add_enabled(!options.automatic, egui::Checkbox::new(&mut options.nvenc, "최종 MP4: FFmpeg 직접 인코딩 · NVENC / AMF / QSV / CPU"));
                                     if path_row(ui, "FFmpeg 실행 파일 · 비워 두면 자동 감지", &mut options.ffmpeg)
                                         && let Some(path) = rfd::FileDialog::new().pick_file()
                                     {
                                         options.ffmpeg = path.display().to_string();
                                     }
-                                    ui.small("NVENC 실패 시 FFmpeg CPU 인코딩, FFmpeg가 없으면 EffectCraft 출력으로 전환합니다.");
+                                    ui.small("자동 모드는 실제 프레임으로 인코더 속도를 비교합니다. 실패 시 다음 경로, FFmpeg가 없으면 EffectCraft 출력으로 전환합니다.");
                                     ui.small("기본값은 Best입니다. Draft는 일부 효과의 품질에 영향을 줄 수 있습니다. FPS와 해상도는 원본을 유지합니다.");
                                     ui.horizontal(|ui| {
                                         ui.label("최종 H.264 비트레이트");
@@ -909,7 +916,8 @@ impl eframe::App for App {
                         egui::ProgressBar::new((done as f32 / total as f32).clamp(0.0, 1.0))
                             .text(format!("전체 {done} / {total} 프레임 · {:.1}%", done as f64 * 100.0 / total as f64)),
                     );
-                    ui.label(format!("연결된 PC: {connected} · 실패한 구간: {failed} · 동시 사용 한도: {}", self.settings.max_workers));
+                    let limit = if self.settings.render.automatic { "자동 · 최대 64".to_owned() } else { self.settings.max_workers.to_string() };
+                    ui.label(format!("연결된 PC: {connected} · 실패한 구간: {failed} · 동시 사용 한도: {limit}"));
                     ui.label(&final_status);
                     let (elapsed, active) = {
                         let s = self.state.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
@@ -984,6 +992,10 @@ impl eframe::App for App {
                     }
                 }
                 if !self.settings.host {
+                    let profile = self.state.lock().unwrap_or_else(std::sync::PoisonError::into_inner).local_profile.clone();
+                    if !profile.is_empty() {
+                        ui.small(profile);
+                    }
                     let preview = self.state.lock().unwrap_or_else(std::sync::PoisonError::into_inner).local_preview.clone();
                     if let Some(preview) = preview {
                         self.show_preview(ui, 0, &preview);
@@ -1024,6 +1036,9 @@ impl eframe::App for App {
                                 ui.small("현재 작업 대기");
                             }
                             ui.small(format!("이 PC에서 완료: {}프레임", worker.completed_frames));
+                            if !worker.profile.is_empty() {
+                                ui.small(&worker.profile);
+                            }
                             let fps = worker
                                 .started
                                 .filter(|_| worker.assigned.is_some())
