@@ -2129,6 +2129,15 @@ pub fn worker_snapshot(state: &Shared) -> (Vec<WorkerInfo>, String) {
 
 pub fn snapshot(state: &Shared) -> (i64, i64, usize, usize, Vec<String>, PathBuf) {
     let s = lock(state);
+    let (done, total, workers, failed) = progress_metrics(&s);
+    (done, total, workers, failed, s.messages.clone(), s.output.clone())
+}
+
+pub fn progress_snapshot(state: &Shared) -> (i64, i64, usize, usize) {
+    progress_metrics(&lock(state))
+}
+
+fn progress_metrics(s: &State) -> (i64, i64, usize, usize) {
     let mut done = 0_i64;
     let mut failed = 0_usize;
     let running = s.worker_info.values().filter_map(|worker| worker.assigned.map(|range| (range, worker.current_done))).collect::<BTreeMap<_, _>>();
@@ -2144,7 +2153,7 @@ pub fn snapshot(state: &Shared) -> (i64, i64, usize, usize, Vec<String>, PathBuf
             ChunkStatus::Pending => {}
         }
     }
-    (done.min(s.total), s.total, s.workers, failed, s.messages.clone(), s.output.clone())
+    (done.min(s.total), s.total, s.workers, failed)
 }
 
 #[cfg(test)]

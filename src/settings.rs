@@ -66,6 +66,7 @@ impl RenderOptions {
 #[derive(Clone, PartialEq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct Settings {
+    pub reduced_motion: bool,
     #[serde(default)]
     pub gpu_defaults_applied: bool,
     pub check_updates: bool,
@@ -96,6 +97,7 @@ impl Default for Settings {
     fn default() -> Self {
         Self {
             gpu_defaults_applied: true,
+            reduced_motion: false,
             check_updates: true,
             revision: 0,
             project: String::new(),

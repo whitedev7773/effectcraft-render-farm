@@ -5,6 +5,7 @@ mod discovery;
 mod encoding;
 mod farm;
 mod installation;
+mod interface;
 mod resources;
 mod settings;
 mod updater;
@@ -45,6 +46,13 @@ fn install_ui_font(ctx: &egui::Context) -> Result<(), String> {
     let mut style = (*ctx.style_of(egui::Theme::Dark)).clone();
     style.spacing.item_spacing = egui::vec2(10.0, 9.0);
     style.spacing.button_padding = egui::vec2(12.0, 7.0);
+    style.spacing.interact_size.y = 30.0;
+    style.visuals.panel_fill = egui::Color32::from_rgb(14, 17, 22);
+    style.visuals.override_text_color = Some(egui::Color32::from_rgb(234, 239, 247));
+    style.visuals.widgets.inactive.corner_radius = egui::CornerRadius::same(8);
+    style.visuals.widgets.hovered.corner_radius = egui::CornerRadius::same(8);
+    style.visuals.widgets.active.corner_radius = egui::CornerRadius::same(8);
+    style.visuals.selection.bg_fill = egui::Color32::from_rgb(42, 79, 128);
     ctx.set_style_of(egui::Theme::Dark, style);
     Ok(())
 }
@@ -148,6 +156,11 @@ struct App {
     catalog_status: String,
     range_handle: Option<RangeHandle>,
     monitor: bool,
+    settings_open: bool,
+    settings_tab: u8,
+    logs_open: bool,
+    preview_open: bool,
+    worker_details: Option<u64>,
     log_filter: String,
     log_debug: bool,
     textures: std::collections::BTreeMap<u64, (Arc<Vec<u8>>, egui::TextureHandle)>,
@@ -173,12 +186,18 @@ impl Default for App {
             }
             let _ = std::fs::remove_file(path);
         }
-        let catalog_path = settings.project.clone();
-        let catalog_changed = (!catalog_path.is_empty()).then(Instant::now);
         let state = Arc::new(Mutex::new(State::with_log_path(settings::log_path().ok())));
         if let Some(notice) = update_notice {
             state.lock().unwrap_or_else(std::sync::PoisonError::into_inner).note(format!("업데이트 결과: {notice}"));
         }
+        Self::with_state(settings, warning, state)
+    }
+}
+
+impl App {
+    fn with_state(settings: Settings, warning: Option<String>, state: Shared) -> Self {
+        let catalog_path = settings.project.clone();
+        let catalog_changed = (!catalog_path.is_empty()).then(Instant::now);
         Self {
             updater: updater::Updater::default(),
             updater_logged_status: String::new(),
@@ -204,6 +223,11 @@ impl Default for App {
             catalog_status: String::new(),
             range_handle: None,
             monitor: false,
+            settings_open: false,
+            settings_tab: 0,
+            logs_open: false,
+            preview_open: false,
+            worker_details: None,
             log_filter: String::new(),
             log_debug: false,
             textures: Default::default(),
@@ -213,9 +237,7 @@ impl Default for App {
             preview_status: String::new(),
         }
     }
-}
 
-impl App {
     fn update_ui(&mut self, ui: &mut egui::Ui) {
         let idle = !self.running && self.pending_start.is_none() && !self.worker_active.load(Ordering::Relaxed) && self.pending_preview.is_none();
         if let Some(result) = self.updater.poll(self.settings.check_updates) {
@@ -235,52 +257,32 @@ impl App {
                 Err(error) => self.updater.status = format!("업데이트 실패: {error}"),
             }
         }
-        ui.horizontal_wrapped(|ui| {
-            ui.small(format!("v{}", env!("CARGO_PKG_VERSION")));
-            if ui.add_enabled(!self.updater.busy(), egui::Button::new("업데이트 확인")).clicked() {
-                self.updater.check();
-            }
-            ui.checkbox(&mut self.settings.check_updates, "앱 실행 시 새 버전 확인");
-            if self.updater.busy() {
-                ui.spinner();
-            }
-            ui.small(&self.updater.status);
-            if self.updater.installing() {
-                ui.small(format!("다운로드 {:.1} MiB", self.updater.progress.load(Ordering::Relaxed) as f64 / 1048576.0));
-            }
-            if self.updater.available.is_some() && !self.updater.busy() && ui.button("업데이트 보기").clicked() {
-                self.updater.prompt = true;
-            }
-        });
         if self.updater.prompt
             && let Some(release) = self.updater.available.clone()
         {
-            let mut open = true;
             let mut consent = false;
             let mut later = false;
-            egui::Window::new("새 버전 업데이트")
-                .collapsible(false)
-                .resizable(false)
-                .default_width(500.0)
-                .anchor(egui::Align2::CENTER_CENTER, egui::Vec2::ZERO)
-                .open(&mut open)
-                .show(ui.ctx(), |ui| {
-                    ui.heading(format!("{} → {}", env!("CARGO_PKG_VERSION"), release.tag_name));
-                    ui.label("동의하면 설치 프로그램을 다운로드·검증하고 Render Farm을 업데이트한 뒤 다시 시작합니다. EffectCraft 설치는 변경하지 않습니다.");
-                    ui.label("연결할 모든 PC를 같은 버전으로 업데이트하세요.");
-                    ui.hyperlink_to("GitHub 릴리스 보기", &release.html_url);
-                    egui::ScrollArea::vertical().id_salt("release_notes").max_height(240.0).show(ui, |ui| {
+            let response = egui::Modal::new(egui::Id::new("update-consent")).show(ui.ctx(), |ui| {
+                ui.set_width((ui.ctx().content_rect().width() - 80.0).clamp(280.0, 500.0));
+                ui.heading(format!("{} → {}", env!("CARGO_PKG_VERSION"), release.tag_name));
+                ui.label("동의하면 설치 프로그램을 다운로드·검증하고 Render Farm을 업데이트한 뒤 다시 시작합니다. EffectCraft 설치는 변경하지 않습니다.");
+                ui.label("연결할 모든 PC를 같은 버전으로 업데이트하세요.");
+                ui.hyperlink_to("GitHub 릴리스 보기", &release.html_url);
+                egui::ScrollArea::vertical().id_salt("release_notes").max_height((ui.ctx().content_rect().height() - 320.0).clamp(80.0, 240.0)).show(
+                    ui,
+                    |ui| {
                         ui.label(release.body.as_deref().unwrap_or("등록된 변경 내용이 없습니다."));
-                    });
-                    if !idle {
-                        ui.colored_label(egui::Color32::YELLOW, "호스트·클라이언트와 진행 중인 작업을 종료하면 업데이트할 수 있습니다.");
-                    }
-                    ui.horizontal(|ui| {
-                        consent = ui.add_enabled(idle && !self.updater.busy(), primary_button("동의하고 업데이트 · 재시작")).clicked();
-                        later = ui.button("나중에").clicked();
-                    });
+                    },
+                );
+                if !idle {
+                    ui.colored_label(egui::Color32::YELLOW, "호스트·클라이언트와 진행 중인 작업을 종료하면 업데이트할 수 있습니다.");
+                }
+                ui.horizontal_wrapped(|ui| {
+                    consent = ui.add_enabled(idle && !self.updater.busy(), primary_button("동의하고 업데이트 · 재시작")).clicked();
+                    later = ui.button("나중에").clicked();
                 });
-            if !open || later {
+            });
+            if response.should_close() || later {
                 self.updater.prompt = false;
             }
             if consent {
@@ -296,6 +298,10 @@ impl App {
     }
 
     fn show_preview(&mut self, ui: &mut egui::Ui, key: u64, preview: &farm::Preview) {
+        self.show_preview_sized(ui, key, preview, 220.0);
+    }
+
+    fn show_preview_sized(&mut self, ui: &mut egui::Ui, key: u64, preview: &farm::Preview, max_height: f32) {
         let changed = self.textures.get(&key).is_none_or(|(bytes, _)| !Arc::ptr_eq(bytes, &preview.jpeg));
         if changed && let Ok(image) = image::load_from_memory(&preview.jpeg) {
             let rgba = image.to_rgba8();
@@ -304,8 +310,11 @@ impl App {
             self.textures.insert(key, (preview.jpeg.clone(), texture));
         }
         if let Some((_, texture)) = self.textures.get(&key) {
-            ui.add(egui::Image::new(texture).max_width(360.0).max_height(203.0));
-            ui.small(format!("프레임 {} · 480px 미리보기", preview.frame));
+            let size = egui::vec2(ui.available_width().min(max_height * 16.0 / 9.0), (ui.available_width() * 9.0 / 16.0).min(max_height));
+            ui.with_layout(egui::Layout::top_down(egui::Align::Center), |ui| {
+                ui.add(egui::Image::new(texture).fit_to_exact_size(size).maintain_aspect_ratio(true));
+                ui.small(format!("프레임 {} · 최근 완료 프레임", preview.frame));
+            });
         }
     }
 
@@ -445,6 +454,14 @@ impl App {
         self.textures.clear();
         self.inspected = None;
         if self.settings.host {
+            let output = PathBuf::from(&self.settings.output);
+            if output.is_absolute()
+                && !output.exists()
+                && let Err(error) = std::fs::create_dir_all(&output)
+            {
+                self.last_error = format!("프레임 저장 폴더 만들기: {error}");
+                return;
+            }
             let missing = self.missing_host_settings();
             if !missing.is_empty() {
                 self.last_error = format!("호스트 설정을 완료하세요: {}", missing.join(", "));
@@ -587,510 +604,15 @@ impl eframe::App for App {
             self.start_discovery();
         }
         let before = self.settings.clone();
-        egui::CentralPanel::default().show(ui, |ui| {
-            ui.label(egui::RichText::new("EffectCraft · Render Farm").size(23.0).strong().color(egui::Color32::from_rgb(242, 245, 250)));
-            ui.label(if self.settings.host {
-                "호스트가 프레임을 배분하고 원본 FPS·해상도로 최종 MP4를 만듭니다."
-            } else {
-                "호스트의 작업 지시에 따라 렌더링하고, 프레임을 전송한 뒤 임시 파일을 삭제합니다."
-            });
-            ui.add_space(8.0);
-            self.update_ui(ui);
-            ui.horizontal(|ui| {
-                if !self.running
-                    && !self.updater.installing()
-                    && self.pending_start.is_none()
-                    && ui.add(primary_button(if self.settings.host { "호스트 열기" } else { "호스트에 연결" })).clicked()
-                {
-                    self.start();
-                }
-                if self.pending_start.is_some() {
-                    ui.label("호스트 준비 중…");
-                }
-                if self.running && self.settings.host && !self.stopping {
-                    let started = self.state.lock().unwrap_or_else(std::sync::PoisonError::into_inner).dispatch_enabled;
-                    if !started
-                        && ui.add(primary_button("렌더 시작")).clicked()
-                        && let Some(job) = &self.job
-                    {
-                        farm::begin_render(&self.config(), job, &self.state);
-                    }
-                }
-                if self.running
-                    && !self.settings.host
-                    && !self.worker_active.load(Ordering::Relaxed)
-                    && !self.stopping
-                    && ui.add(primary_button("다시 연결")).clicked()
-                {
-                    self.spawn_worker(self.config());
-                }
-                if self.running && !self.stopping && ui.button("중지").clicked() {
-                    self.stop.store(true, Ordering::Relaxed);
-                    self.stopping = true;
-                }
-                if self.running {
-                    ui.label(if self.stopping {
-                        "중지 중"
-                    } else if self.settings.host {
-                        "호스트 실행 중"
-                    } else {
-                        let state = self.state.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
-                        match state.local_progress {
-                            Some((start, end, done)) if done < end - start => "클라이언트 프레임 렌더링 중",
-                            Some(_) => "클라이언트 준비 완료 · 작업 대기",
-                            None => match state.messages.last().map(String::as_str) {
-                                Some(message) if message.contains("렌더링:") => "클라이언트 프레임 렌더링 중",
-                                Some(message) if message.contains("렌더 준비 완료:") || message.contains("구간 ") => "클라이언트 준비 완료 · 작업 대기",
-                                _ => "클라이언트 연결 및 리소스 검사 중",
-                            },
-                        }
-                    });
-                }
-            });
-            if self.running && self.settings.host {
-                ui.small(format!("TCP 수신 중: {} · 클라이언트에는 이 PC의 고정 LAN IP와 위 수신 포트를 입력하세요", self.settings.host_address));
-            } else if !self.settings.host && self.settings.client_address.trim_start().starts_with("127.") {
-                ui.colored_label(egui::Color32::YELLOW, "127.0.0.1은 이 클라이언트 PC 자신입니다. 호스트가 다른 PC라면 호스트 PC의 고정 LAN IP를 입력하세요.");
+        if self.stopping {
+            let connected = farm::progress_snapshot(&self.state).2;
+            if connected == 0 && !self.worker_active.load(Ordering::Relaxed) {
+                self.running = false;
+                self.stopping = false;
             }
-            if !self.last_error.is_empty() {
-                ui.colored_label(egui::Color32::RED, &self.last_error);
-            }
-            if self.settings.host && !self.running {
-                let missing = self.missing_host_settings();
-                if !missing.is_empty() {
-                    ui.colored_label(egui::Color32::YELLOW, format!("호스트 준비에 필요: {}", missing.join(", ")));
-                }
-            }
-            ui.separator();
-            ui.horizontal(|ui| {
-                ui.selectable_value(&mut self.monitor, false, "작업 설정");
-                ui.selectable_value(&mut self.monitor, true, "렌더 모니터");
-                if self.running {
-                    ui.small("실행 중 · 설정 변경은 종료 후 적용");
-                }
-            });
-            ui.add_space(6.0);
-            egui::ScrollArea::vertical().auto_shrink([false, false]).show(ui, |ui| {
-                if !self.monitor {
-                    ui.add_enabled_ui(!self.running && self.pending_start.is_none(), |ui| {
-                        ui.group(|ui| {
-                            ui.set_width(ui.available_width());
-                            section_title(ui, "1 · 역할과 연결");
-                            ui.horizontal(|ui| {
-                                ui.selectable_value(&mut self.settings.host, true, "호스트 · 작업 배분 및 영상 합치기");
-                                ui.selectable_value(&mut self.settings.host, false, "클라이언트 · 프레임 렌더링");
-                            });
-                            ui.add_space(4.0);
-                            if self.settings.host {
-                                text_row(ui, "수신할 IP:포트", &mut self.settings.host_address, false);
-                                ui.small("0.0.0.0은 이 PC의 모든 네트워크 주소에서 연결을 받습니다.");
-                            } else {
-                                text_row(ui, "호스트의 고정 IP:포트", &mut self.settings.client_address, false);
-                                ui.small("예: 192.168.0.10:9778 · 호스트에서 '호스트 열기'를 완료한 뒤 연결하세요.");
-                                ui.horizontal(|ui| {
-                                    if ui.button("LAN에서 다시 검색").clicked() && self.pending_discovery.is_none() {
-                                        self.start_discovery();
-                                    }
-                                    ui.small(&self.discovery_status);
-                                });
-                                for host in &self.discovered_hosts {
-                                    let address = host.address.to_string();
-                                    if ui.selectable_label(self.settings.client_address == address, format!("{} · {address}", host.name)).clicked() {
-                                        self.settings.client_address = address;
-                                    }
-                                }
-                            }
-                            text_row(ui, "접속 암호", &mut self.settings.token, true);
-                        });
-                        ui.add_space(8.0);
-                        ui.group(|ui| {
-                            ui.set_width(ui.available_width());
-                            section_title(ui, if self.settings.host { "2 · 프로젝트와 출력 폴더" } else { "2 · 클라이언트 렌더 준비" });
-                            if self.settings.host {
-                                if path_row(ui, "EffectCraft 프로젝트 (.ecproj)", &mut self.settings.project)
-                                    && let Some(path) = rfd::FileDialog::new().add_filter("EffectCraft project", &["ecproj"]).pick_file()
-                                {
-                                    self.settings.project = path.display().to_string();
-                                }
-                                ui.label(egui::RichText::new("렌더할 컴포지션").strong());
-                                let previous_comp = self.settings.comp.clone();
-                                egui::ComboBox::from_id_salt("composition")
-                                    .selected_text(if self.settings.comp.is_empty() { "컴포지션 선택" } else { &self.settings.comp })
-                                    .show_ui(ui, |ui| {
-                                        for comp in &self.catalog {
-                                            ui.selectable_value(&mut self.settings.comp, comp.name.clone(), &comp.name);
-                                        }
-                                    });
-                                if self.settings.comp != previous_comp {
-                                    self.sync_selected_comp_range();
-                                }
-                                if let Some(comp) = self.catalog.iter().find(|comp| comp.name == self.settings.comp) {
-                                    ui.small(format!("{}프레임 · {:.3} FPS · {}×{}", comp.frames, comp.rate.as_f64(), comp.width, comp.height));
-                                } else {
-                                    ui.small(&self.catalog_status);
-                                }
-                                if ui.button("프로젝트 목록 새로고침").clicked() {
-                                    self.catalog_changed = Some(Instant::now());
-                                }
-                            } else {
-                                ui.small("프로젝트·소스·글꼴·컴포지션·프레임 범위는 호스트가 렌더 시작 시 전송합니다.");
-                            }
-                            ui.label("설치된 EffectCraft에서 자동으로 찾은 렌더 엔진");
-                            ui.monospace(&self.settings.cli);
-                            if self.settings.host
-                                && path_row(ui, "호스트 프레임 저장 폴더", &mut self.settings.output)
-                                && let Some(path) = rfd::FileDialog::new().pick_folder()
-                            {
-                                self.settings.output = path.display().to_string();
-                            }
-                            ui.checkbox(&mut self.settings.render.automatic, "연결된 PC 자원과 실측 성능에 맞춰 자동 최적화 · 권장");
-                            ui.small("호스트의 자동 모드를 모든 작업 PC에 적용합니다. CPU/GPU·인코더·스레드 수·작업량·미리보기 부하를 자동 조절합니다.");
-                            ui.add_enabled(!self.settings.render.automatic, egui::Checkbox::new(&mut self.settings.gpu, "수동: 이 PC에서 GPU 가속 렌더링 사용"));
-                        });
-                        if self.settings.host {
-                            ui.add_space(8.0);
-                            ui.group(|ui| {
-                                ui.set_width(ui.available_width());
-                                section_title(ui, "3 · 렌더 범위와 분배");
-                                let selected = self.catalog.iter().find(|comp| comp.name == self.settings.comp);
-                                let total = selected.map_or(100_000, |comp| comp.frames.max(1));
-                                if let Some(comp) = selected {
-                                    ui.small(format!("작업 영역: {}–{} / 전체 {}프레임", comp.work_start, comp.work_end, comp.frames));
-                                    let display_end = if self.settings.range_end == 0 { total } else { self.settings.range_end };
-                                    self.settings.range_end = display_end.clamp(1, total);
-                                    self.settings.range_start = self.settings.range_start.clamp(0, self.settings.range_end - 1);
-                                    range_bar(
-                                        ui,
-                                        &mut self.settings.range_start,
-                                        &mut self.settings.range_end,
-                                        total,
-                                        (comp.work_start, comp.work_end),
-                                        &mut self.range_handle,
-                                    );
-                                    ui.horizontal(|ui| {
-                                        if ui.button("작업 영역으로 초기화").clicked() {
-                                            self.settings.range_start = comp.work_start;
-                                            self.settings.range_end = comp.work_end;
-                                        }
-                                        if ui.button("전체 컴포지션").clicked() {
-                                            self.settings.range_start = 0;
-                                            self.settings.range_end = total;
-                                        }
-                                    });
-                                } else {
-                                    ui.small("프로젝트와 컴포지션을 선택하면 렌더 범위 바가 표시됩니다.");
-                                }
-                                egui::Grid::new("render_options").num_columns(2).spacing([20.0, 10.0]).show(ui, |ui| {
-                                    ui.label("시작 프레임");
-                                    ui.add(egui::DragValue::new(&mut self.settings.range_start).range(0..=total.saturating_sub(1)));
-                                    ui.end_row();
-                                    ui.label("끝 프레임 · 미포함");
-                                    ui.add(egui::DragValue::new(&mut self.settings.range_end).range(1..=total));
-                                    ui.end_row();
-                                    ui.label("동시에 사용할 PC 수");
-                                    if self.settings.render.automatic {
-                                        ui.label("연결된 사용 가능 PC 전체 · 최대 64대");
-                                    } else {
-                                        ui.add(egui::DragValue::new(&mut self.settings.max_workers).range(1..=64));
-                                    }
-                                    ui.end_row();
-                                });
-                                if selected.is_some() {
-                                    self.settings.range_end = self.settings.range_end.clamp(1, total);
-                                    self.settings.range_start = self.settings.range_start.clamp(0, self.settings.range_end - 1);
-                                }
-                                let has_selection = selected.is_some();
-                                ui.horizontal(|ui| {
-                                    ui.label("범위 미리보기 프레임");
-                                    ui.add(
-                                        egui::DragValue::new(&mut self.inspect_frame)
-                                            .range(self.settings.range_start..=self.settings.range_end.saturating_sub(1).max(self.settings.range_start)),
-                                    );
-                                    if ui.add_enabled(self.pending_preview.is_none() && has_selection, egui::Button::new("선택 프레임 시험 렌더")).clicked()
-                                    {
-                                        let config = self.config();
-                                        let frame = self.inspect_frame;
-                                        let (tx, rx) = mpsc::channel();
-                                        self.pending_preview = Some(rx);
-                                        self.preview_status = "미리보기 렌더링 중…".into();
-                                        thread::spawn(move || {
-                                            let _ = tx.send(farm::render_preview(&config, frame));
-                                        });
-                                    }
-                                });
-                                ui.small(&self.preview_status);
-                                if let Some(preview) = self.inspected.clone() {
-                                    self.show_preview(ui, u64::MAX, &preview);
-                                }
-                                ui.horizontal(|ui| {
-                                    ui.label("구간 분배");
-                                    ui.selectable_value(&mut self.settings.distribution, Distribution::Auto, "자동 · 빠른 PC가 남은 작업 지원");
-                                    ui.selectable_value(&mut self.settings.distribution, Distribution::Frames, "프레임");
-                                    ui.selectable_value(&mut self.settings.distribution, Distribution::Percent, "퍼센트");
-                                });
-                                match self.settings.distribution {
-                                    Distribution::Auto => {}
-                                    Distribution::Frames => {
-                                        ui.horizontal(|ui| {
-                                            ui.label("구간당 프레임");
-                                            ui.add(egui::DragValue::new(&mut self.settings.chunk_frames).range(1..=100_000));
-                                        });
-                                    }
-                                    Distribution::Percent => {
-                                        ui.horizontal(|ui| {
-                                            ui.label("전체 선택 범위 중 구간당 비율");
-                                            ui.add(egui::DragValue::new(&mut self.settings.chunk_percent).range(0.01..=100.0).suffix("%"));
-                                        });
-                                    }
-                                }
-                                if let Some(comp) = self.catalog.iter().find(|comp| comp.name == self.settings.comp)
-                                    && let Ok(frames) = self.settings.effective_chunk_frames(comp.frames)
-                                {
-                                    let end = if self.settings.range_end == 0 { comp.frames } else { self.settings.range_end };
-                                    let span = end - self.settings.range_start;
-                                    let chunks = (span + frames - 1) / frames;
-                                    ui.small(format!(
-                                        "{}–{} · 총 {}프레임 → 구간당 최대 {}프레임, {}개 구간",
-                                        self.settings.range_start, end, span, frames, chunks
-                                    ));
-                                }
-                                ui.checkbox(&mut self.settings.local_worker, "호스트 PC도 렌더링에 참여");
-                                if path_row(ui, "최종 MP4 저장 위치", &mut self.settings.final_video)
-                                    && let Some(path) = rfd::FileDialog::new().add_filter("MP4 video", &["mp4"]).save_file()
-                                {
-                                    self.settings.final_video = path.display().to_string();
-                                }
-                                ui.collapsing("성능 · 품질 · 미리보기 옵션", |ui| {
-                                    let options = &mut self.settings.render;
-                                    ui.add_enabled(!options.automatic, egui::Checkbox::new(&mut options.adaptive, "PC 처리 속도에 맞춰 대기 구간 자동 분할"));
-                                    ui.horizontal(|ui| {
-                                        ui.label("목표 작업 시간");
-                                        ui.add(egui::DragValue::new(&mut options.target_seconds).range(5..=300).suffix("초"));
-                                        ui.label("실패 시 최대 시도");
-                                        ui.add(egui::DragValue::new(&mut options.retries).range(1..=10).suffix("회"));
-                                    });
-                                    ui.checkbox(&mut options.previews, "PC별 실시간 프레임 미리보기");
-                                    ui.horizontal(|ui| {
-                                        ui.label("미리보기 주기");
-                                        ui.add(egui::DragValue::new(&mut options.preview_seconds).range(1..=30).suffix("초"));
-                                        ui.label("프레임 감지 주기");
-                                        ui.add(egui::DragValue::new(&mut options.poll_ms).range(50..=2000).suffix("ms"));
-                                    });
-                                    ui.checkbox(&mut options.draft, "Draft 품질 · 검토용 빠른 렌더링");
-                                    ui.add_enabled(!options.automatic, egui::Checkbox::new(&mut options.nvenc, "최종 MP4: FFmpeg 직접 인코딩 · NVENC / AMF / QSV / CPU"));
-                                    if path_row(ui, "FFmpeg 실행 파일 · 비워 두면 자동 감지", &mut options.ffmpeg)
-                                        && let Some(path) = rfd::FileDialog::new().pick_file()
-                                    {
-                                        options.ffmpeg = path.display().to_string();
-                                    }
-                                    ui.small("자동 모드는 실제 프레임으로 인코더 속도를 비교합니다. 실패 시 다음 경로, FFmpeg가 없으면 EffectCraft 출력으로 전환합니다.");
-                                    ui.small("기본값은 Best입니다. Draft는 일부 효과의 품질에 영향을 줄 수 있습니다. FPS와 해상도는 원본을 유지합니다.");
-                                    ui.horizontal(|ui| {
-                                        ui.label("최종 H.264 비트레이트");
-                                        ui.add(egui::DragValue::new(&mut options.video_bitrate).range(100..=200_000).speed(100).suffix("kbps"));
-                                        ui.checkbox(&mut options.audio, "원본 오디오 포함");
-                                    });
-                                    ui.checkbox(&mut options.durable_writes, "수신 프레임마다 디스크 동기화 · 전원 장애 대비, 저장 속도 감소");
-                                    ui.small(
-                                        "작은 구간은 PC 간 부하를 고르게 하지만 CLI 시작 비용이 늘어납니다. 소스가 무거우면 프레임 분배로 구간을 늘리세요.",
-                                    );
-                                });
-                            });
-                        }
-                    });
-                }
-                ui.add_space(10.0);
-                ui.separator();
-                let (done, total, connected, failed, messages, _) = farm::snapshot(&self.state);
-                let (workers, final_status) = farm::worker_snapshot(&self.state);
-                if self.stopping {
-                    ui.label("중지 요청됨 · 진행 중인 구간이 끝나기를 기다리는 중");
-                    if connected == 0 && !self.worker_active.load(Ordering::Relaxed) {
-                        self.running = false;
-                        self.stopping = false;
-                    }
-                }
-                if self.settings.host && total > 0 {
-                    section_title(ui, "진행 상황");
-                    ui.add(
-                        egui::ProgressBar::new((done as f32 / total as f32).clamp(0.0, 1.0))
-                            .text(format!("전체 {done} / {total} 프레임 · {:.1}%", done as f64 * 100.0 / total as f64)),
-                    );
-                    let limit = if self.settings.render.automatic { "자동 · 최대 64".to_owned() } else { self.settings.max_workers.to_string() };
-                    ui.label(format!("연결된 PC: {connected} · 실패한 구간: {failed} · 동시 사용 한도: {limit}"));
-                    ui.label(&final_status);
-                    let (elapsed, active) = {
-                        let s = self.state.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
-                        (
-                            s.started.map(|at| s.finished_elapsed.unwrap_or_else(|| at.elapsed()).as_secs_f64()),
-                            workers.iter().filter(|w| w.assigned.is_some()).count(),
-                        )
-                    };
-                    if let Some(elapsed) = elapsed {
-                        let speed = workers
-                            .iter()
-                            .map(|w| w.started.filter(|_| w.assigned.is_some()).map_or(0.0, |at| w.current_done as f64 / at.elapsed().as_secs_f64().max(0.001)))
-                            .sum::<f64>();
-                        let eta = if done >= total {
-                            "프레임 완료".into()
-                        } else if speed > 0.0 {
-                            format!("약 {:.0}초", (total - done) as f64 / speed)
-                        } else {
-                            "계산 중".into()
-                        };
-                        ui.horizontal(|ui| {
-                            ui.strong(format!("경과 {:.0}초", elapsed));
-                            ui.separator();
-                            ui.label(format!("처리 {:.2} FPS", speed));
-                            ui.separator();
-                            ui.label(format!("남은 시간 {eta}"));
-                            ui.separator();
-                            ui.label(format!("작업 중 {active}대"));
-                        });
-                    }
-                    let segments = farm::timeline(&self.state);
-                    if let (Some(first), Some(last)) = (segments.iter().map(|s| s.0).min(), segments.iter().map(|s| s.1).max()) {
-                        let (rect, _) = ui.allocate_exact_size(egui::vec2(ui.available_width(), 22.0), egui::Sense::hover());
-                        let x = |frame: i64| rect.left() + (frame - first) as f32 / (last - first).max(1) as f32 * rect.width();
-                        for (start, end, status) in segments {
-                            let color = match status {
-                                1 => egui::Color32::from_rgb(80, 150, 250),
-                                2 => egui::Color32::from_rgb(55, 185, 135),
-                                3 => egui::Color32::from_rgb(235, 85, 100),
-                                _ => egui::Color32::from_gray(65),
-                            };
-                            ui.painter().rect_filled(egui::Rect::from_min_max(egui::pos2(x(start), rect.top()), egui::pos2(x(end), rect.bottom())), 0.0, color);
-                        }
-                        ui.small(format!("{first}–{last} · 회색 대기 / 파랑 진행 / 초록 완료 / 빨강 실패 · 끝 프레임 미포함"));
-                        ui.collapsing("완료 프레임 탐색", |ui| {
-                            ui.horizontal(|ui| {
-                                ui.add(egui::Slider::new(&mut self.inspect_frame, first..=last - 1).text("프레임"));
-                                if ui.add_enabled(self.pending_preview.is_none(), egui::Button::new("미리보기 열기")).clicked() {
-                                    let output = self.state.lock().unwrap_or_else(std::sync::PoisonError::into_inner).output.clone();
-                                    let frame = self.inspect_frame;
-                                    let (tx, rx) = mpsc::channel();
-                                    self.pending_preview = Some(rx);
-                                    thread::spawn(move || {
-                                        let _ = tx.send(farm::preview_frame(&output, frame));
-                                    });
-                                }
-                            });
-                            ui.small(&self.preview_status);
-                            if let Some(preview) = self.inspected.clone() {
-                                self.show_preview(ui, u64::MAX, &preview);
-                            }
-                        });
-                    }
-                }
-                if !self.settings.host
-                    && let Some((start, end, done)) = self.state.lock().unwrap_or_else(std::sync::PoisonError::into_inner).local_progress
-                {
-                    let span = end - start;
-                    if span > 0 {
-                        section_title(ui, "이 PC 렌더 진행률");
-                        ui.add(egui::ProgressBar::new((done as f32 / span as f32).clamp(0.0, 1.0)).text(format!("{start}–{end} · {done} / {span} 프레임")));
-                    }
-                }
-                if !self.settings.host {
-                    let profile = self.state.lock().unwrap_or_else(std::sync::PoisonError::into_inner).local_profile.clone();
-                    if !profile.is_empty() {
-                        ui.small(profile);
-                    }
-                    let preview = self.state.lock().unwrap_or_else(std::sync::PoisonError::into_inner).local_preview.clone();
-                    if let Some(preview) = preview {
-                        self.show_preview(ui, 0, &preview);
-                    }
-                }
-                if self.settings.host {
-                    ui.separator();
-                    section_title(ui, "PC별 진행률");
-                    if !workers.iter().any(|worker| worker.connected) {
-                        ui.label("연결된 PC가 없습니다. 클라이언트에서 이 호스트의 고정 IP로 연결하세요.");
-                    }
-                    for worker in &workers {
-                        ui.group(|ui| {
-                            ui.set_width(ui.available_width());
-                            ui.horizontal(|ui| {
-                                let mut enabled = worker.enabled;
-                                if ui.checkbox(&mut enabled, &worker.label).changed()
-                                    && let Some(ip) = farm::set_worker_enabled(&self.state, worker.id, enabled)
-                                {
-                                    self.settings.disabled_workers.retain(|saved| saved != &ip && saved != &worker.label);
-                                    if !enabled {
-                                        self.settings.disabled_workers.push(ip);
-                                    }
-                                }
-                                if !worker.connected {
-                                    ui.small("연결 끊김");
-                                }
-                            });
-                            if let Some((start, end)) = worker.assigned {
-                                let span = end - start;
-                                if span > 0 {
-                                    ui.add(
-                                        egui::ProgressBar::new((worker.current_done as f32 / span as f32).clamp(0.0, 1.0))
-                                            .text(format!("현재 {start}–{end} · {} / {span} 프레임", worker.current_done)),
-                                    );
-                                }
-                            } else {
-                                ui.small("현재 작업 대기");
-                            }
-                            ui.small(format!("이 PC에서 완료: {}프레임", worker.completed_frames));
-                            if !worker.profile.is_empty() {
-                                ui.small(&worker.profile);
-                            }
-                            let fps = worker
-                                .started
-                                .filter(|_| worker.assigned.is_some())
-                                .map_or(worker.fps, |at| worker.current_done as f64 / at.elapsed().as_secs_f64().max(0.001));
-                            let network = worker.transferred_bytes as f64 / 1048576.0 / worker.transfer_seconds.max(0.001);
-                            ui.small(format!("{fps:.2} FPS · 수신 {:.1} MiB · {network:.1} MiB/s", worker.transferred_bytes as f64 / 1048576.0));
-                            if let Some((start, end)) = worker.assigned {
-                                ui.small(format!("다음 렌더 프레임: {} · 구간 {}–{}", (start + worker.current_done).min(end - 1), start, end));
-                            }
-                            if let Some(preview) = &worker.preview {
-                                self.show_preview(ui, worker.id, preview);
-                            }
-                        });
-                    }
-                }
-                ui.separator();
-                section_title(ui, "작업 기록");
-                ui.horizontal(|ui| {
-                    ui.label("검색");
-                    ui.text_edit_singleline(&mut self.log_filter);
-                    ui.checkbox(&mut self.log_debug, "DEBUG 포함");
-                    if ui.button("표시 로그 복사").clicked() {
-                        ui.ctx().copy_text(
-                            messages
-                                .iter()
-                                .filter(|m| (self.log_debug || !m.contains("[DEBUG]")) && m.contains(&self.log_filter))
-                                .cloned()
-                                .collect::<Vec<_>>()
-                                .join("\n"),
-                        );
-                    }
-                });
-                egui::ScrollArea::vertical().id_salt("farm_log").max_height(170.0).show(ui, |ui| {
-                    for message in messages.iter().rev().filter(|m| (self.log_debug || !m.contains("[DEBUG]")) && m.contains(&self.log_filter)) {
-                        let color = if message.contains("[ERROR]") {
-                            egui::Color32::LIGHT_RED
-                        } else if message.contains("[WARN]") {
-                            egui::Color32::YELLOW
-                        } else {
-                            ui.visuals().text_color()
-                        };
-                        ui.colored_label(color, message);
-                    }
-                });
-                ui.separator();
-                ui.small("클라이언트가 호스트의 로컬 IP로 연결합니다. 프로젝트와 참조 소스는 호스트가 전송합니다.");
-                ui.small("설정은 이 PC의 EffectCraft 사용자 설정 폴더에 저장됩니다.");
-                if let Ok(path) = settings::log_path() {
-                    ui.small(format!("로그 파일: {}", path.display()));
-                }
-            });
-        });
+        }
+        self.draw_interface(ui);
+        self.update_ui(ui);
         if self.last_error != self.last_logged_error {
             if !self.last_error.is_empty() && !self.last_error.starts_with("클라이언트 오류:") {
                 self.state.lock().unwrap_or_else(std::sync::PoisonError::into_inner).note(format!("화면 오류: {}", self.last_error));
@@ -1104,6 +626,10 @@ impl eframe::App for App {
 }
 
 fn main() {
+    #[cfg(debug_assertions)]
+    if interface::review::run_requested() {
+        return;
+    }
     let (saved, _) = settings::load();
     let installation = match installation::detect(&saved.cli) {
         Ok(installation) => installation,
@@ -1114,7 +640,7 @@ fn main() {
         }
     };
     let options = eframe::NativeOptions {
-        viewport: egui::ViewportBuilder::default().with_title("EffectCraft Render Farm").with_inner_size([1120.0, 860.0]).with_min_inner_size([760.0, 600.0]),
+        viewport: egui::ViewportBuilder::default().with_title("EffectCraft Render Farm").with_inner_size([1440.0, 940.0]).with_min_inner_size([560.0, 520.0]),
         ..Default::default()
     };
     if let Err(e) = eframe::run_native(
