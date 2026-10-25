@@ -313,7 +313,7 @@ impl App {
             let size = egui::vec2(ui.available_width().min(max_height * 16.0 / 9.0), (ui.available_width() * 9.0 / 16.0).min(max_height));
             ui.with_layout(egui::Layout::top_down(egui::Align::Center), |ui| {
                 ui.add(egui::Image::new(texture).fit_to_exact_size(size).maintain_aspect_ratio(true));
-                ui.small(format!("프레임 {} · 최근 완료 프레임", preview.frame));
+                ui.small(format!("프레임 {}", preview.frame));
             });
         }
     }

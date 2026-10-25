@@ -89,16 +89,6 @@ impl App {
         egui::Panel::bottom("primary-actions").frame(egui::Frame::new().fill(SURFACE).inner_margin(egui::Margin::symmetric(20, 10))).show(root, |ui| {
             ui.horizontal_wrapped(|ui| {
                 self.action_bar(ui);
-                if self.running {
-                    caption(
-                        ui,
-                        if self.stopping {
-                            "진행 중인 구간을 마치는 중입니다."
-                        } else {
-                            "설정은 연결을 종료한 후 변경할 수 있습니다."
-                        },
-                    );
-                }
             });
         });
         egui::CentralPanel::default().frame(egui::Frame::new().fill(BACKGROUND).inner_margin(20)).show(root, |ui| {
@@ -166,7 +156,6 @@ impl App {
         ui.horizontal_wrapped(|ui| {
             ui.vertical(|ui| {
                 ui.label(egui::RichText::new("Render Farm").size(26.0).strong());
-                caption(ui, "EffectCraft  /  연결하고, 함께 렌더링하세요.");
             });
             if wide {
                 ui.add_space(24.0);
@@ -242,8 +231,7 @@ impl App {
     fn setup_panel(&mut self, ui: &mut egui::Ui) {
         card().show(ui, |ui| {
             ui.set_width(ui.available_width());
-            section_title(ui, "작업 공간");
-            caption(ui, "프로젝트를 준비하고 작업 PC를 연결하세요.");
+            section_title(ui, if self.settings.host { "프로젝트" } else { "호스트 연결" });
             ui.add_space(8.0);
             ui.add_enabled_ui(!self.running && self.pending_start.is_none(), |ui| {
                 ui.horizontal(|ui| {
@@ -286,7 +274,7 @@ impl App {
                     }
                 } else {
                     text_row(ui, "호스트 주소", &mut self.settings.client_address, false);
-                    caption(ui, "호스트 PC에 표시된 LAN 주소를 입력하세요.");
+                    caption(ui, "예: 192.168.0.10:9778");
                     if ui.button("주변 호스트 찾기").clicked() && self.pending_discovery.is_none() {
                         self.start_discovery();
                     }
@@ -298,11 +286,9 @@ impl App {
                     }
                     caption(ui, &self.discovery_status);
                     ui.add_space(10.0);
-                    caption(ui, "연결하면 프로젝트와 소스를 자동으로 받습니다.");
                 }
                 ui.add_space(8.0);
-                text_row(ui, "접속 암호", &mut self.settings.token, true);
-                caption(ui, "호스트와 작업 PC에 같은 암호를 입력하세요. 8자 이상.");
+                text_row(ui, "접속 암호 · 8자 이상", &mut self.settings.token, true);
             });
             ui.add_space(12.0);
             ui.separator();
@@ -316,7 +302,7 @@ impl App {
                     ),
                 );
             } else {
-                caption(ui, "CPU·GPU 최적화는 호스트 설정을 따릅니다.");
+                caption(ui, "렌더 설정: 호스트 기준");
             }
             if self.running && self.settings.host {
                 caption(ui, format!("연결 포트: {}", self.settings.host_address));
@@ -358,7 +344,7 @@ impl App {
         card().show(ui, |ui| {
             ui.set_width(ui.available_width());
             ui.horizontal_wrapped(|ui| {
-                section_title(ui, if total > 0 { "렌더 진행 상황" } else { "준비되면, 함께 시작하세요." });
+                section_title(ui, "렌더 진행 상황");
                 if failed > 0 {
                     ui.colored_label(egui::Color32::LIGHT_RED, format!("실패 {failed}구간 · 작업 기록 확인"));
                 }
@@ -377,7 +363,7 @@ impl App {
             } else if let Some((start, end, done)) = local_progress {
                 (done as f32 / (end - start).max(1) as f32, format!("현재 {start}–{end} · {done}/{} 프레임", end - start))
             } else {
-                (0.0, "프로젝트와 작업 PC가 연결되면 진행 상황을 표시합니다.".into())
+                (0.0, "작업 대기".into())
             };
             let animated = motion(ui.ctx(), ui.id().with("total-progress"), progress, self.settings.reduced_motion);
             ui.add_space(12.0);
@@ -457,21 +443,12 @@ impl App {
     fn workers_panel(&mut self, ui: &mut egui::Ui, workers: &[farm::WorkerInfo]) {
         ui.horizontal_wrapped(|ui| {
             section_title(ui, "연결된 컴퓨터");
-            caption(ui, "각 PC의 진행 상황 · 상세 정보는 카드에서 확인");
         });
         ui.add_space(8.0);
         if workers.is_empty() {
             card().show(ui, |ui| {
                 ui.set_width(ui.available_width());
-                ui.label("아직 연결된 작업 PC가 없습니다.");
-                caption(
-                    ui,
-                    if self.settings.host {
-                        "호스트를 연 다음, 다른 PC에서 이 호스트에 연결하세요."
-                    } else {
-                        "호스트에 연결하면 이 PC가 렌더링에 참여합니다."
-                    },
-                );
+                ui.label("연결된 PC 없음");
             });
         }
         let columns = ((ui.available_width() + 14.0) / 270.0).floor().clamp(1.0, 4.0) as usize;
@@ -505,7 +482,7 @@ impl App {
                 let height = (ui.available_width() * 0.46).clamp(160.0, 330.0);
                 let (rect, _) = ui.allocate_exact_size(egui::vec2(ui.available_width(), height), egui::Sense::hover());
                 ui.painter().rect_filled(rect, 10.0, BACKGROUND);
-                ui.painter().text(rect.center(), egui::Align2::CENTER_CENTER, "완료된 프레임이 여기에 표시됩니다", egui::FontId::proportional(14.0), MUTED);
+                ui.painter().text(rect.center(), egui::Align2::CENTER_CENTER, "미리보기 없음", egui::FontId::proportional(14.0), MUTED);
             }
             let segments = farm::timeline(&self.state);
             if let (Some(first), Some(last)) = (segments.iter().map(|s| s.0).min(), segments.iter().map(|s| s.1).max()) {
@@ -616,9 +593,8 @@ impl App {
     }
 
     fn general_settings(&mut self, ui: &mut egui::Ui) {
-        section_title(ui, "자동 최적화");
-        ui.checkbox(&mut self.settings.render.automatic, "PC 자원과 실제 처리 속도에 맞춰 자동 선택");
-        caption(ui, "CPU/GPU, 인코더, 스레드 수와 작업량을 자동으로 조절합니다.");
+        section_title(ui, "렌더링");
+        ui.checkbox(&mut self.settings.render.automatic, "자동 최적화").on_hover_text("CPU/GPU, 인코더, 스레드 수와 작업량을 PC 성능에 맞춰 조절합니다.");
         ui.checkbox(&mut self.settings.local_worker, "호스트 PC도 렌더링에 참여");
         ui.add_enabled(!self.settings.render.automatic, egui::Checkbox::new(&mut self.settings.gpu, "수동: 이 PC에서 GPU 가속 사용"));
         ui.add_space(14.0);
@@ -629,7 +605,7 @@ impl App {
             ui.add(egui::DragValue::new(&mut self.settings.render.preview_seconds).range(1..=30).suffix("초"));
         });
         ui.add_space(14.0);
-        caption(ui, "설치된 EffectCraft 렌더 엔진");
+        caption(ui, "EffectCraft CLI");
         ui.label(egui::RichText::new(&self.settings.cli).small());
         if ui.button("컴포지션 목록 새로고침").clicked() {
             self.catalog_changed = Some(Instant::now());
@@ -639,8 +615,7 @@ impl App {
     fn render_settings(&mut self, ui: &mut egui::Ui) {
         section_title(ui, "품질과 출력");
         let options = &mut self.settings.render;
-        ui.checkbox(&mut options.draft, "Draft · 빠른 검토용");
-        caption(ui, "기본 Best 품질. FPS와 해상도는 원본을 유지합니다.");
+        ui.checkbox(&mut options.draft, "Draft 품질").on_hover_text("빠른 검토용 품질입니다. 끄면 Best 품질을 사용합니다.");
         ui.checkbox(&mut options.audio, "원본 오디오 포함");
         ui.horizontal_wrapped(|ui| {
             ui.label("H.264 비트레이트");
@@ -701,10 +676,10 @@ impl App {
     fn connection_settings(&mut self, ui: &mut egui::Ui) {
         section_title(ui, "네트워크");
         text_row(ui, "호스트 수신 IP:포트", &mut self.settings.host_address, false);
-        caption(ui, "기본 0.0.0.0:9778 · 이 PC의 모든 네트워크 주소에서 연결을 받습니다.");
+        caption(ui, "0.0.0.0: 모든 네트워크 인터페이스");
         ui.add_space(12.0);
         text_row(ui, "작업 PC의 호스트 주소", &mut self.settings.client_address, false);
-        caption(ui, "다른 PC의 호스트에 연결할 때는 해당 PC의 LAN IP를 사용하세요.");
+        caption(ui, "다른 PC에 연결할 때는 해당 PC의 LAN IP를 사용하세요.");
     }
 
     fn about_settings(&mut self, ui: &mut egui::Ui) {
