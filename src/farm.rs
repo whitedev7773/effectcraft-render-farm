@@ -1749,7 +1749,7 @@ fn maybe_start_assembly(config: &Config, job: &Job, state: &Shared) {
     let state = state.clone();
     thread::spawn(move || {
         log(&state, "최종 MP4 출력 시작 · PNG 검증 및 원본 오디오 구성");
-        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| assemble_final(&config, &job)))
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| assemble_final(&config, &job, &state)))
             .unwrap_or_else(|_| Err("최종 영상 합치기 중 예상하지 못한 오류가 발생했습니다".into()));
         let mut s = lock(&state);
         s.finished_elapsed = s.started.map(|at| at.elapsed());
@@ -1825,7 +1825,117 @@ fn assembly_project(config: &Config, job: &Job) -> Result<Project, String> {
     Ok(project)
 }
 
-fn assemble_final(config: &Config, job: &Job) -> Result<(), String> {
+fn assemble_final(config: &Config, job: &Job, state: &Shared) -> Result<(), String> {
+    if config.final_video.exists() {
+        return Err("최종 MP4가 이미 있습니다. 덮어쓰지 않았습니다".into());
+    }
+    if config.render.nvenc {
+        match crate::encoding::locate(&config.render.ffmpeg, &config.cli) {
+            Ok(ffmpeg) => return assemble_ffmpeg(config, job, state, &ffmpeg),
+            Err(reason) => lock(state).event("WARN", "encoder", format!("{reason} · EffectCraft 출력 경로로 전환")),
+        }
+    }
+    log(state, "최종 인코더: EffectCraft 기본 H.264");
+    assemble_legacy(config, job)
+}
+
+fn assemble_ffmpeg(config: &Config, job: &Job, state: &Shared, ffmpeg: &Path) -> Result<(), String> {
+    use crate::encoding::{Encoder, Video};
+    let project = assembly_project(config, job)?;
+    let (comp_id, comp) = project.comps().find(|(id, _)| project.item(**id).is_some_and(|item| item.name == job.comp)).ok_or("컴포지션이 없습니다")?;
+    let aspect = comp.pixel_aspect;
+    if !aspect.is_finite() || aspect <= 0.0 {
+        return Err("잘못된 픽셀 종횡비입니다".into());
+    }
+    let has_audio = config.render.audio
+        && selected_items(&project, *comp_id)?
+            .into_iter()
+            .any(|id| project.item(id).is_some_and(|item| matches!(&item.kind, ItemKind::Footage(f) if f.has_audio || f.kind == FootageKind::Audio)));
+    let workspace = TempWorkspace::new()?;
+    let audio = workspace.root.join("mix.wav");
+    if has_audio {
+        log(state, "원본 오디오 믹싱 시작 · 영상 재렌더링 없이 WAV 출력");
+        let errors = workspace.root.join("audio.stderr");
+        let mut command = Command::new(&config.cli);
+        configure_cli(&mut command);
+        command
+            .arg("render")
+            .arg(&config.project)
+            .arg("--comp")
+            .arg(&job.comp)
+            .arg("--out")
+            .arg(&audio)
+            .args(["--format", "wav", "--audio", "on"])
+            .arg("--start")
+            .arg(format!("{:.9}", job.rate.tick_of(job.start).seconds()))
+            .arg("--end")
+            .arg(format!("{:.9}", job.rate.tick_of(job.end).seconds()))
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::from(std::fs::File::create(&errors).map_err(|e| e.to_string())?));
+        let status = command.status().map_err(|e| format!("오디오 믹싱 CLI 실행: {e}"))?;
+        if !status.success() || !std::fs::metadata(&audio).is_ok_and(|m| m.len() > 44) {
+            return Err(format!("원본 오디오 믹싱 실패: {}", crate::encoding::stderr_tail(&errors)));
+        }
+        log(state, "원본 오디오 믹싱 완료");
+    }
+    let parent = config.final_video.parent().ok_or("최종 출력 폴더가 없습니다")?;
+    let nonce = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap_or_default().as_nanos();
+    let partial = parent.join(format!(".farm-{}-{nonce}.partial.mp4", std::process::id()));
+    let video = Video {
+        directory: &job.output,
+        start: job.start,
+        end: job.end,
+        rate: job.rate,
+        width: job.width,
+        height: job.height,
+        pixel_aspect: aspect,
+        bitrate: config.render.video_bitrate,
+        audio: has_audio.then_some(audio.as_path()),
+        output: &partial,
+    };
+    let mut encoders = vec![Encoder::Nvenc, Encoder::Cpu];
+    if !job.width.is_multiple_of(2) || !job.height.is_multiple_of(2) {
+        lock(state).event("WARN", "encoder", "홀수 해상도를 변경하지 않기 위해 CPU YUV444 인코딩을 사용합니다");
+        encoders.remove(0);
+    }
+    for encoder in encoders {
+        let started = Instant::now();
+        log(
+            state,
+            format!("최종 인코더: {} · FFmpeg {} · {}×{} · {}/{} FPS", encoder.name(), ffmpeg.display(), job.width, job.height, job.rate.num, job.rate.den),
+        );
+        let errors = workspace.root.join(format!("{}.stderr", encoder.name()));
+        let mut last_log = Instant::now();
+        let result = crate::encoding::encode(ffmpeg, &video, encoder, &errors, |done| {
+            let mut s = lock(state);
+            s.final_status = format!("최종 MP4 {} · {done}/{} 프레임 · {:.1}초", encoder.name(), job.end - job.start, started.elapsed().as_secs_f64());
+            if last_log.elapsed() >= Duration::from_secs(5) || done == job.end - job.start {
+                let message = s.final_status.clone();
+                s.event("DEBUG", "encoder", message);
+                last_log = Instant::now();
+            }
+        });
+        match result {
+            Ok(()) => {
+                if !std::fs::metadata(&partial).is_ok_and(|m| m.len() > 128) {
+                    return Err("FFmpeg MP4 출력이 비어 있습니다".into());
+                }
+                if config.final_video.exists() {
+                    return Err(format!("최종 경로에 파일이 생겼습니다. 출력 보존: {}", partial.display()));
+                }
+                std::fs::rename(&partial, &config.final_video).map_err(|e| format!("최종 MP4 확정: {e}; {}", partial.display()))?;
+                log(state, format!("{} 최종 MP4 완료 · {:.2}초", encoder.name(), started.elapsed().as_secs_f64()));
+                return Ok(());
+            }
+            Err(error) if encoder == Encoder::Nvenc => lock(state).event("WARN", "encoder", format!("NVENC 사용 실패 · CPU libx264로 전환: {error}")),
+            Err(error) => return Err(error),
+        }
+    }
+    Err("최종 인코더를 선택할 수 없습니다".into())
+}
+
+fn assemble_legacy(config: &Config, job: &Job) -> Result<(), String> {
     if config.final_video.exists() {
         return Err(format!("최종 파일이 이미 있습니다. 덮어쓰지 않았습니다: {}", config.final_video.display()));
     }
@@ -2257,7 +2367,7 @@ mod tests {
             comp: "Transfer Test".into(),
             address: address.to_string(),
             token: "test-password".into(),
-            gpu: false,
+            gpu: true,
             range_start: 0,
             range_end: 2,
             chunk_frames: 2,
@@ -2290,7 +2400,7 @@ mod tests {
             comp: "stale".into(),
             address: address.to_string(),
             token: "test-password".into(),
-            gpu: false,
+            gpu: true,
             range_start: 0,
             range_end: 0,
             chunk_frames: 1,
@@ -2614,7 +2724,7 @@ mod tests {
         assert!(!assembled_comp.layers.get(1).unwrap().switches.video);
         assert!(assembled_comp.layers.get(1).unwrap().switches.audio);
         if std::env::var_os("EFFECTCRAFT_FARM_TEST_CLI").is_some() {
-            assemble_final(&config, &job).unwrap();
+            assemble_final(&config, &job, &Arc::new(Mutex::new(State::default()))).unwrap();
             assert!(std::fs::metadata(&config.final_video).unwrap().len() > 128);
         }
         if std::env::var_os("EFFECTCRAFT_FARM_KEEP_TEST_OUTPUT").is_some() {

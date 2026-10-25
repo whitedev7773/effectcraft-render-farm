@@ -2,6 +2,7 @@
 #![cfg_attr(all(windows, not(debug_assertions)), windows_subsystem = "windows")]
 
 mod discovery;
+mod encoding;
 mod farm;
 mod installation;
 mod settings;
@@ -741,7 +742,7 @@ impl eframe::App for App {
                             {
                                 self.settings.output = path.display().to_string();
                             }
-                            ui.checkbox(&mut self.settings.gpu, "이 PC에서 GPU 렌더링 사용");
+                            ui.checkbox(&mut self.settings.gpu, "이 PC에서 GPU 가속 렌더링 사용 · 기본 활성화");
                         });
                         if self.settings.host {
                             ui.add_space(8.0);
@@ -869,6 +870,13 @@ impl eframe::App for App {
                                         ui.add(egui::DragValue::new(&mut options.poll_ms).range(50..=2000).suffix("ms"));
                                     });
                                     ui.checkbox(&mut options.draft, "Draft 품질 · 검토용 빠른 렌더링");
+                                    ui.checkbox(&mut options.nvenc, "최종 MP4: FFmpeg로 직접 인코딩 · NVIDIA NVENC 우선");
+                                    if path_row(ui, "FFmpeg 실행 파일 · 비워 두면 자동 감지", &mut options.ffmpeg)
+                                        && let Some(path) = rfd::FileDialog::new().pick_file()
+                                    {
+                                        options.ffmpeg = path.display().to_string();
+                                    }
+                                    ui.small("NVENC 실패 시 FFmpeg CPU 인코딩, FFmpeg가 없으면 EffectCraft 출력으로 전환합니다.");
                                     ui.small("기본값은 Best입니다. Draft는 일부 효과의 품질에 영향을 줄 수 있습니다. FPS와 해상도는 원본을 유지합니다.");
                                     ui.horizontal(|ui| {
                                         ui.label("최종 H.264 비트레이트");

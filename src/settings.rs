@@ -14,6 +14,8 @@ pub enum Distribution {
 #[derive(Clone, PartialEq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct RenderOptions {
+    pub nvenc: bool,
+    pub ffmpeg: String,
     pub adaptive: bool,
     pub target_seconds: u32,
     pub retries: u8,
@@ -29,6 +31,8 @@ pub struct RenderOptions {
 impl Default for RenderOptions {
     fn default() -> Self {
         Self {
+            nvenc: true,
+            ffmpeg: String::new(),
             adaptive: true,
             target_seconds: 30,
             retries: 3,
@@ -60,6 +64,8 @@ impl RenderOptions {
 #[derive(Clone, PartialEq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct Settings {
+    #[serde(default)]
+    pub gpu_defaults_applied: bool,
     pub check_updates: bool,
     pub revision: u64,
     pub project: String,
@@ -87,6 +93,7 @@ pub struct Settings {
 impl Default for Settings {
     fn default() -> Self {
         Self {
+            gpu_defaults_applied: true,
             check_updates: true,
             revision: 0,
             project: String::new(),
@@ -96,7 +103,7 @@ impl Default for Settings {
             host_address: "0.0.0.0:9778".into(),
             client_address: String::new(),
             token: String::new(),
-            gpu: false,
+            gpu: true,
             host: true,
             local_worker: true,
             range_start: 0,
@@ -197,7 +204,11 @@ fn load_from(dir: &std::path::Path) -> (Settings, Option<String>) {
         }
     }
     valid.sort_by_key(|(settings, modified)| (settings.revision, *modified));
-    let settings = valid.pop().map(|(settings, _)| settings).unwrap_or_default();
+    let mut settings = valid.pop().map(|(settings, _)| settings).unwrap_or_default();
+    if !settings.gpu_defaults_applied {
+        settings.gpu = true;
+        settings.gpu_defaults_applied = true;
+    }
     (settings, (!errors.is_empty()).then(|| errors.join("; ")))
 }
 
@@ -239,6 +250,29 @@ fn save_to(dir: &std::path::Path, settings: &mut Settings) -> Result<(), String>
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn enables_gpu_on_upgrade_once_then_preserves_manual_cpu_choice() {
+        assert!(Settings::default().gpu);
+        let suffix = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos();
+        let dir = std::env::temp_dir().join(format!("farm-gpu-settings-{}-{suffix}", std::process::id()));
+        std::fs::create_dir(&dir).unwrap();
+        let mut legacy = serde_json::to_value(Settings::default()).unwrap();
+        legacy.as_object_mut().unwrap().remove("gpu_defaults_applied");
+        legacy["gpu"] = false.into();
+        legacy["render"].as_object_mut().unwrap().remove("nvenc");
+        std::fs::write(dir.join("settings-a.json"), serde_json::to_vec(&legacy).unwrap()).unwrap();
+        let (mut settings, warning) = load_from(&dir);
+        assert!(warning.is_none());
+        assert!(settings.gpu);
+        assert!(settings.gpu_defaults_applied);
+        assert!(settings.render.nvenc);
+        settings.gpu = false;
+        save_to(&dir, &mut settings).unwrap();
+        assert!(!load_from(&dir).0.gpu);
+        assert!(dir.canonicalize().unwrap().starts_with(std::env::temp_dir().canonicalize().unwrap()));
+        std::fs::remove_dir_all(dir).unwrap();
+    }
 
     #[test]
     fn distribution_supports_auto_frames_and_percent() {
