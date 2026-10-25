@@ -1,3 +1,4 @@
+use crate::settings::RenderOptions;
 use std::collections::{BTreeMap, BTreeSet};
 use std::io::{BufRead, BufReader, Read, Seek, SeekFrom, Write};
 use std::net::{SocketAddr, TcpListener, TcpStream};
@@ -6,7 +7,7 @@ use std::process::{Command, Stdio};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, OnceLock, PoisonError};
 use std::thread;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use effectcraft_keyframe::Value;
 use effectcraft_project::props::{Node, PropGroup};
@@ -23,7 +24,7 @@ fn project_hash(bytes: &[u8]) -> String {
 const MAX_LINE: usize = 4096;
 const MAX_FRAMES: i64 = 100_000;
 const MAX_WORKERS: usize = 64;
-const PROTOCOL_VERSION: u32 = 4;
+const PROTOCOL_VERSION: u32 = 5;
 const MAX_TRANSFER_FILE: u64 = 32 * 1024 * 1024 * 1024;
 const MAX_TRANSFER_TOTAL: u64 = 256 * 1024 * 1024 * 1024;
 const MAX_TRANSFER_FILES: usize = 20_000;
@@ -73,10 +74,12 @@ pub struct Config {
     pub max_workers: usize,
     pub final_video: PathBuf,
     pub disabled_workers: Vec<String>,
+    pub render: RenderOptions,
 }
 
 #[derive(Clone)]
 pub struct Job {
+    pub draft: bool,
     pub hash: String,
     pub comp: String,
     pub rate: FrameRate,
@@ -101,6 +104,8 @@ pub struct CompInfo {
 
 #[derive(Serialize, Deserialize, PartialEq, Eq)]
 struct Manifest {
+    #[serde(default)]
+    draft: bool,
     hash: String,
     comp: String,
     fps_num: i64,
@@ -117,6 +122,7 @@ struct Manifest {
 impl From<&Job> for Manifest {
     fn from(job: &Job) -> Self {
         Self {
+            draft: job.draft,
             hash: job.hash.clone(),
             comp: job.comp.clone(),
             fps_num: job.rate.num,
@@ -156,6 +162,53 @@ pub struct WorkerInfo {
     pub assigned: Option<(i64, i64)>,
     pub current_done: i64,
     pub completed_frames: i64,
+    pub started: Option<Instant>,
+    pub fps: f64,
+    pub transferred_bytes: u64,
+    pub transfer_seconds: f64,
+    pub preview: Option<Preview>,
+    pub ready: bool,
+}
+
+// Workers always take from one shared queue. Split only unassigned work, so
+// ownership and already running CLI processes remain unambiguous.
+fn claim_chunk(s: &mut State, worker_id: u64, label: &str, options: &RenderOptions) -> Option<(i64, i64)> {
+    let index = s.chunks.iter().position(|c| c.status == ChunkStatus::Pending)?;
+    let chunk = &s.chunks[index];
+    let mut size = chunk.end - chunk.start;
+    if options.adaptive {
+        let fps = s.worker_info.get(&worker_id).map_or(0.0, |w| w.fps);
+        if fps > 0.0 {
+            size = size.min((fps * options.target_seconds as f64).ceil().max(1.0) as i64);
+        }
+        let pending = s.chunks.iter().filter(|c| c.status == ChunkStatus::Pending).map(|c| c.end - c.start).sum::<i64>();
+        let participants =
+            s.worker_info.values().filter(|w| w.connected && w.enabled && w.ready && w.assigned.is_none()).count().min(s.max_workers).max(1) as i64;
+        size = size.min(((pending + participants - 1) / participants).max(1));
+    }
+    let chunk = &mut s.chunks[index];
+    let original_end = chunk.end;
+    chunk.end = chunk.start + size;
+    chunk.status = ChunkStatus::Running;
+    chunk.worker = label.to_owned();
+    let range = (chunk.start, chunk.end);
+    let attempts = chunk.attempts;
+    if range.1 < original_end {
+        s.chunks.push(Chunk { start: range.1, end: original_end, status: ChunkStatus::Pending, attempts, worker: String::new() });
+    }
+    if let Some(info) = s.worker_info.get_mut(&worker_id) {
+        info.assigned = Some(range);
+        info.current_done = 0;
+        info.started = Some(Instant::now());
+    }
+    s.event("INFO", "scheduler", format!("{label}: 구간 {}–{} 배정 · {}프레임 · 이전 실패 {attempts}회", range.0, range.1, size));
+    Some(range)
+}
+
+#[derive(Clone)]
+pub struct Preview {
+    pub frame: i64,
+    pub jpeg: Arc<Vec<u8>>,
 }
 
 #[derive(Default)]
@@ -176,6 +229,9 @@ pub struct State {
     pub local_progress: Option<(i64, i64, i64)>,
     pub log_path: Option<PathBuf>,
     log_error_reported: bool,
+    pub local_preview: Option<Preview>,
+    pub started: Option<Instant>,
+    pub finished_elapsed: Option<Duration>,
 }
 
 pub type Shared = Arc<Mutex<State>>;
@@ -191,17 +247,42 @@ fn append_log(path: &Path, message: &str) -> Result<(), String> {
         std::fs::rename(path, previous).map_err(|e| format!("로그 교체: {e}"))?;
     }
     let mut file = std::fs::OpenOptions::new().create(true).append(true).open(path).map_err(|e| format!("로그 열기: {e}"))?;
-    let seconds = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap_or_default().as_secs();
-    writeln!(file, "[{seconds}] {message}").map_err(|e| format!("로그 쓰기: {e}"))
+    writeln!(file, "{message}").map_err(|e| format!("로그 쓰기: {e}"))
 }
 
 impl State {
     pub fn with_log_path(path: Option<PathBuf>) -> Self {
-        Self { log_path: path, ..Self::default() }
+        let mut state = Self { log_path: path, ..Self::default() };
+        state.event(
+            "INFO",
+            "app",
+            format!(
+                "EffectCraft Farm {} 시작 · PID {} · {} · CPU {}개",
+                env!("CARGO_PKG_VERSION"),
+                std::process::id(),
+                std::env::consts::OS,
+                std::thread::available_parallelism().map_or(1, |n| n.get())
+            ),
+        );
+        state
     }
 
     pub fn note(&mut self, message: impl Into<String>) {
         let message = message.into();
+        let level = if message.contains("실패") || message.contains("오류") {
+            "ERROR"
+        } else if message.contains("재시도") || message.contains("끊") {
+            "WARN"
+        } else {
+            "INFO"
+        };
+        self.event(level, "farm", message);
+    }
+
+    pub fn event(&mut self, level: &str, category: &str, message: impl Into<String>) {
+        let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap_or_default();
+        // Keep one physical line per event, including untrusted CLI/peer text.
+        let message = format!("[{}.{:03} UTC] [{level}] [{category}] {}", now.as_secs(), now.subsec_millis(), message.into().replace(['\r', '\n'], " "));
         if let Some(path) = &self.log_path
             && let Err(error) = append_log(path, &message)
             && !self.log_error_reported
@@ -210,7 +291,7 @@ impl State {
             self.messages.push(format!("로그 파일 저장 실패: {error}"));
         }
         self.messages.push(message);
-        if self.messages.len() > 100 {
+        if self.messages.len() > 2000 {
             self.messages.remove(0);
         }
     }
@@ -229,6 +310,7 @@ enum Message {
         comp: String,
     },
     Bundle {
+        options: RenderOptions,
         comp: String,
         project_len: u64,
         project_sha256: String,
@@ -253,6 +335,13 @@ enum Message {
         start: i64,
         end: i64,
         done: i64,
+    },
+    Continue {
+        end: i64,
+    },
+    Preview {
+        frame: i64,
+        len: usize,
     },
     Request,
     Assign {
@@ -321,6 +410,7 @@ fn read_job_impl(config: &Config, preflight: bool) -> Result<Job, String> {
         preflight_resources(&project, **comp_id, &config.project)?;
     }
     Ok(Job {
+        draft: config.render.draft,
         hash: project_hash(&bytes),
         comp: config.comp.clone(),
         rate,
@@ -678,6 +768,109 @@ fn chunk_complete(output: &Path, start: i64, end: i64) -> bool {
     (start..end).all(|frame| valid_png(&frame_path(output, frame)))
 }
 
+fn partition_frames(output: &Path, start: i64, end: i64, size: i64) -> Vec<Chunk> {
+    let mut chunks: Vec<Chunk> = Vec::new();
+    for frame in start..end {
+        let status = if valid_png(&frame_path(output, frame)) { ChunkStatus::Done } else { ChunkStatus::Pending };
+        if let Some(last) = chunks.last_mut()
+            && last.status == status
+            && frame - last.start < size
+        {
+            last.end = frame + 1;
+        } else {
+            chunks.push(Chunk { start: frame, end: frame + 1, status, attempts: 0, worker: String::new() });
+        }
+    }
+    chunks
+}
+
+// Only frames already checksum-verified by receive_path may be retained here.
+fn retain_received_prefix(s: &mut State, start: i64, end: i64, received: i64) {
+    if received <= 0 || received >= end - start {
+        return;
+    }
+    if let Some(chunk) = s.chunks.iter_mut().find(|c| c.start == start && c.end == end) {
+        chunk.start = start + received;
+        s.chunks.push(Chunk { start, end: start + received, status: ChunkStatus::Done, attempts: 0, worker: String::new() });
+        s.event("INFO", "recovery", format!("{start}–{} 검증된 프레임 보존 · 나머지만 재시도", start + received));
+    }
+}
+
+fn make_preview(path: &Path, frame: i64) -> Result<Preview, String> {
+    let mut reader = image::ImageReader::open(path).map_err(|e| e.to_string())?;
+    let mut limits = image::Limits::default();
+    limits.max_alloc = Some(256 * 1024 * 1024);
+    reader.limits(limits);
+    let image = reader.decode().map_err(|e| e.to_string())?.thumbnail(480, 270).to_rgb8();
+    let mut jpeg = Vec::new();
+    image::codecs::jpeg::JpegEncoder::new_with_quality(&mut jpeg, 65).encode_image(&image).map_err(|e| e.to_string())?;
+    Ok(Preview { frame, jpeg: Arc::new(jpeg) })
+}
+
+pub fn preview_frame(output: &Path, frame: i64) -> Result<Preview, String> {
+    let path = frame_path(output, frame);
+    if !valid_png(&path) {
+        return Err(format!("프레임 {frame}: 아직 수신되지 않았거나 렌더되지 않았습니다"));
+    }
+    make_preview(&path, frame)
+}
+
+pub fn render_preview(config: &Config, frame: i64) -> Result<Preview, String> {
+    if !(0..MAX_FRAMES).contains(&frame) {
+        return Err("미리보기 프레임 범위 오류".into());
+    }
+    let workspace = TempWorkspace::new()?;
+    let path = workspace.root.join("preview.png");
+    let mut command = Command::new(&config.cli);
+    command
+        .arg("render-frame")
+        .arg(&config.project)
+        .arg("--comp")
+        .arg(&config.comp)
+        .arg("--frame")
+        .arg(frame.to_string())
+        .arg("--max-side")
+        .arg("480")
+        .arg("--out")
+        .arg(&path);
+    if config.gpu {
+        command.arg("--gpu");
+    }
+    let result = command.output().map_err(|e| format!("미리보기 CLI 실행: {e}"))?;
+    if !result.status.success() {
+        return Err(format!("미리보기 실패: {}", String::from_utf8_lossy(&result.stderr).chars().take(1500).collect::<String>()));
+    }
+    make_preview(&path, frame)
+}
+
+pub fn timeline(state: &Shared) -> Vec<(i64, i64, u8)> {
+    lock(state)
+        .chunks
+        .iter()
+        .map(|c| {
+            (
+                c.start,
+                c.end,
+                match c.status {
+                    ChunkStatus::Pending => 0,
+                    ChunkStatus::Running => 1,
+                    ChunkStatus::Done => 2,
+                    ChunkStatus::Failed => 3,
+                },
+            )
+        })
+        .collect()
+}
+
+fn validate_preview(bytes: &[u8]) -> Result<(), String> {
+    let (w, h) =
+        image::ImageReader::with_format(std::io::Cursor::new(bytes), image::ImageFormat::Jpeg).into_dimensions().map_err(|e| format!("미리보기 JPEG: {e}"))?;
+    if w == 0 || h == 0 || w > 480 || h > 270 {
+        return Err("미리보기 해상도 제한 초과".into());
+    }
+    Ok(())
+}
+
 fn connect_to_host(address: &str) -> Result<TcpStream, String> {
     let target = address
         .trim()
@@ -700,6 +893,7 @@ fn connect_to_host(address: &str) -> Result<TcpStream, String> {
 }
 
 pub fn start_coordinator(config: Config, state: Shared, stop: Arc<AtomicBool>) -> Result<Job, String> {
+    config.render.validate()?;
     if !(1..=MAX_FRAMES).contains(&config.chunk_frames) || !(1..=MAX_WORKERS).contains(&config.max_workers) {
         return Err("구간 크기는 1~100,000프레임, 사용할 PC 수는 1~64대여야 합니다".into());
     }
@@ -721,19 +915,7 @@ pub fn start_coordinator(config: Config, state: Shared, stop: Arc<AtomicBool>) -
     prepare_output(&job)?;
     {
         let mut s = lock(&state);
-        s.chunks = (job.start..job.end)
-            .step_by(config.chunk_frames as usize)
-            .map(|start| {
-                let end = start.saturating_add(config.chunk_frames).min(job.end);
-                Chunk {
-                    start,
-                    end,
-                    status: if chunk_complete(&job.output, start, end) { ChunkStatus::Done } else { ChunkStatus::Pending },
-                    attempts: 0,
-                    worker: String::new(),
-                }
-            })
-            .collect();
+        s.chunks = partition_frames(&job.output, job.start, job.end, config.chunk_frames);
         s.total = job.end - job.start;
         s.output = job.output.clone();
         s.messages.clear();
@@ -745,8 +927,25 @@ pub fn start_coordinator(config: Config, state: Shared, stop: Arc<AtomicBool>) -
         s.final_status = "프레임 렌더링 대기".into();
         s.disabled_workers = config.disabled_workers.clone();
         s.bundle = Arc::new(OnceLock::new());
+        s.started = None;
+        s.finished_elapsed = None;
+        s.local_preview = None;
     }
     log(&state, format!("호스트 시작: {} / {}–{}프레임", config.address, job.start, job.end));
+    log(
+        &state,
+        format!(
+            "작업 설정: {}×{} / {:.3} FPS / 구간 {}프레임 / PC {}대 / 자동 균형 {} / 품질 {} / 비트레이트 {}kbps",
+            job.width,
+            job.height,
+            job.rate.as_f64(),
+            config.chunk_frames,
+            config.max_workers,
+            config.render.adaptive,
+            if config.render.draft { "draft" } else { "best" },
+            config.render.video_bitrate
+        ),
+    );
     match listener.local_addr() {
         Ok(address) => {
             if let Err(error) = crate::discovery::start_responder(address, stop.clone()) {
@@ -808,14 +1007,15 @@ fn send(stream: &mut TcpStream, message: &Message) -> Result<(), String> {
 
 fn send_path(stream: &mut TcpStream, path: &Path, expected_len: u64) -> Result<(), String> {
     let file = std::fs::File::open(path).map_err(|e| format!("전송 파일 열기 {}: {e}", path.display()))?;
-    let copied = std::io::copy(&mut file.take(expected_len.saturating_add(1)), stream).map_err(|e| format!("파일 전송: {e}"))?;
+    let mut source = BufReader::with_capacity(1024 * 1024, file.take(expected_len.saturating_add(1)));
+    let copied = std::io::copy(&mut source, stream).map_err(|e| format!("파일 전송: {e}"))?;
     if copied != expected_len {
         return Err(format!("전송 중 파일 크기가 변경됐습니다: {}", path.display()));
     }
     Ok(())
 }
 
-fn receive_path(reader: &mut BufReader<TcpStream>, path: &Path, len: u64, sha256: &str) -> Result<(), String> {
+fn receive_path(reader: &mut BufReader<TcpStream>, path: &Path, len: u64, sha256: &str, durable: bool) -> Result<(), String> {
     if len > MAX_TRANSFER_FILE || sha256.len() != 64 || !sha256.bytes().all(|b| b.is_ascii_hexdigit()) {
         return Err("파일 크기 또는 체크섬이 잘못됐습니다".into());
     }
@@ -834,9 +1034,11 @@ fn receive_path(reader: &mut BufReader<TcpStream>, path: &Path, len: u64, sha256
             hash.update(&buf[..n]);
             remaining -= n as u64;
         }
-        file.sync_all().map_err(|e| format!("수신 파일 확정: {e}"))?;
         if format!("{:x}", hash.finalize()) != sha256.to_ascii_lowercase() {
             return Err("수신 파일 SHA-256이 다릅니다".into());
+        }
+        if durable {
+            file.sync_all().map_err(|e| format!("수신 파일 확정: {e}"))?;
         }
         Ok(())
     })();
@@ -847,10 +1049,11 @@ fn receive_path(reader: &mut BufReader<TcpStream>, path: &Path, len: u64, sha256
     result
 }
 
-fn send_bundle(stream: &mut TcpStream, bundle: &TransferBundle, job: &Job) -> Result<(), String> {
+fn send_bundle(stream: &mut TcpStream, bundle: &TransferBundle, job: &Job, options: &RenderOptions) -> Result<(), String> {
     send(
         stream,
         &Message::Bundle {
+            options: options.clone(),
             comp: job.comp.clone(),
             project_len: bundle.project.len() as u64,
             project_sha256: bundle.project_sha256.clone(),
@@ -908,7 +1111,7 @@ fn safe_bundle_name(name: &str) -> bool {
 }
 
 fn receive_bundle(reader: &mut BufReader<TcpStream>, config: &mut Config, message: Message) -> Result<(TempWorkspace, Job), String> {
-    let Message::Bundle { comp, project_len, project_sha256, file_count, total, fps_num, fps_den, width, height } = message else {
+    let Message::Bundle { options, comp, project_len, project_sha256, file_count, total, fps_num, fps_den, width, height } = message else {
         return Err("전송용 프로젝트 정보가 없습니다".into());
     };
     if project_len > 100_000_000 || file_count > MAX_TRANSFER_FILES || project_sha256.len() != 64 || !project_sha256.bytes().all(|b| b.is_ascii_hexdigit()) {
@@ -916,7 +1119,7 @@ fn receive_bundle(reader: &mut BufReader<TcpStream>, config: &mut Config, messag
     }
     let workspace = TempWorkspace::new()?;
     let project_path = workspace.root.join("project.ecproj");
-    receive_path(reader, &project_path, project_len, &project_sha256)?;
+    receive_path(reader, &project_path, project_len, &project_sha256, true)?;
     let mut total_bytes = project_len;
     for _ in 0..file_count {
         let Message::File { name, len, sha256 } = receive(reader)? else {
@@ -932,11 +1135,13 @@ fn receive_bundle(reader: &mut BufReader<TcpStream>, config: &mut Config, messag
         let target = workspace.root.join(&name);
         let parent = target.parent().ok_or("소스 폴더가 없습니다")?;
         std::fs::create_dir_all(parent).map_err(|e| format!("소스 폴더 만들기: {e}"))?;
-        receive_path(reader, &target, len, &sha256)?;
+        receive_path(reader, &target, len, &sha256, true)?;
     }
     let output = workspace.root.join("frames");
     std::fs::create_dir(&output).map_err(|e| format!("임시 프레임 폴더 만들기: {e}"))?;
     config.project = project_path;
+    options.validate()?;
+    config.render = options;
     config.output = output;
     config.comp = comp;
     config.range_start = 0;
@@ -952,8 +1157,9 @@ fn serve_worker(mut stream: TcpStream, peer: SocketAddr, config: &Config, job: &
     // On Windows, sockets accepted by a nonblocking listener can remain
     // nonblocking. The protocol uses blocking reads and writes on this stream.
     stream.set_nonblocking(false).map_err(|e| format!("클라이언트 소켓 설정: {e}"))?;
+    stream.set_nodelay(true).map_err(|e| e.to_string())?;
     stream.set_read_timeout(Some(Duration::from_secs(3600))).map_err(|e| e.to_string())?;
-    let mut reader = BufReader::new(stream.try_clone().map_err(|e| e.to_string())?);
+    let mut reader = BufReader::with_capacity(1024 * 1024, stream.try_clone().map_err(|e| e.to_string())?);
     let (name, given_token, protocol) = match receive(&mut reader)? {
         Message::Hello { token, name, protocol, .. } => (name, token, protocol),
         _ => return Err("인증 메시지가 필요합니다".into()),
@@ -989,7 +1195,22 @@ fn serve_worker(mut stream: TcpStream, peer: SocketAddr, config: &Config, job: &
             let enabled = !s.disabled_workers.contains(&ip) && !s.disabled_workers.contains(&label);
             s.worker_info.insert(
                 id,
-                WorkerInfo { id, ip: ip.clone(), label: label.clone(), enabled, connected: true, assigned: None, current_done: 0, completed_frames: 0 },
+                WorkerInfo {
+                    id,
+                    ip: ip.clone(),
+                    label: label.clone(),
+                    enabled,
+                    connected: true,
+                    assigned: None,
+                    current_done: 0,
+                    completed_frames: 0,
+                    started: None,
+                    fps: 0.0,
+                    transferred_bytes: 0,
+                    transfer_seconds: 0.0,
+                    preview: None,
+                    ready: false,
+                },
             );
             Ok(id)
         }
@@ -1023,20 +1244,30 @@ fn serve_worker(mut stream: TcpStream, peer: SocketAddr, config: &Config, job: &
                         let s = lock(state);
                         s.dispatch_enabled
                             && s.worker_info.get(&worker_id).is_some_and(|worker| worker.enabled)
-                            && s.chunks.iter().any(|chunk| chunk.status == ChunkStatus::Pending)
+                            && s.chunks
+                                .iter()
+                                .any(|chunk| chunk.status == ChunkStatus::Pending || (config.render.adaptive && chunk.status == ChunkStatus::Running))
                             && s.chunks.iter().filter(|chunk| chunk.status == ChunkStatus::Running).count() < s.max_workers
                     };
                     if may_prepare && !prepared {
                         log(state, format!("{label}: 프로젝트와 소스 전송 중"));
                         let cache = { lock(state).bundle.clone() };
                         let bundle = cache.get_or_init(|| build_bundle(config, job).map(Arc::new)).clone();
-                        let transfer = bundle.and_then(|bundle| send_bundle(&mut stream, &bundle, job));
+                        let transfer_started = Instant::now();
+                        let transfer = bundle.and_then(|bundle| {
+                            let bytes = bundle.project.len() as u64 + bundle.files.iter().map(|f| f.len).sum::<u64>();
+                            log(state, format!("{label}: 소스 {}개 · {:.1} MiB 전송", bundle.files.len(), bytes as f64 / 1048576.0));
+                            send_bundle(&mut stream, &bundle, job, &config.render)
+                        });
                         if let Err(error) = transfer {
                             let _ = send(&mut stream, &Message::Error { detail: error.clone() });
                             return Err(error);
                         }
                         prepared = true;
-                        log(state, format!("{label}: 소스 전송 완료"));
+                        if let Some(info) = lock(state).worker_info.get_mut(&worker_id) {
+                            info.ready = true;
+                        }
+                        log(state, format!("{label}: 소스 전송 완료 · {:.2}초", transfer_started.elapsed().as_secs_f64()));
                         continue;
                     }
                     let next = {
@@ -1046,18 +1277,8 @@ fn serve_worker(mut stream: TcpStream, peer: SocketAddr, config: &Config, job: &
                         let available = s.chunks.iter().filter(|c| c.status == ChunkStatus::Running).count() < s.max_workers;
                         if finished {
                             None
-                        } else if enabled
-                            && available
-                            && let Some(chunk) = s.chunks.iter_mut().find(|c| c.status == ChunkStatus::Pending)
-                        {
-                            chunk.status = ChunkStatus::Running;
-                            chunk.worker = label.clone();
-                            let range = (chunk.start, chunk.end);
-                            if let Some(info) = s.worker_info.get_mut(&worker_id) {
-                                info.assigned = Some(range);
-                                info.current_done = 0;
-                            }
-                            Some(range)
+                        } else if enabled && available {
+                            claim_chunk(&mut s, worker_id, &label, &config.render)
                         } else {
                             None
                         }
@@ -1090,15 +1311,51 @@ fn serve_worker(mut stream: TcpStream, peer: SocketAddr, config: &Config, job: &
                         }
                         info.current_done = done;
                     }
+                    let idle = s.worker_info.values().any(|w| w.id != worker_id && w.connected && w.enabled && w.ready && w.assigned.is_none());
+                    let running = s.chunks.iter().filter(|c| c.status == ChunkStatus::Running).count();
+                    let can_share = config.render.adaptive
+                        && idle
+                        && running < s.max_workers
+                        && !s.chunks.iter().any(|c| c.status == ChunkStatus::Pending)
+                        && end - start - done >= 2;
+                    let mut new_end = end;
+                    if can_share {
+                        new_end = start + done + (end - start - done + 1) / 2;
+                        if let Some(chunk) = s.chunks.iter_mut().find(|c| c.start == start && c.end == end && c.status == ChunkStatus::Running) {
+                            chunk.end = new_end;
+                            let attempts = chunk.attempts;
+                            s.chunks.push(Chunk { start: new_end, end, status: ChunkStatus::Pending, attempts, worker: String::new() });
+                            assigned = Some((start, new_end));
+                            if let Some(info) = s.worker_info.get_mut(&worker_id) {
+                                info.assigned = assigned;
+                            }
+                            s.event("INFO", "scheduler", format!("{label}: 남은 {new_end}–{end}프레임을 대기 PC에 재분배"));
+                        }
+                    }
+                    drop(s);
+                    send(&mut stream, &Message::Continue { end: new_end })?;
+                }
+                Ok(Message::Preview { frame, len }) if assigned.is_some() => {
+                    let (start, end) = assigned.ok_or("미리보기 작업이 없습니다")?;
+                    if frame < start || frame >= end || len == 0 || len > 256 * 1024 {
+                        break Err("미리보기 범위 또는 크기가 잘못됐습니다".into());
+                    }
+                    let mut jpeg = vec![0; len];
+                    reader.read_exact(&mut jpeg).map_err(|e| format!("미리보기 수신: {e}"))?;
+                    validate_preview(&jpeg)?;
+                    if let Some(info) = lock(state).worker_info.get_mut(&worker_id) {
+                        info.preview = Some(Preview { frame, jpeg: Arc::new(jpeg) });
+                    }
                 }
                 Ok(Message::Frame { frame, len, sha256 }) if assigned.is_some() => {
+                    let transfer_started = Instant::now();
                     let (start, end) = assigned.ok_or("작업 구간이 없습니다")?;
                     if frame != start.saturating_add(received_frames) || frame >= end || len > 512 * 1024 * 1024 {
                         break Err("프레임 번호 또는 크기가 작업 지시와 다릅니다".into());
                     }
                     let target = frame_path(&job.output, frame);
                     let partial = job.output.join(format!("frame_{frame:05}.worker_{worker_id}.partial"));
-                    receive_path(&mut reader, &partial, len, &sha256)?;
+                    receive_path(&mut reader, &partial, len, &sha256, config.render.durable_writes)?;
                     if !valid_png(&partial) {
                         let _ = std::fs::remove_file(&partial);
                         break Err(format!("수신 프레임 {frame}이 손상됐습니다"));
@@ -1111,7 +1368,10 @@ fn serve_worker(mut stream: TcpStream, peer: SocketAddr, config: &Config, job: &
                     let mut s = lock(state);
                     if let Some(info) = s.worker_info.get_mut(&worker_id) {
                         info.current_done = info.current_done.max(received_frames);
+                        info.transferred_bytes += len;
+                        info.transfer_seconds += transfer_started.elapsed().as_secs_f64();
                     }
+                    s.event("DEBUG", "frame", format!("{label}: 프레임 {frame} 검증·저장 · {len} bytes · {:.3}초", transfer_started.elapsed().as_secs_f64()));
                 }
                 Ok(Message::Complete { start, end, ok, detail }) if assigned == Some((start, end)) => {
                     let verified = ok && received_frames == end - start && chunk_complete(&job.output, start, end);
@@ -1121,23 +1381,30 @@ fn serve_worker(mut stream: TcpStream, peer: SocketAddr, config: &Config, job: &
                             chunk.attempts = chunk.attempts.saturating_add(1);
                             chunk.status = if verified {
                                 ChunkStatus::Done
-                            } else if chunk.attempts >= 3 {
+                            } else if chunk.attempts >= config.render.retries {
                                 ChunkStatus::Failed
                             } else {
                                 ChunkStatus::Pending
                             };
                             if chunk.status == ChunkStatus::Failed {
-                                s.final_status = format!("{start}–{end} 구간이 세 번 실패했습니다");
+                                s.final_status = format!("{start}–{end} 구간이 {}번 실패했습니다", config.render.retries);
                             }
                             s.note(format!("{label}: {start}–{end} {} {detail}", if verified { "완료" } else { "실패" }));
                         }
                         if let Some(info) = s.worker_info.get_mut(&worker_id) {
                             if verified {
                                 info.completed_frames = info.completed_frames.saturating_add(end - start);
+                                let elapsed = info.started.map_or(0.0, |at| at.elapsed().as_secs_f64());
+                                if elapsed > 0.0 {
+                                    info.fps = (end - start) as f64 / elapsed;
+                                }
                             }
                             info.assigned = None;
                             info.current_done = 0;
                         }
+                    }
+                    if !verified {
+                        retain_received_prefix(&mut lock(state), start, end, received_frames);
                     }
                     assigned = None;
                     if verified {
@@ -1154,8 +1421,11 @@ fn serve_worker(mut stream: TcpStream, peer: SocketAddr, config: &Config, job: &
     if let Some((start, end)) = assigned {
         let mut s = lock(state);
         if let Some(chunk) = s.chunks.iter_mut().find(|c| c.start == start && c.end == end && c.status == ChunkStatus::Running) {
-            chunk.status = ChunkStatus::Pending;
+            chunk.attempts = chunk.attempts.saturating_add(1);
+            chunk.status = if chunk.attempts >= config.render.retries { ChunkStatus::Failed } else { ChunkStatus::Pending };
         }
+        retain_received_prefix(&mut s, start, end, received_frames);
+        s.event("WARN", "scheduler", format!("{label}: 연결 종료 · {start}–{end} 공용 대기열로 반환"));
     }
     let mut s = lock(state);
     s.workers = s.workers.saturating_sub(1);
@@ -1184,6 +1454,7 @@ pub fn begin_render(config: &Config, job: &Job, state: &Shared) {
     {
         let mut s = lock(state);
         s.dispatch_enabled = true;
+        s.started = Some(Instant::now());
         s.final_status = "프레임 렌더링 중".into();
         s.note("호스트가 렌더링을 시작했습니다");
     }
@@ -1195,8 +1466,9 @@ pub fn run_worker(config: Config, state: Shared, stop: Arc<AtomicBool>) -> Resul
         return Err(format!("렌더 CLI 파일이 없습니다: {}", config.cli.display()));
     }
     let mut stream = connect_to_host(&config.address)?;
+    stream.set_nodelay(true).map_err(|e| e.to_string())?;
     stream.set_read_timeout(Some(Duration::from_secs(3600))).map_err(|e| e.to_string())?;
-    let mut reader = BufReader::new(stream.try_clone().map_err(|e| e.to_string())?);
+    let mut reader = BufReader::with_capacity(1024 * 1024, stream.try_clone().map_err(|e| e.to_string())?);
     let name = std::env::var("COMPUTERNAME").or_else(|_| std::env::var("HOSTNAME")).unwrap_or_else(|_| "worker".into());
     send(&mut stream, &Message::Hello { token: config.token.clone(), name, protocol: PROTOCOL_VERSION })?;
     let comp = match receive(&mut reader)? {
@@ -1227,25 +1499,102 @@ pub fn run_worker(config: Config, state: Shared, stop: Arc<AtomicBool>) -> Resul
                     return Err("서버 작업 범위 또는 설정이 프로젝트와 다릅니다".into());
                 }
                 log(&state, format!("렌더링: {start}–{end}"));
+                lock(&state).event(
+                    "DEBUG",
+                    "cli",
+                    format!(
+                        "실행 {} · 프로젝트 {} · 컴포지션 {} · GPU {} · 품질 {}",
+                        config.cli.display(),
+                        config.project.display(),
+                        job.comp,
+                        config.gpu,
+                        if config.render.draft { "draft" } else { "best" }
+                    ),
+                );
+                let render_started = Instant::now();
+                let original_end = end;
+                let mut assigned_end = end;
+                let mut sent_until = start;
+                let mut last_preview = Instant::now().checked_sub(Duration::from_secs(30)).unwrap_or_else(Instant::now);
+                let mut last_report = Instant::now();
+                let mut preview_error_reported = false;
                 let result = render_chunk(&config, job, start, end, |done| {
-                    lock(&state).local_progress = Some((start, end, done));
-                    send(&mut stream, &Message::Progress { start, end, done })
+                    let done = done.min(assigned_end - start);
+                    send(&mut stream, &Message::Progress { start, end: assigned_end, done })?;
+                    match receive(&mut reader)? {
+                        Message::Continue { end: new_end } if new_end >= start + done && new_end > start && new_end <= assigned_end => {
+                            if new_end < assigned_end {
+                                log(&state, format!("작업 공유: {new_end}–{assigned_end}프레임을 다른 PC가 지원"));
+                            }
+                            assigned_end = new_end;
+                        }
+                        _ => return Err("호스트 진행 응답이 잘못됐습니다".into()),
+                    }
+                    lock(&state).local_progress = Some((start, assigned_end, done));
+                    if done > 0
+                        && config.render.previews
+                        && (last_preview.elapsed().as_secs() >= config.render.preview_seconds as u64 || done == assigned_end - start)
+                    {
+                        let frame = start + done - 1;
+                        match make_preview(&frame_path(&job.output, frame), frame) {
+                            Ok(preview) => {
+                                send(&mut stream, &Message::Preview { frame, len: preview.jpeg.len() })?;
+                                stream.write_all(&preview.jpeg).map_err(|e| e.to_string())?;
+                                lock(&state).local_preview = Some(preview);
+                            }
+                            Err(error) if !preview_error_reported => {
+                                lock(&state).event("WARN", "preview", error);
+                                preview_error_reported = true;
+                            }
+                            Err(_) => {}
+                        }
+                        last_preview = Instant::now();
+                    }
+                    // The CLI keeps rendering while this thread uploads completed PNGs.
+                    while sent_until < start + done {
+                        let path = frame_path(&job.output, sent_until);
+                        let len = std::fs::metadata(&path).map_err(|e| e.to_string())?.len();
+                        if len > 512 * 1024 * 1024 {
+                            return Err("전송 프레임이 512MB를 넘습니다".into());
+                        }
+                        let sha256 = file_sha256(&path)?;
+                        send(&mut stream, &Message::Frame { frame: sent_until, len, sha256 })?;
+                        send_path(&mut stream, &path, len)?;
+                        sent_until += 1;
+                    }
+                    if last_report.elapsed() >= Duration::from_secs(5) || done == end - start {
+                        lock(&state).event(
+                            "DEBUG",
+                            "render",
+                            format!(
+                                "구간 {start}–{end}: {done}/{} · {:.2} FPS · {:.1}초",
+                                end - start,
+                                done as f64 / render_started.elapsed().as_secs_f64().max(0.001),
+                                render_started.elapsed().as_secs_f64()
+                            ),
+                        );
+                        last_report = Instant::now();
+                    }
+                    Ok(assigned_end)
                 });
+                let end = assigned_end;
                 let (ok, detail) = match result {
-                    Ok(()) => (true, "".into()),
+                    Ok(_) => (
+                        true,
+                        format!(
+                            "{:.2}초 · {:.2} FPS",
+                            render_started.elapsed().as_secs_f64(),
+                            (end - start) as f64 / render_started.elapsed().as_secs_f64().max(0.001)
+                        ),
+                    ),
                     Err(e) => (false, e.chars().take(1800).collect::<String>()),
                 };
                 if ok {
-                    for frame in start..end {
+                    for frame in start..original_end {
                         let path = frame_path(&job.output, frame);
-                        let len = std::fs::metadata(&path).map_err(|e| format!("전송 프레임 정보: {e}"))?.len();
-                        if len > 512 * 1024 * 1024 {
-                            return Err(format!("프레임 {frame}이 512MB를 넘습니다"));
+                        if path.exists() {
+                            std::fs::remove_file(&path).map_err(|e| format!("전송한 임시 프레임 삭제: {e}"))?;
                         }
-                        let sha256 = file_sha256(&path)?;
-                        send(&mut stream, &Message::Frame { frame, len, sha256 })?;
-                        send_path(&mut stream, &path, len)?;
-                        std::fs::remove_file(&path).map_err(|e| format!("전송한 임시 프레임 삭제: {e}"))?;
                     }
                 }
                 send(&mut stream, &Message::Complete { start, end, ok, detail: detail.clone() })?;
@@ -1255,7 +1604,7 @@ pub fn run_worker(config: Config, state: Shared, stop: Arc<AtomicBool>) -> Resul
                     log(&state, format!("구간 {start}–{end} 실패: {detail}"));
                 }
             }
-            Message::Wait => thread::sleep(Duration::from_secs(1)),
+            Message::Wait => thread::sleep(Duration::from_millis(200)),
             Message::Finished => {
                 log(&state, "모든 작업 완료");
                 break;
@@ -1274,11 +1623,23 @@ pub fn run_worker(config: Config, state: Shared, stop: Arc<AtomicBool>) -> Resul
     Ok(())
 }
 
-fn render_chunk(config: &Config, job: &Job, start: i64, end: i64, mut progress: impl FnMut(i64) -> Result<(), String>) -> Result<(), String> {
+fn render_chunk(config: &Config, job: &Job, start: i64, end: i64, mut progress: impl FnMut(i64) -> Result<i64, String>) -> Result<i64, String> {
+    // Remove leftovers from a failed attempt before detecting new completions.
+    for frame in start..end {
+        let path = frame_path(&config.output, frame);
+        if path.exists() {
+            std::fs::remove_file(path).map_err(|e| format!("이전 임시 프레임 정리: {e}"))?;
+        }
+    }
+    let mut target_end = progress(0)?;
+    if target_end <= start || target_end > end {
+        return Err("잘못된 렌더 시작 경계".into());
+    }
+    let launched_end = target_end;
     // A tiny bias below each boundary ensures the CLI's f64-to-Tick conversion
     // cannot advance a boundary by one tick and skip its frame.
     let start_s = format!("{:.9}", (job.rate.tick_of(start).seconds() - 0.000_001).max(0.0));
-    let end_s = format!("{:.9}", (job.rate.tick_of(end).seconds() - 0.000_001).max(0.0));
+    let end_s = format!("{:.9}", (job.rate.tick_of(launched_end).seconds() - 0.000_001).max(0.0));
     let mut command = Command::new(&config.cli);
     command
         .arg("render")
@@ -1296,6 +1657,7 @@ fn render_chunk(config: &Config, job: &Job, start: i64, end: i64, mut progress: 
     if config.gpu {
         command.arg("--gpu");
     }
+    command.arg("--quality").arg(if config.render.draft { "draft" } else { "best" }).arg("--audio").arg("off");
     if let Some(root) = config.project.parent() {
         let fonts = root.join("fonts");
         if fonts.is_dir() {
@@ -1307,7 +1669,8 @@ fn render_chunk(config: &Config, job: &Job, start: i64, end: i64, mut progress: 
     command.stdout(Stdio::null()).stderr(Stdio::from(stderr_file));
     let mut child = command.spawn().map_err(|e| format!("렌더 CLI 실행: {e}"))?;
     let mut next = start;
-    let mut last_progress = -1_i64;
+    let mut last_progress = 0_i64;
+    let mut yielded = false;
     let status = loop {
         let current = match child.try_wait() {
             Ok(status) => status,
@@ -1317,24 +1680,33 @@ fn render_chunk(config: &Config, job: &Job, start: i64, end: i64, mut progress: 
                 return Err(format!("렌더 CLI 상태 확인: {error}"));
             }
         };
-        while next < end && valid_png(&frame_path(&config.output, next)) {
+        while next < target_end && valid_png(&frame_path(&config.output, next)) {
             next += 1;
         }
         let done = next - start;
         if done != last_progress {
-            if let Err(error) = progress(done) {
-                let _ = child.kill();
-                let _ = child.wait();
-                return Err(error);
+            match progress(done) {
+                Ok(new_end) if new_end > start && new_end >= next && new_end <= target_end => target_end = new_end,
+                result => {
+                    let _ = child.kill();
+                    let _ = child.wait();
+                    return Err(result.err().unwrap_or_else(|| "잘못된 렌더 종료 경계".into()));
+                }
             }
             last_progress = done;
+        }
+        if target_end < launched_end && next >= target_end {
+            let _ = child.kill();
+            let status = child.wait().map_err(|e| format!("작업 공유 후 CLI 종료: {e}"))?;
+            yielded = true;
+            break status;
         }
         if let Some(status) = current {
             break status;
         }
-        thread::sleep(Duration::from_millis(400));
+        thread::sleep(Duration::from_millis(config.render.poll_ms));
     };
-    if !status.success() {
+    if !status.success() && !yielded {
         let mut file = std::fs::File::open(&stderr_path).map_err(|e| format!("CLI 오류 기록 읽기: {e}"))?;
         let len = file.metadata().map_err(|e| format!("CLI 오류 기록 정보: {e}"))?.len();
         file.seek(SeekFrom::Start(len.saturating_sub(4000))).map_err(|e| format!("CLI 오류 기록 위치: {e}"))?;
@@ -1345,10 +1717,10 @@ fn render_chunk(config: &Config, job: &Job, start: i64, end: i64, mut progress: 
         return Err(format!("CLI 종료 {status}: {tail}"));
     }
     let _ = std::fs::remove_file(&stderr_path);
-    if !chunk_complete(&config.output, start, end) {
+    if !chunk_complete(&config.output, start, target_end) {
         return Err("CLI는 종료됐지만 일부 PNG 프레임이 없거나 손상됐습니다".into());
     }
-    Ok(())
+    Ok(target_end)
 }
 
 fn maybe_start_assembly(config: &Config, job: &Job, state: &Shared) {
@@ -1364,9 +1736,11 @@ fn maybe_start_assembly(config: &Config, job: &Job, state: &Shared) {
     let job = job.clone();
     let state = state.clone();
     thread::spawn(move || {
+        log(&state, "최종 MP4 출력 시작 · PNG 검증 및 원본 오디오 구성");
         let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| assemble_final(&config, &job)))
             .unwrap_or_else(|_| Err("최종 영상 합치기 중 예상하지 못한 오류가 발생했습니다".into()));
         let mut s = lock(&state);
+        s.finished_elapsed = s.started.map(|at| at.elapsed());
         match result {
             Ok(()) => {
                 s.final_status = format!("최종 영상 완료: {}", config.final_video.display());
@@ -1473,7 +1847,9 @@ fn assemble_final(config: &Config, job: &Job) -> Result<(), String> {
         .arg("--end")
         .arg(end_s)
         .arg("--audio")
-        .arg("auto");
+        .arg(if config.render.audio { "auto" } else { "off" })
+        .arg("--bitrate")
+        .arg(config.render.video_bitrate.to_string());
     if config.gpu {
         command.arg("--gpu");
     }
@@ -1674,6 +2050,7 @@ mod tests {
             max_workers: 2,
             final_video: dir.join("final.mp4"),
             disabled_workers: Vec::new(),
+            render: RenderOptions::default(),
         };
         let job = read_job(&config).unwrap();
         assert_eq!((job.total, job.width, job.height), (120, 64, 64));
@@ -1708,6 +2085,7 @@ mod tests {
             max_workers: 1,
             final_video: dir.join("final.mp4"),
             disabled_workers: Vec::new(),
+            render: RenderOptions::default(),
         };
         let job = read_job(&config).unwrap();
         let state = Arc::new(Mutex::new(State {
@@ -1747,6 +2125,7 @@ mod tests {
         send(&mut client, &Message::Request).unwrap();
         assert!(matches!(receive(&mut reader), Ok(Message::Assign { start: 0, end: 2, .. })));
         send(&mut client, &Message::Progress { start: 0, end: 2, done: 1 }).unwrap();
+        assert!(matches!(receive(&mut reader), Ok(Message::Continue { end: 2 })));
         for _ in 0..100 {
             if snapshot(&state).0 == 1 {
                 break;
@@ -1797,6 +2176,7 @@ mod tests {
             max_workers: 1,
             final_video: dir.join("final.mp4"),
             disabled_workers: Vec::new(),
+            render: RenderOptions::default(),
         };
         let job = read_job(&config).unwrap();
         let bundle = build_bundle(&config, &job).unwrap();
@@ -1824,12 +2204,12 @@ mod tests {
         let client_stop = stop.clone();
         let client = thread::spawn(move || run_worker(config, client_state, client_stop));
         for _ in 0..100 {
-            if lock(&state).messages.iter().any(|message| message == "렌더 준비 완료: Host Choice") {
+            if lock(&state).messages.iter().any(|message| message.contains("렌더 준비 완료: Host Choice")) {
                 break;
             }
             thread::sleep(Duration::from_millis(20));
         }
-        assert!(lock(&state).messages.iter().any(|message| message == "렌더 준비 완료: Host Choice"));
+        assert!(lock(&state).messages.iter().any(|message| message.contains("렌더 준비 완료: Host Choice")));
         stop.store(true, Ordering::Relaxed);
         assert!(client.join().unwrap().is_ok());
         assert!(server.join().unwrap().is_ok());
@@ -1871,6 +2251,7 @@ mod tests {
             max_workers: 1,
             final_video: dir.join("final.mp4"),
             disabled_workers: Vec::new(),
+            render: RenderOptions::default(),
         };
         let job = read_job(&host).unwrap();
         let state = Arc::new(Mutex::new(State {
@@ -1882,6 +2263,8 @@ mod tests {
             output: dir.clone(),
             ..State::default()
         }));
+        let mut preview_config = host.clone();
+        let preview_job = job.clone();
         let server_state = state.clone();
         let server = thread::spawn(move || {
             let (stream, peer) = listener.accept().unwrap();
@@ -1901,6 +2284,7 @@ mod tests {
             max_workers: 1,
             final_video: dir.join("unused.mp4"),
             disabled_workers: Vec::new(),
+            render: RenderOptions::default(),
         };
         assert!(run_worker(client, state.clone(), Arc::new(AtomicBool::new(false))).is_ok());
         assert!(server.join().unwrap().is_ok());
@@ -1908,6 +2292,16 @@ mod tests {
         assert_eq!(worker_snapshot(&state).0.first().unwrap().completed_frames, 2);
         assert_eq!(lock(&state).local_progress, Some((0, 2, 2)));
         assert!(lock(&state).messages.iter().any(|message| message.contains("임시 프로젝트·소스·프레임 삭제 완료")));
+        assert!(worker_snapshot(&state).0.first().unwrap().preview.is_some());
+        let preview = render_preview(&preview_config, 1).unwrap();
+        validate_preview(&preview.jpeg).unwrap();
+        preview_config.output = dir.join("boundary");
+        std::fs::create_dir(&preview_config.output).unwrap();
+        // The initial scheduler response can shorten the CLI's exact frame range.
+        let rendered_end = render_chunk(&preview_config, &preview_job, 0, 2, |_| Ok(1)).unwrap();
+        assert_eq!(rendered_end, 1);
+        assert!(valid_png(&frame_path(&preview_config.output, 0)));
+        assert!(!frame_path(&preview_config.output, 1).exists());
         std::fs::remove_dir_all(dir).unwrap();
     }
 
@@ -1934,6 +2328,7 @@ mod tests {
             max_workers: 1,
             final_video: dir.join("final.mp4"),
             disabled_workers: Vec::new(),
+            render: RenderOptions::default(),
         };
         let job = read_job(&config).unwrap();
         let state = Arc::new(Mutex::new(State {
@@ -2014,6 +2409,134 @@ mod tests {
     }
 
     #[test]
+    fn idle_worker_shares_running_tail_and_receives_live_preview() {
+        let workspace = TempWorkspace::new().unwrap();
+        let dir = workspace.root.clone();
+        let mut project = Project::default();
+        project.add_item("Test", Label::None, None, ItemKind::Comp(Arc::new(Comp::new(2, 2, FrameRate::FPS_60, FrameRate::FPS_60.tick_of(10)))));
+        let source = dir.join("source.ecproj");
+        std::fs::write(&source, project.to_json()).unwrap();
+        let config = Config {
+            project: source,
+            cli: std::env::current_exe().unwrap(),
+            output: dir.clone(),
+            comp: "Test".into(),
+            address: "127.0.0.1:0".into(),
+            token: "password".into(),
+            gpu: false,
+            range_start: 0,
+            range_end: 10,
+            chunk_frames: 10,
+            max_workers: 2,
+            final_video: dir.join("final.mp4"),
+            disabled_workers: vec![],
+            render: RenderOptions::default(),
+        };
+        let job = read_job(&config).unwrap();
+        let state = Arc::new(Mutex::new(State {
+            chunks: vec![Chunk { start: 0, end: 10, status: ChunkStatus::Pending, attempts: 0, worker: String::new() }],
+            total: 10,
+            output: dir.clone(),
+            max_workers: 2,
+            dispatch_enabled: true,
+            assembly_started: true,
+            ..State::default()
+        }));
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        let server_state = state.clone();
+        let server = thread::spawn(move || {
+            let mut handles = Vec::new();
+            for index in 1..=2 {
+                let (stream, peer) = listener.accept().unwrap();
+                let peer = SocketAddr::new(format!("127.0.0.{index}").parse().unwrap(), peer.port());
+                let config = config.clone();
+                let job = job.clone();
+                let state = server_state.clone();
+                handles.push(thread::spawn(move || serve_worker(stream, peer, &config, &job, &state, &AtomicBool::new(false))));
+            }
+            handles.into_iter().all(|h| h.join().unwrap().is_ok())
+        });
+        let mut first = TcpStream::connect(address).unwrap();
+        first.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+        let mut a = BufReader::new(first.try_clone().unwrap());
+        send(&mut first, &Message::Hello { token: "password".into(), name: "slow".into(), protocol: PROTOCOL_VERSION }).unwrap();
+        assert!(matches!(receive(&mut a), Ok(Message::Ready { .. })));
+        send(&mut first, &Message::Request).unwrap();
+        receive_test_bundle(&mut a);
+        send(&mut first, &Message::Request).unwrap();
+        assert!(matches!(receive(&mut a), Ok(Message::Assign { start: 0, end: 10, .. })));
+
+        let mut second = TcpStream::connect(address).unwrap();
+        second.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+        let mut b = BufReader::new(second.try_clone().unwrap());
+        send(&mut second, &Message::Hello { token: "password".into(), name: "helper".into(), protocol: PROTOCOL_VERSION }).unwrap();
+        assert!(matches!(receive(&mut b), Ok(Message::Ready { .. })));
+        send(&mut second, &Message::Request).unwrap();
+        receive_test_bundle(&mut b);
+        send(&mut second, &Message::Request).unwrap();
+        assert!(matches!(receive(&mut b), Ok(Message::Wait)));
+
+        send(&mut first, &Message::Progress { start: 0, end: 10, done: 2 }).unwrap();
+        assert!(matches!(receive(&mut a), Ok(Message::Continue { end: 6 })));
+        let preview_path = dir.join("preview.png");
+        image::RgbImage::from_pixel(16, 16, image::Rgb([50, 100, 150])).save(&preview_path).unwrap();
+        let preview = make_preview(&preview_path, 1).unwrap();
+        send(&mut first, &Message::Preview { frame: 1, len: preview.jpeg.len() }).unwrap();
+        first.write_all(&preview.jpeg).unwrap();
+        // A second progress acknowledgement ensures the preview was consumed.
+        send(&mut first, &Message::Progress { start: 0, end: 6, done: 2 }).unwrap();
+        assert!(matches!(receive(&mut a), Ok(Message::Continue { end: 6 })));
+        assert!(lock(&state).worker_info.values().any(|w| w.preview.as_ref().is_some_and(|p| p.frame == 1)));
+        send(&mut second, &Message::Request).unwrap();
+        assert!(matches!(receive(&mut b), Ok(Message::Assign { start: 6, end: 10, .. })));
+        send_test_frames(&mut first, 0, 6);
+        send(&mut first, &Message::Complete { start: 0, end: 6, ok: true, detail: String::new() }).unwrap();
+        send_test_frames(&mut second, 6, 10);
+        send(&mut second, &Message::Complete { start: 6, end: 10, ok: true, detail: String::new() }).unwrap();
+        send(&mut first, &Message::Disconnect).unwrap();
+        send(&mut second, &Message::Disconnect).unwrap();
+        assert!(server.join().unwrap());
+        assert_eq!(snapshot(&state).0, 10);
+        assert!(chunk_complete(&dir, 0, 10));
+        assert!(lock(&state).messages.iter().any(|m| m.contains("대기 PC에 재분배")));
+    }
+
+    #[test]
+    fn resume_preserves_partial_chunks_and_draft_cannot_mix_with_best() {
+        let workspace = TempWorkspace::new().unwrap();
+        for frame in [2, 3, 6] {
+            image::RgbImage::new(2, 2).save(frame_path(&workspace.root, frame)).unwrap();
+        }
+        let chunks = partition_frames(&workspace.root, 2, 8, 4);
+        assert_eq!(chunks.iter().filter(|c| c.status == ChunkStatus::Done).map(|c| c.end - c.start).sum::<i64>(), 3);
+        assert_eq!(chunks.first().unwrap().start, 2);
+        assert_eq!(chunks.last().unwrap().end, 8);
+        for pair in chunks.windows(2) {
+            assert_eq!(pair[0].end, pair[1].start);
+        }
+        let mut state = State { chunks, ..State::default() };
+        retain_received_prefix(&mut state, 4, 6, 1);
+        assert!(state.chunks.iter().any(|c| c.start == 4 && c.end == 5 && c.status == ChunkStatus::Done));
+        assert!(state.chunks.iter().any(|c| c.start == 5 && c.end == 6 && c.status == ChunkStatus::Pending));
+        let job = Job {
+            draft: false,
+            hash: "test".into(),
+            comp: "Test".into(),
+            rate: FrameRate::FPS_60,
+            total: 8,
+            start: 2,
+            end: 8,
+            width: 2,
+            height: 2,
+            output: workspace.root.clone(),
+        };
+        let best = Manifest::from(&job);
+        let draft = Manifest::from(&Job { draft: true, ..job });
+        assert!(best != draft);
+    }
+
+    #[test]
     fn assembly_preserves_original_audio_and_uses_rendered_frames() {
         let suffix = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos();
         let dir = std::env::temp_dir().join(format!("effectcraft-farm-assembly-{}-{suffix}", std::process::id()));
@@ -2065,6 +2588,7 @@ mod tests {
             max_workers: 2,
             final_video: dir.join("final.mp4"),
             disabled_workers: Vec::new(),
+            render: RenderOptions::default(),
         };
         let job = read_job(&config).unwrap();
         let assembled = assembly_project(&config, &job).unwrap();

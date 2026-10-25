@@ -13,7 +13,54 @@ pub enum Distribution {
 
 #[derive(Clone, PartialEq, Serialize, Deserialize)]
 #[serde(default)]
+pub struct RenderOptions {
+    pub adaptive: bool,
+    pub target_seconds: u32,
+    pub retries: u8,
+    pub previews: bool,
+    pub preview_seconds: u32,
+    pub poll_ms: u64,
+    pub draft: bool,
+    pub video_bitrate: u32,
+    pub audio: bool,
+    pub durable_writes: bool,
+}
+
+impl Default for RenderOptions {
+    fn default() -> Self {
+        Self {
+            adaptive: true,
+            target_seconds: 30,
+            retries: 3,
+            previews: true,
+            preview_seconds: 3,
+            poll_ms: 150,
+            draft: false,
+            video_bitrate: 16000,
+            audio: true,
+            durable_writes: false,
+        }
+    }
+}
+
+impl RenderOptions {
+    pub fn validate(&self) -> Result<(), String> {
+        if !(5..=300).contains(&self.target_seconds)
+            || !(1..=10).contains(&self.retries)
+            || !(1..=30).contains(&self.preview_seconds)
+            || !(50..=2000).contains(&self.poll_ms)
+            || !(100..=200_000).contains(&self.video_bitrate)
+        {
+            return Err("렌더 옵션 범위를 확인하세요".into());
+        }
+        Ok(())
+    }
+}
+
+#[derive(Clone, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
 pub struct Settings {
+    pub check_updates: bool,
     pub revision: u64,
     pub project: String,
     pub cli: String,
@@ -34,6 +81,7 @@ pub struct Settings {
     pub max_workers: usize,
     pub final_video: String,
     pub disabled_workers: Vec<String>,
+    pub render: RenderOptions,
 }
 
 impl Default for Settings {
@@ -43,6 +91,7 @@ impl Default for Settings {
             .and_then(|p| p.parent().map(|d| d.join(if cfg!(windows) { "effectcraft-cli.exe" } else { "effectcraft-cli" })))
             .unwrap_or_default();
         Self {
+            check_updates: true,
             revision: 0,
             project: String::new(),
             cli: cli.display().to_string(),
@@ -63,6 +112,7 @@ impl Default for Settings {
             max_workers: 2,
             final_video: String::new(),
             disabled_workers: Vec::new(),
+            render: RenderOptions::default(),
         }
     }
 }
@@ -79,7 +129,8 @@ impl Settings {
                 if !(1..=64).contains(&self.max_workers) {
                     return Err("사용할 PC 수는 1~64대여야 합니다".into());
                 }
-                (span + self.max_workers as i64 - 1) / self.max_workers as i64
+                // Leave work in the shared queue so faster machines can help.
+                ((span + self.max_workers as i64 * 8 - 1) / (self.max_workers as i64 * 8)).clamp(1, 120)
             }
             Distribution::Frames => self.chunk_frames,
             Distribution::Percent => {
@@ -108,6 +159,10 @@ fn directory() -> Result<PathBuf, String> {
 
 pub fn log_path() -> Result<PathBuf, String> {
     Ok(directory()?.join("render-farm.log"))
+}
+
+pub fn update_result_path() -> Result<PathBuf, String> {
+    Ok(directory()?.join("update-result.txt"))
 }
 
 fn slots(dir: &std::path::Path) -> [PathBuf; 2] {
@@ -192,7 +247,7 @@ mod tests {
     #[test]
     fn distribution_supports_auto_frames_and_percent() {
         let mut settings = Settings { max_workers: 3, range_start: 100, range_end: 1000, ..Settings::default() };
-        assert_eq!(settings.effective_chunk_frames(1200).unwrap(), 300);
+        assert_eq!(settings.effective_chunk_frames(1200).unwrap(), 38);
         settings.distribution = Distribution::Frames;
         settings.chunk_frames = 240;
         assert_eq!(settings.effective_chunk_frames(1200).unwrap(), 240);
