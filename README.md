@@ -17,6 +17,11 @@ EffectCraft 컴포지션 하나를 여러 PC에서 렌더링하는 별도 데스
 
 ## 빌드
 
+앱 아이콘은 EffectCraft 원본 유니콘에 파란 배경과 연결 배지를 더한 승인 시안 B를 사용합니다.
+원본 그림은 ArtCraft Team / EffectCraft contributors의 MIT OR Apache-2.0 저작물입니다.
+출처와 아이콘 재생성 방법은 [아이콘 안내](assets/app-icon/README.md)에 있습니다.
+Windows 빌드에는 Windows SDK의 리소스 컴파일러가 필요하며, 아이콘 내장 실패 시 빌드가 중단됩니다.
+
 Rust 1.95 이상에서 `cargo build --release`로 앱을 빌드합니다. Windows MSI는 다음 명령으로 만듭니다.
 
 ```powershell

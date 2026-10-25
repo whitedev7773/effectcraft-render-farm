@@ -1,6 +1,7 @@
 /target/
 *.mp4
 *.png
+!/assets/app-icon/*.png
 *.ecproj
 *.wav
 *.zip

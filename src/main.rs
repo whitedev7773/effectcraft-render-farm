@@ -639,8 +639,19 @@ fn main() {
             return;
         }
     };
+    let icon = match eframe::icon_data::from_png_bytes(include_bytes!("../assets/app-icon/farm-256.png")) {
+        Ok(icon) => icon,
+        Err(error) => {
+            eprintln!("Render Farm icon: {error}");
+            return;
+        }
+    };
     let options = eframe::NativeOptions {
-        viewport: egui::ViewportBuilder::default().with_title("EffectCraft Render Farm").with_inner_size([1440.0, 940.0]).with_min_inner_size([560.0, 520.0]),
+        viewport: egui::ViewportBuilder::default()
+            .with_title("EffectCraft Render Farm")
+            .with_icon(icon)
+            .with_inner_size([1440.0, 940.0])
+            .with_min_inner_size([560.0, 520.0]),
         ..Default::default()
     };
     if let Err(e) = eframe::run_native(

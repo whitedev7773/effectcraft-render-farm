@@ -12,6 +12,22 @@ $files = @()
 while ($record = $view.Fetch()) { $files += ($record.StringData(1) -split '\|')[-1] }
 [void]$view.Close()
 if ($files.Count -ne 4 -or $files -contains 'effectcraft-cli.exe' -or $files -notcontains 'effectcraft-farm.exe') { throw 'Unexpected MSI payload' }
+$iconView = $db.OpenView('SELECT `Data` FROM `Icon` WHERE `Name`=''FarmIcon.ico''')
+[void]$iconView.Execute()
+$iconRecord = $iconView.Fetch()
+if (-not $iconRecord -or $iconRecord.DataSize(1) -ne (Get-Item -LiteralPath (Join-Path $root 'assets/app-icon/farm.ico')).Length) { throw 'Missing or incorrect MSI icon data' }
+[void]$iconView.Close()
+$propertyView = $db.OpenView('SELECT `Value` FROM `Property` WHERE `Property`=''ARPPRODUCTICON''')
+[void]$propertyView.Execute()
+$iconProperty = $propertyView.Fetch()
+if (-not $iconProperty -or $iconProperty.StringData(1) -ne 'FarmIcon.ico') { throw 'Installed-app icon not configured' }
+[void]$propertyView.Close()
+$shortcutView = $db.OpenView('SELECT `Icon_` FROM `Shortcut` WHERE `Shortcut`=''FarmShortcut''')
+[void]$shortcutView.Execute()
+$shortcutIcon = $shortcutView.Fetch()
+if (-not $shortcutIcon -or $shortcutIcon.StringData(1) -ne 'FarmIcon.ico') { throw 'Start Menu shortcut icon not configured' }
+[void]$shortcutView.Close()
+Write-Output 'MSI icon data, installed-app icon and Start Menu icon passed.'
 [Runtime.InteropServices.Marshal]::FinalReleaseComObject($db) | Out-Null
 [Runtime.InteropServices.Marshal]::FinalReleaseComObject($installer) | Out-Null
 Write-Output ('MSI payload: ' + ($files -join ', '))
@@ -27,6 +43,7 @@ $built = Join-Path $root 'target/x86_64-pc-windows-msvc/release/effectcraft-farm
 if ((Get-FileHash -LiteralPath $apps[0].FullName).Hash -ne (Get-FileHash -LiteralPath $built).Hash) { throw 'MSI payload differs from release build' }
 if (@(Get-ChildItem -LiteralPath $extracted -Recurse -Filter 'effectcraft-cli.exe').Count -ne 0) { throw 'Unexpected bundled CLI' }
 Write-Output 'MSI extraction and app checksum passed.'
+& (Join-Path $PSScriptRoot 'verify-icon.ps1') -Executable $apps[0].FullName
 
 foreach ($scenario in @('valid', 'wrong-product')) {
     $stage = Join-Path $work $scenario
