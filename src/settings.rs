@@ -86,15 +86,11 @@ pub struct Settings {
 
 impl Default for Settings {
     fn default() -> Self {
-        let cli = std::env::current_exe()
-            .ok()
-            .and_then(|p| p.parent().map(|d| d.join(if cfg!(windows) { "effectcraft-cli.exe" } else { "effectcraft-cli" })))
-            .unwrap_or_default();
         Self {
             check_updates: true,
             revision: 0,
             project: String::new(),
-            cli: cli.display().to_string(),
+            cli: String::new(),
             output: String::new(),
             comp: String::new(),
             host_address: "0.0.0.0:9778".into(),

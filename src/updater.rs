@@ -11,8 +11,7 @@ use sha2::{Digest, Sha256};
 
 const API: &str = "https://api.github.com/repos/whitedev7773/effectcraft-render-farm/releases/latest";
 const REPO: &str = "https://github.com/whitedev7773/effectcraft-render-farm/";
-const MAX_ARCHIVE: u64 = 512 * 1024 * 1024;
-const MAX_FILE: u64 = 512 * 1024 * 1024;
+const MAX_INSTALLER: u64 = 512 * 1024 * 1024;
 
 #[derive(Clone, Deserialize)]
 pub struct Asset {
@@ -77,9 +76,9 @@ pub fn check() -> Result<Option<Release>, String> {
 }
 
 fn windows_asset(release: &Release) -> Result<&Asset, String> {
-    let expected = format!("effectcraft-render-farm-{}-windows-x64.zip", release.tag_name);
-    let asset = release.assets.iter().find(|a| a.name == expected).ok_or("이 릴리스에는 Windows x64 업데이트 ZIP이 없습니다")?;
-    if asset.size == 0 || asset.size > MAX_ARCHIVE || !asset.browser_download_url.starts_with(&format!("{REPO}releases/download/")) {
+    let expected = format!("effectcraft-render-farm-{}-windows-x64.msi", release.tag_name);
+    let asset = release.assets.iter().find(|a| a.name == expected).ok_or("이 릴리스에는 Windows x64 설치 프로그램이 없습니다")?;
+    if asset.size == 0 || asset.size > MAX_INSTALLER || !asset.browser_download_url.starts_with(&format!("{REPO}releases/download/")) {
         return Err("업데이트 파일 크기 또는 주소가 잘못됐습니다".into());
     }
     expected_digest(asset)?;
@@ -98,58 +97,14 @@ fn expected_digest(asset: &Asset) -> Result<&str, String> {
     Ok(digest)
 }
 
-fn validate_pe(path: &Path) -> Result<(), String> {
-    use std::io::{Seek, SeekFrom};
+fn validate_installer(path: &Path) -> Result<(), String> {
     let mut file = std::fs::File::open(path).map_err(|e| e.to_string())?;
-    let mut header = [0; 64];
-    file.read_exact(&mut header).map_err(|e| e.to_string())?;
-    if &header[..2] != b"MZ" {
-        return Err("업데이트 파일이 Windows 실행 파일이 아닙니다".into());
+    let mut signature = [0; 8];
+    file.read_exact(&mut signature).map_err(|e| format!("설치 프로그램 헤더: {e}"))?;
+    if signature != [0xd0, 0xcf, 0x11, 0xe0, 0xa1, 0xb1, 0x1a, 0xe1] {
+        return Err("다운로드 파일이 Windows MSI 설치 프로그램이 아닙니다".into());
     }
-    let offset = u32::from_le_bytes([header[60], header[61], header[62], header[63]]);
-    file.seek(SeekFrom::Start(offset as u64)).map_err(|e| e.to_string())?;
-    let mut pe = [0; 6];
-    file.read_exact(&mut pe).map_err(|e| e.to_string())?;
-    if &pe[..4] != b"PE\0\0" || pe[4..] != [0x64, 0x86] {
-        return Err("업데이트 실행 파일이 Windows x64가 아닙니다".into());
-    }
-    Ok(())
-}
-
-fn extract(archive: &Path, stage: &Path) -> Result<(), String> {
-    let file = std::fs::File::open(archive).map_err(|e| e.to_string())?;
-    let mut zip = zip::ZipArchive::new(file).map_err(|e| format!("업데이트 ZIP: {e}"))?;
-    if zip.len() > 1000 {
-        return Err("업데이트 ZIP 항목이 너무 많습니다".into());
-    }
-    let mut found = std::collections::BTreeSet::new();
-    for i in 0..zip.len() {
-        let mut entry = zip.by_index(i).map_err(|e| e.to_string())?;
-        let path = entry.enclosed_name().ok_or("업데이트 ZIP 경로 오류")?;
-        if entry.is_dir() {
-            continue;
-        }
-        let Some(name) = path.file_name().and_then(|n| n.to_str()) else { continue };
-        if !matches!(name, "effectcraft-farm.exe" | "effectcraft-cli.exe") {
-            continue;
-        }
-        if entry.is_symlink() || entry.size() > MAX_FILE || !found.insert(name.to_owned()) {
-            return Err("업데이트 ZIP 실행 파일 중복·크기·링크 오류".into());
-        }
-        let target = stage.join(name);
-        let mut output = std::fs::OpenOptions::new().write(true).create_new(true).open(&target).map_err(|e| e.to_string())?;
-        let declared_size = entry.size();
-        let copied = std::io::copy(&mut (&mut entry).take(MAX_FILE + 1), &mut output).map_err(|e| format!("업데이트 압축 해제: {e}"))?;
-        if copied > MAX_FILE || copied != declared_size {
-            return Err("업데이트 파일 크기 오류".into());
-        }
-        output.sync_all().map_err(|e| e.to_string())?;
-        drop(output);
-        validate_pe(&target)?;
-    }
-    if found.len() != 2 {
-        return Err("ZIP에 앱과 CLI 실행 파일이 모두 필요합니다".into());
-    }
+    // The helper also checks MSI ProductName and UpgradeCode before this app exits.
     Ok(())
 }
 
@@ -164,19 +119,14 @@ fn prepare(release: Release, progress: Arc<AtomicU64>) -> Result<Prepared, Strin
     }
     let asset = windows_asset(&release)?;
     let exe = std::env::current_exe().map_err(|e| e.to_string())?;
-    if exe.file_name().and_then(|n| n.to_str()).is_some_and(|n| n.eq_ignore_ascii_case("effectcraft-cli.exe")) {
-        return Err("앱 실행 파일 이름을 변경하세요".into());
+    if exe.file_name().and_then(|n| n.to_str()).is_none_or(|n| !n.eq_ignore_ascii_case("effectcraft-farm.exe")) {
+        return Err("Render Farm 설치 프로그램으로 먼저 설치하세요".into());
     }
     let nonce = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap_or_default().as_nanos();
     let stage = std::env::temp_dir().join(format!("effectcraft-farm-update-{}-{nonce}", std::process::id()));
     std::fs::create_dir(&stage).map_err(|e| format!("업데이트 임시 폴더: {e}"))?;
-    // Check write permission before asking the running app to exit.
-    let install = exe.parent().ok_or("앱 설치 폴더가 없습니다")?;
-    let probe = install.join(format!(".farm-update-write-{nonce}"));
-    std::fs::OpenOptions::new().write(true).create_new(true).open(&probe).map_err(|e| format!("설치 폴더 쓰기 권한이 없습니다: {e}"))?;
-    std::fs::remove_file(probe).map_err(|e| e.to_string())?;
     let mut response = client()?.get(&asset.browser_download_url).send().and_then(|r| r.error_for_status()).map_err(|e| format!("업데이트 다운로드: {e}"))?;
-    let archive = stage.join("release.zip");
+    let archive = stage.join("setup.msi");
     let mut output = std::fs::File::create(&archive).map_err(|e| e.to_string())?;
     let mut hash = Sha256::new();
     let mut buffer = vec![0; 256 * 1024];
@@ -187,7 +137,7 @@ fn prepare(release: Release, progress: Arc<AtomicU64>) -> Result<Prepared, Strin
             break;
         }
         downloaded += count as u64;
-        if downloaded > asset.size || downloaded > MAX_ARCHIVE {
+        if downloaded > asset.size || downloaded > MAX_INSTALLER {
             return Err("업데이트 다운로드 크기 초과".into());
         }
         hash.update(&buffer[..count]);
@@ -199,7 +149,7 @@ fn prepare(release: Release, progress: Arc<AtomicU64>) -> Result<Prepared, Strin
     if downloaded != asset.size || !format!("{:x}", hash.finalize()).eq_ignore_ascii_case(expected_digest(asset)?) {
         return Err("업데이트 크기 또는 SHA-256 검증 실패 · 설치하지 않았습니다".into());
     }
-    extract(&archive, &stage)?;
+    validate_installer(&archive)?;
     Ok(Prepared { stage, exe })
 }
 
@@ -350,10 +300,10 @@ mod tests {
             draft: false,
             prerelease: false,
             assets: vec![Asset {
-                name: format!("effectcraft-render-farm-{tag}-windows-x64.zip"),
+                name: format!("effectcraft-render-farm-{tag}-windows-x64.msi"),
                 size: 100,
                 digest: Some(format!("sha256:{}", "a".repeat(64))),
-                browser_download_url: format!("{REPO}releases/download/{tag}/app.zip"),
+                browser_download_url: format!("{REPO}releases/download/{tag}/app.msi"),
             }],
         }
     }
@@ -377,10 +327,10 @@ mod tests {
         value.assets[0].digest = None;
         assert!(windows_asset(&value).is_err());
         value.assets[0].digest = Some(format!("sha256:{}", "a".repeat(64)));
-        value.assets[0].browser_download_url = "https://example.com/app.zip".into();
+        value.assets[0].browser_download_url = "https://example.com/app.msi".into();
         assert!(windows_asset(&value).is_err());
-        value.assets[0].browser_download_url = format!("{REPO}releases/download/v0.7.0/app.zip");
-        value.assets[0].name = "linux.zip".into();
+        value.assets[0].browser_download_url = format!("{REPO}releases/download/v0.7.0/app.msi");
+        value.assets[0].name = "linux.tar.gz".into();
         assert!(windows_asset(&value).is_err());
     }
 
@@ -395,43 +345,17 @@ mod tests {
         assert!(!updater.installing());
     }
 
-    fn write_archive(path: &Path, names: &[&str]) {
-        let file = std::fs::File::create(path).unwrap();
-        let mut writer = zip::ZipWriter::new(file);
-        let mut bytes = vec![0; 128];
-        bytes[..2].copy_from_slice(b"MZ");
-        bytes[60..64].copy_from_slice(&64u32.to_le_bytes());
-        bytes[64..70].copy_from_slice(b"PE\0\0\x64\x86");
-        for name in names {
-            writer.start_file(*name, zip::write::SimpleFileOptions::default()).unwrap();
-            writer.write_all(&bytes).unwrap();
-        }
-        writer.finish().unwrap();
-    }
-
     #[test]
-    fn archive_extracts_only_pair_and_rejects_missing_duplicate_and_traversal() {
+    fn installer_header_rejects_executables_and_zip_files() {
         let nonce = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos();
-        let root = std::env::temp_dir().join(format!("effectcraft-update-test-{}-{nonce}", std::process::id()));
-        std::fs::create_dir(&root).unwrap();
-        for (i, names, valid) in [
-            (0, vec!["app/effectcraft-farm.exe", "app/effectcraft-cli.exe", "README.md"], true),
-            (1, vec!["effectcraft-farm.exe"], false),
-            (2, vec!["a/effectcraft-farm.exe", "b/effectcraft-farm.exe", "effectcraft-cli.exe"], false),
-            (3, vec!["../effectcraft-farm.exe", "effectcraft-cli.exe"], false),
-        ] {
-            let stage = root.join(i.to_string());
-            std::fs::create_dir(&stage).unwrap();
-            let archive = stage.join("test.zip");
-            write_archive(&archive, &names);
-            assert_eq!(extract(&archive, &stage).is_ok(), valid);
-            if valid {
-                assert!(!stage.join("README.md").exists());
-            }
-        }
-        // Only this uniquely created test directory is removed.
-        assert!(root.canonicalize().unwrap().starts_with(std::env::temp_dir().canonicalize().unwrap()));
-        std::fs::remove_dir_all(root).unwrap();
+        let path = std::env::temp_dir().join(format!("farm-msi-header-{}-{nonce}.msi", std::process::id()));
+        std::fs::write(&path, b"MZnot-an-msi").unwrap();
+        assert!(validate_installer(&path).is_err());
+        std::fs::write(&path, b"PKzip-not-msi").unwrap();
+        assert!(validate_installer(&path).is_err());
+        std::fs::write(&path, [0xd0, 0xcf, 0x11, 0xe0, 0xa1, 0xb1, 0x1a, 0xe1]).unwrap();
+        assert!(validate_installer(&path).is_ok());
+        std::fs::remove_file(path).unwrap();
     }
 
     #[test]

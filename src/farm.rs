@@ -17,6 +17,16 @@ use effectcraft_time::{FrameRate, Tick};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
+fn configure_cli(command: &mut Command) {
+    #[cfg(windows)]
+    {
+        use std::os::windows::process::CommandExt;
+        command.creation_flags(0x0800_0000);
+    }
+    #[cfg(not(windows))]
+    let _ = command;
+}
+
 fn project_hash(bytes: &[u8]) -> String {
     format!("{:x}", Sha256::digest(bytes))
 }
@@ -822,6 +832,7 @@ pub fn render_preview(config: &Config, frame: i64) -> Result<Preview, String> {
     let workspace = TempWorkspace::new()?;
     let path = workspace.root.join("preview.png");
     let mut command = Command::new(&config.cli);
+    configure_cli(&mut command);
     command
         .arg("render-frame")
         .arg(&config.project)
@@ -1641,6 +1652,7 @@ fn render_chunk(config: &Config, job: &Job, start: i64, end: i64, mut progress: 
     let start_s = format!("{:.9}", (job.rate.tick_of(start).seconds() - 0.000_001).max(0.0));
     let end_s = format!("{:.9}", (job.rate.tick_of(launched_end).seconds() - 0.000_001).max(0.0));
     let mut command = Command::new(&config.cli);
+    configure_cli(&mut command);
     command
         .arg("render")
         .arg(&config.project)
@@ -1833,6 +1845,7 @@ fn assemble_final(config: &Config, job: &Job) -> Result<(), String> {
     let start_s = format!("{:.9}", (job.rate.tick_of(job.start).seconds() - 0.000_001).max(0.0));
     let end_s = format!("{:.9}", (job.rate.tick_of(job.end).seconds() - 0.000_001).max(0.0));
     let mut command = Command::new(&config.cli);
+    configure_cli(&mut command);
     command
         .arg("render")
         .arg(&scratch_project)

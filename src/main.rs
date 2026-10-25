@@ -1,7 +1,9 @@
 #![deny(clippy::unwrap_used, clippy::expect_used, clippy::panic, clippy::unimplemented, clippy::todo, clippy::unreachable)]
+#![cfg_attr(all(windows, not(debug_assertions)), windows_subsystem = "windows")]
 
 mod discovery;
 mod farm;
+mod installation;
 mod settings;
 mod updater;
 
@@ -262,7 +264,7 @@ impl App {
                 .open(&mut open)
                 .show(ui.ctx(), |ui| {
                     ui.heading(format!("{} → {}", env!("CARGO_PKG_VERSION"), release.tag_name));
-                    ui.label("동의하면 업데이트를 다운로드하고 검증한 뒤 앱과 CLI를 교체하고 다시 시작합니다.");
+                    ui.label("동의하면 설치 프로그램을 다운로드·검증하고 Render Farm을 업데이트한 뒤 다시 시작합니다. EffectCraft 설치는 변경하지 않습니다.");
                     ui.label("연결할 모든 PC를 같은 버전으로 업데이트하세요.");
                     ui.hyperlink_to("GitHub 릴리스 보기", &release.html_url);
                     egui::ScrollArea::vertical().id_salt("release_notes").max_height(240.0).show(ui, |ui| {
@@ -731,11 +733,8 @@ impl eframe::App for App {
                             } else {
                                 ui.small("프로젝트·소스·글꼴·컴포지션·프레임 범위는 호스트가 렌더 시작 시 전송합니다.");
                             }
-                            if path_row(ui, "렌더 CLI 실행 파일", &mut self.settings.cli)
-                                && let Some(path) = rfd::FileDialog::new().pick_file()
-                            {
-                                self.settings.cli = path.display().to_string();
-                            }
+                            ui.label("설치된 EffectCraft에서 자동으로 찾은 렌더 엔진");
+                            ui.monospace(&self.settings.cli);
                             if self.settings.host
                                 && path_row(ui, "호스트 프레임 저장 폴더", &mut self.settings.output)
                                 && let Some(path) = rfd::FileDialog::new().pick_folder()
@@ -1082,6 +1081,15 @@ impl eframe::App for App {
 }
 
 fn main() {
+    let (saved, _) = settings::load();
+    let installation = match installation::detect(&saved.cli) {
+        Ok(installation) => installation,
+        Err(reason) => {
+            State::with_log_path(settings::log_path().ok()).note(format!("EffectCraft 설치 확인 실패: {reason}"));
+            installation::guide_and_exit_reason(&reason);
+            return;
+        }
+    };
     let options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default().with_title("EffectCraft Render Farm").with_inner_size([1120.0, 860.0]).with_min_inner_size([760.0, 600.0]),
         ..Default::default()
@@ -1089,8 +1097,11 @@ fn main() {
     if let Err(e) = eframe::run_native(
         "EffectCraft Render Farm",
         options,
-        Box::new(|cc| {
+        Box::new(move |cc| {
             let mut app = App::default();
+            app.settings.cli = installation.cli.display().to_string();
+            app.state.lock().unwrap_or_else(std::sync::PoisonError::into_inner).note(format!("설치된 EffectCraft 감지: {}", installation.root.display()));
+            app.save_settings();
             cc.egui_ctx.set_visuals(egui::Visuals::dark());
             cc.egui_ctx.style_mut_of(egui::Theme::Dark, |style| {
                 style.spacing.item_spacing = egui::vec2(10.0, 8.0);

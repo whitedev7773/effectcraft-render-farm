@@ -1,0 +1,45 @@
+<?xml version="1.0" encoding="utf-8"?>
+<Wix xmlns="http://wixtoolset.org/schemas/v4/wxs" xmlns:ui="http://wixtoolset.org/schemas/v4/wxs/ui">
+  <Package Name="EffectCraft Render Farm" Manufacturer="whitedev7773" Version="$(var.Version)"
+           UpgradeCode="648C6D1E-A6B1-49DB-96ED-D34D4F441B27" Scope="perUser" Compressed="yes" Language="1033">
+    <MajorUpgrade AllowSameVersionUpgrades="yes" Schedule="afterInstallInitialize"
+                  DowngradeErrorMessage="A newer version of EffectCraft Render Farm is already installed." />
+    <MediaTemplate EmbedCab="yes" CompressionLevel="high" />
+    <Property Id="ARPURLINFOABOUT" Value="https://github.com/whitedev7773/effectcraft-render-farm" />
+    <Property Id="INSTALLFOLDER" Secure="yes">
+      <RegistrySearch Id="PreviousFarmFolder" Root="HKCU" Type="directory"
+        Key="Software\Microsoft\Windows\CurrentVersion\App Paths\effectcraft-farm.exe" Name="Path" />
+    </Property>
+    <StandardDirectory Id="LocalAppDataFolder">
+      <Directory Id="FarmProgramsFolder" Name="Programs">
+        <Directory Id="INSTALLFOLDER" Name="EffectCraft Render Farm" />
+      </Directory>
+    </StandardDirectory>
+    <StandardDirectory Id="ProgramMenuFolder" />
+    <ui:WixUI Id="WixUI_InstallDir" InstallDirectory="INSTALLFOLDER" />
+    <WixVariable Id="WixUILicenseRtf" Value="$(var.LicensePath)" />
+    <Feature Id="Main" Title="EffectCraft Render Farm" Level="1">
+      <Component Directory="INSTALLFOLDER" Id="FarmApp" Guid="E8C2EB98-42E0-47A8-80EF-4F0A90658FF5">
+        <File Id="FarmExe" Source="$(var.BinDir)\effectcraft-farm.exe" />
+        <Shortcut Id="FarmShortcut" Directory="ProgramMenuFolder" Name="EffectCraft Render Farm"
+                  Target="[#FarmExe]" WorkingDirectory="INSTALLFOLDER" />
+        <RegistryValue Root="HKCU" Key="Software\Microsoft\Windows\CurrentVersion\App Paths\effectcraft-farm.exe"
+                       Value="[#FarmExe]" Type="string" />
+        <RegistryValue Root="HKCU" Key="Software\Microsoft\Windows\CurrentVersion\App Paths\effectcraft-farm.exe"
+                       Name="Path" Value="[INSTALLFOLDER]" Type="string" KeyPath="yes" />
+      </Component>
+      <Component Directory="INSTALLFOLDER" Id="FarmReadme" Guid="AE42F8C2-70BC-49A6-B185-3219AB7FFFC2">
+        <File Source="$(var.Root)\README.md" Name="Farm-README.md" />
+        <RegistryValue Root="HKCU" Key="Software\EffectCraft\RenderFarmInstaller" Name="Readme" Value="1" Type="integer" KeyPath="yes" />
+      </Component>
+      <Component Directory="INSTALLFOLDER" Id="FarmMitLicense" Guid="0147B54E-8A05-453F-BE6D-9E7BD56B5FF2">
+        <File Source="$(var.Root)\LICENSE-MIT" Name="Farm-LICENSE-MIT" />
+        <RegistryValue Root="HKCU" Key="Software\EffectCraft\RenderFarmInstaller" Name="MitLicense" Value="1" Type="integer" KeyPath="yes" />
+      </Component>
+      <Component Directory="INSTALLFOLDER" Id="FarmApacheLicense" Guid="52E88F21-1A64-41EC-8B78-4EA14E9ED3BC">
+        <File Source="$(var.Root)\LICENSE-APACHE" Name="Farm-LICENSE-APACHE" />
+        <RegistryValue Root="HKCU" Key="Software\EffectCraft\RenderFarmInstaller" Name="ApacheLicense" Value="1" Type="integer" KeyPath="yes" />
+      </Component>
+    </Feature>
+  </Package>
+</Wix>
