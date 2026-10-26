@@ -162,7 +162,10 @@ impl Settings {
 
 /// Derive the host frame directory from the selected project, never from an MP4 or saved setting.
 pub fn frame_output(project: &str) -> PathBuf {
-    PathBuf::from(project).parent().unwrap_or_else(|| std::path::Path::new("")).join("frame-share")
+    let project = std::path::Path::new(project);
+    let mut name = project.file_stem().unwrap_or_default().to_os_string();
+    name.push("-frame-share");
+    project.parent().unwrap_or_else(|| std::path::Path::new("")).join(name)
 }
 
 fn directory() -> Result<PathBuf, String> {
@@ -265,6 +268,15 @@ fn save_to(dir: &std::path::Path, settings: &mut Settings) -> Result<(), String>
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn frame_directory_preserves_project_name_and_removes_only_last_extension() {
+        let parent = std::env::temp_dir().join("farm-projects");
+        for name in ["scene", "scene.v2", "한글 프로젝트", "scene.ecproj.backup"] {
+            let project = parent.join(format!("{name}.ecproj"));
+            assert_eq!(frame_output(&project.to_string_lossy()), parent.join(format!("{name}-frame-share")));
+        }
+    }
 
     #[test]
     fn enables_gpu_on_upgrade_once_then_preserves_manual_cpu_choice() {

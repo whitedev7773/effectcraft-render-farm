@@ -104,7 +104,7 @@ impl Task {
         }
         let output = settings::frame_output(&self.project);
         if !output.is_absolute() || output.is_file() {
-            return Err("프로젝트 폴더의 frame-share 경로를 확인하세요".into());
+            return Err("프로젝트 폴더의 <프로젝트이름>-frame-share 경로를 확인하세요".into());
         }
         Ok(())
     }
@@ -124,7 +124,7 @@ pub(crate) fn validate_unique(task: &Task, tasks: &[Task]) -> Result<(), String>
     task.validate()?;
     for other in tasks.iter().filter(|other| other.id != task.id) {
         if path_key(&settings::frame_output(&other.project).to_string_lossy()) == path_key(&settings::frame_output(&task.project).to_string_lossy()) {
-            return Err(format!("‘{}’ 작업과 frame-share 폴더가 겹칩니다. 프로젝트를 별도 폴더에 저장하세요.", other.composition.name));
+            return Err(format!("‘{}’ 작업과 프레임 폴더가 겹칩니다. 프로젝트 이름이나 저장 폴더를 바꾸세요.", other.composition.name));
         }
         if path_key(&other.final_video) == path_key(&task.final_video) {
             return Err(format!("‘{}’ 작업과 최종 MP4 경로가 겹칩니다. 별도 MP4 이름을 지정하세요.", other.composition.name));
@@ -398,10 +398,10 @@ mod tests {
         let loaded: Settings = serde_json::from_value(legacy).unwrap();
         let mut app = App::with_state(loaded, None, Arc::new(Mutex::new(State::default())));
         app.settings.project = std::env::temp_dir().join("farm-project-b/other.ecproj").display().to_string();
-        assert_eq!(app.config().output, std::env::temp_dir().join("farm-project-b/frame-share"));
+        assert_eq!(app.config().output, std::env::temp_dir().join("farm-project-b/other-frame-share"));
         app.settings.queue[0].clone().apply(&mut app.settings);
         app.settings.final_video = std::env::temp_dir().join("elsewhere.mp4").display().to_string();
-        assert_eq!(app.config().output, project_dir.join("frame-share"));
+        assert_eq!(app.config().output, project_dir.join("scene-frame-share"));
         let saved = serde_json::to_value(&app.settings).unwrap();
         assert!(saved.get("output").is_none());
         assert!(saved["queue"][0].get("output").is_none());
@@ -425,10 +425,11 @@ mod tests {
         assert!(validate_unique(&second, &[first.clone()]).is_err());
         second.final_video = dir.join("two.mp4").display().to_string();
         assert!(validate_unique(&second, &[first.clone()]).is_err());
-        let second_dir = dir.join("second");
-        std::fs::create_dir(&second_dir).unwrap();
-        second.project = second_dir.join("project.ecproj").display().to_string();
+        second.project = dir.join("second.ecproj").display().to_string();
         std::fs::write(&second.project, "fixture").unwrap();
+        let mut same_video = second.clone();
+        same_video.final_video = first.final_video.clone();
+        assert!(validate_unique(&same_video, &[first.clone()]).is_err());
         assert!(validate_unique(&second, &[first]).is_ok());
         second.range_end = second.range_start;
         assert!(second.validate().is_err());
@@ -535,9 +536,9 @@ mod tests {
         let job = app.job.as_ref().unwrap();
         assert_eq!(job.comp, "Comp 2");
         assert_eq!((job.start, job.end), (5, 60));
-        assert_eq!(job.output, dir.join("2/frame-share"));
+        assert_eq!(job.output, dir.join("2/project-frame-share"));
         assert!(job.output.is_dir());
-        assert!(!dir.join("1/frame-share").exists());
+        assert!(!dir.join("1/project-frame-share").exists());
         assert!(app.state.lock().unwrap().dispatch_enabled);
         assert!(dir.canonicalize().unwrap().starts_with(std::env::temp_dir().canonicalize().unwrap()));
         std::fs::remove_dir_all(dir).unwrap();
