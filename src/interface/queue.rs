@@ -53,7 +53,9 @@ impl App {
                 }
             });
             if self.queue_automatic {
-                caption(ui, "큐 자동 진행 중 · 오류가 발생하면 큐를 멈춥니다.");
+                caption(ui, "참여 PC들과 큐를 순차 처리합니다. 다음 작업은 PC 재연결을 확인한 뒤 시작합니다.");
+            } else if self.queue_active.is_some() && self.running {
+                caption(ui, "호스트 준비 완료 · 작업 PC를 연결·선택한 뒤 렌더 시작을 누르세요.");
             }
         });
     }

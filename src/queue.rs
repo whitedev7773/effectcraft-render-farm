@@ -6,6 +6,7 @@ pub(crate) enum Status {
     #[default]
     Pending,
     Preparing,
+    Waiting,
     Rendering,
     Encoding,
     Completed,
@@ -15,13 +16,14 @@ pub(crate) enum Status {
 
 impl Status {
     pub fn in_progress(self) -> bool {
-        matches!(self, Self::Preparing | Self::Rendering | Self::Encoding)
+        matches!(self, Self::Preparing | Self::Waiting | Self::Rendering | Self::Encoding)
     }
 
     pub fn label(self) -> &'static str {
         match self {
             Self::Pending => "대기",
             Self::Preparing => "준비 중",
+            Self::Waiting => "시작 대기",
             Self::Rendering => "렌더링 중",
             Self::Encoding => "MP4 출력 중",
             Self::Completed => "완료",
@@ -134,6 +136,64 @@ pub(crate) fn validate_unique(task: &Task, tasks: &[Task]) -> Result<(), String>
 }
 
 impl App {
+    pub(crate) fn connected_render_workers(&self) -> std::collections::BTreeSet<String> {
+        self.state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .worker_info
+            .values()
+            .filter(|worker| worker.connected && worker.enabled)
+            .map(|worker| worker.ip.clone())
+            .collect()
+    }
+
+    /// The first job waits for an explicit start. Subsequent jobs wait for the
+    /// same participating computers to reconnect before dispatching any frames.
+    pub(crate) fn begin_current_render(&mut self) {
+        if !self.settings.host || !self.running || self.stopping || self.pending_start.is_some() {
+            return;
+        }
+        let workers = self.connected_render_workers();
+        if workers.is_empty() {
+            self.last_error = "렌더링에 사용할 작업 PC를 연결하고 선택하세요".into();
+            return;
+        }
+        let Some(job) = &self.job else { return };
+        if self.state.lock().unwrap_or_else(std::sync::PoisonError::into_inner).dispatch_enabled {
+            return;
+        }
+        if self.queue_active.is_some() {
+            self.queue_automatic = true;
+            self.queue_workers = workers;
+        }
+        self.last_error.clear();
+        farm::begin_render(&self.config(), job, &self.state);
+    }
+
+    fn poll_queue_connections(&mut self) {
+        if !self.queue_automatic || !self.running || self.stopping || self.pending_start.is_some() || self.queue_active.is_none() {
+            return;
+        }
+        self.queue_workers.retain(|ip| !self.settings.disabled_workers.contains(ip));
+        let connected = self.connected_render_workers();
+        let mut state = self.state.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        if state.dispatch_enabled {
+            self.queue_workers.extend(state.worker_info.values().filter(|worker| worker.enabled).map(|worker| worker.ip.clone()));
+            return;
+        }
+        let missing: Vec<_> = self.queue_workers.difference(&connected).cloned().collect();
+        if missing.is_empty() && !connected.is_empty() {
+            drop(state);
+            self.begin_current_render();
+        } else {
+            state.final_status = if missing.is_empty() {
+                "작업 PC 연결 대기 · 사용할 PC를 연결·선택하세요".into()
+            } else {
+                format!("다음 프로젝트 준비 · 참여 PC 재연결 대기: {}", missing.join(", "))
+            };
+        }
+    }
+
     pub(crate) fn enqueue_current(&mut self) {
         if self.settings.queue.len() >= 200 {
             self.last_error = "큐에는 최대 200개 작업을 등록할 수 있습니다".into();
@@ -202,6 +262,7 @@ impl App {
     }
 
     pub(crate) fn poll_queue(&mut self) {
+        self.poll_queue_connections();
         if let Some(id) = self.queue_active {
             let (done, _, _, failed) = farm::progress_snapshot(&self.state);
             let (dispatch, encoding, result, preview, detail) = {
@@ -244,7 +305,7 @@ impl App {
                     } else if dispatch {
                         Status::Rendering
                     } else {
-                        Status::Preparing
+                        Status::Waiting
                     };
                 }
             }
@@ -291,6 +352,112 @@ mod tests {
         let mut app = App::with_state(settings, None, Arc::new(Mutex::new(State::default())));
         app.settings_in_memory = true;
         app
+    }
+
+    fn worker(id: u64, ip: &str, enabled: bool) -> farm::WorkerInfo {
+        farm::WorkerInfo {
+            id,
+            ip: ip.into(),
+            label: format!("PC @ {ip}"),
+            enabled,
+            connected: true,
+            assigned: None,
+            current_done: 0,
+            completed_frames: 0,
+            started: None,
+            fps: 0.0,
+            transferred_bytes: 0,
+            transfer_seconds: 0.0,
+            preview: None,
+            ready: false,
+            profile: String::new(),
+        }
+    }
+
+    fn waiting_app() -> App {
+        let mut app = app();
+        app.running = true;
+        app.queue_active = Some(1);
+        app.job = Some(Job {
+            draft: false,
+            hash: String::new(),
+            comp: "Comp 1".into(),
+            rate: effectcraft_time::FrameRate::FPS_60,
+            total: 90,
+            start: 5,
+            end: 60,
+            width: 1920,
+            height: 1080,
+            output: PathBuf::new(),
+        });
+        app
+    }
+
+    #[test]
+    fn preconnected_workers_wait_for_explicit_first_render_start() {
+        let mut app = waiting_app();
+        {
+            let mut state = app.state.lock().unwrap();
+            state.worker_info.insert(1, worker(1, "127.0.0.1", true));
+            state.worker_info.insert(2, worker(2, "192.168.1.2", true));
+            state.worker_info.insert(3, worker(3, "192.168.1.3", false));
+        }
+        app.poll_queue();
+        assert!(!app.queue_automatic);
+        assert!(!app.state.lock().unwrap().dispatch_enabled);
+        assert_eq!(app.settings.queue[0].status.label(), "시작 대기");
+        app.begin_current_render();
+        assert!(app.queue_automatic);
+        assert!(app.state.lock().unwrap().dispatch_enabled);
+        assert_eq!(app.queue_workers.len(), 2);
+        assert!(app.queue_workers.contains("192.168.1.2"));
+        assert!(!app.queue_workers.contains("192.168.1.3"));
+    }
+
+    #[test]
+    fn render_start_requires_a_connected_enabled_worker_and_ignores_repeat_clicks() {
+        let mut app = waiting_app();
+        app.state.lock().unwrap().worker_info.insert(1, worker(1, "192.168.1.2", false));
+        app.begin_current_render();
+        assert!(!app.queue_automatic);
+        assert!(!app.state.lock().unwrap().dispatch_enabled);
+        app.state.lock().unwrap().worker_info.get_mut(&1).unwrap().enabled = true;
+        app.begin_current_render();
+        let started = app.state.lock().unwrap().started;
+        app.begin_current_render();
+        assert_eq!(app.state.lock().unwrap().started, started);
+        assert!(app.queue_automatic);
+    }
+
+    #[test]
+    fn subsequent_job_waits_for_all_participating_pcs_to_reconnect() {
+        let mut app = waiting_app();
+        app.queue_automatic = true;
+        app.queue_workers.extend(["127.0.0.1".into(), "192.168.1.2".into()]);
+        app.state.lock().unwrap().worker_info.insert(1, worker(1, "127.0.0.1", true));
+        app.poll_queue();
+        assert!(!app.state.lock().unwrap().dispatch_enabled);
+        assert!(app.state.lock().unwrap().final_status.contains("192.168.1.2"));
+        app.state.lock().unwrap().worker_info.insert(2, worker(2, "192.168.1.2", true));
+        app.poll_queue();
+        assert!(app.state.lock().unwrap().dispatch_enabled);
+        assert_eq!(app.queue_workers.len(), 2);
+    }
+
+    #[test]
+    fn explicit_continue_updates_participating_pcs_and_stop_never_dispatches() {
+        let mut app = waiting_app();
+        app.queue_automatic = true;
+        app.queue_workers.extend(["127.0.0.1".into(), "192.168.1.2".into()]);
+        app.state.lock().unwrap().worker_info.insert(1, worker(1, "127.0.0.1", true));
+        app.stopping = true;
+        app.poll_queue();
+        app.begin_current_render();
+        assert!(!app.state.lock().unwrap().dispatch_enabled);
+        app.stopping = false;
+        app.begin_current_render();
+        assert!(app.state.lock().unwrap().dispatch_enabled);
+        assert_eq!(app.queue_workers, std::collections::BTreeSet::from(["127.0.0.1".into()]));
     }
 
     #[test]
@@ -539,7 +706,7 @@ mod tests {
         assert_eq!(job.output, dir.join("2/project-frame-share"));
         assert!(job.output.is_dir());
         assert!(!dir.join("1/project-frame-share").exists());
-        assert!(app.state.lock().unwrap().dispatch_enabled);
+        assert!(!app.state.lock().unwrap().dispatch_enabled);
         assert!(dir.canonicalize().unwrap().starts_with(std::env::temp_dir().canonicalize().unwrap()));
         std::fs::remove_dir_all(dir).unwrap();
     }

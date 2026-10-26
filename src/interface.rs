@@ -254,10 +254,12 @@ impl App {
                     && !self.updater.installing()
                     && self.pending_preview.is_none()
                     && !self.worker_active.load(Ordering::Relaxed);
-                if ui.add_enabled(ready, primary_button("큐 시작").min_size(egui::vec2(130.0, 42.0))).clicked() {
-                    self.queue_automatic = true;
+                if ui.add_enabled(ready, primary_button("호스트 열기").min_size(egui::vec2(130.0, 42.0))).clicked() {
+                    self.queue_automatic = false;
+                    self.queue_workers.clear();
                     self.start_next_queued();
                 }
+                caption(ui, "호스트를 연 뒤 작업 PC를 연결·선택하고 렌더 시작을 누르세요.");
                 return;
             }
             let enabled = !self.updater.installing() && self.pending_preview.is_none() && (!self.settings.host || self.missing_host_settings().is_empty());
@@ -274,13 +276,21 @@ impl App {
         } else {
             ui.horizontal_wrapped(|ui| {
                 let started = self.state.lock().unwrap_or_else(std::sync::PoisonError::into_inner).dispatch_enabled;
+                let enabled_workers = self.connected_render_workers();
                 if self.settings.host
                     && !started
                     && !self.stopping
-                    && ui.add(primary_button("렌더 시작").min_size(egui::vec2(140.0, 40.0))).clicked()
-                    && let Some(job) = &self.job
+                    && ui
+                        .add_enabled(
+                            !enabled_workers.is_empty(),
+                            primary_button(if self.queue_automatic { "연결된 PC로 계속" } else { "렌더 시작" }).min_size(egui::vec2(140.0, 40.0)),
+                        )
+                        .clicked()
                 {
-                    farm::begin_render(&self.config(), job, &self.state);
+                    self.begin_current_render();
+                }
+                if self.settings.host && !started && !self.stopping {
+                    caption(ui, format!("사용할 연결 PC {}대 · PC 상세 정보에서 참여 여부를 선택하세요.", enabled_workers.len()));
                 }
                 if ui.add_enabled(!self.stopping, egui::Button::new("연결 종료").min_size(egui::vec2(100.0, 40.0))).clicked() {
                     self.queue_automatic = false;

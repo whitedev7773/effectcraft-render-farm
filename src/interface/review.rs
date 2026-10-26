@@ -148,6 +148,8 @@ const CASES: &[(&str, f32, f32)] = &[
     ("queue-cards-compact", 560.0, 740.0),
     ("queue-detail", 1440.0, 940.0),
     ("queue-detail-compact", 560.0, 740.0),
+    ("queue-connect", 1440.0, 940.0),
+    ("queue-connect-compact", 560.0, 740.0),
 ];
 
 #[cfg(debug_assertions)]
@@ -187,6 +189,16 @@ impl eframe::App for Capture {
             self.app.preview_open = name == "preview-compact";
             self.app.settings.queue_cards = name.starts_with("queue-cards");
             self.app.queue_detail = name.starts_with("queue-detail").then_some(2);
+            if name.starts_with("queue-connect") {
+                let mut state = self.app.state.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+                state.dispatch_enabled = false;
+                state.started = None;
+                state.final_status = "작업 PC 연결 완료 · 렌더 시작 대기".into();
+                self.app.settings.queue[0].status = crate::queue::Status::Waiting;
+                self.app.settings.queue[0].done = 0;
+                self.app.settings.queue[0].detail = state.final_status.clone();
+                self.app.queue_automatic = false;
+            }
             self.app.inspected = (name == "preview-compact")
                 .then(|| {
                     self.app.state.lock().unwrap_or_else(std::sync::PoisonError::into_inner).worker_info.values().find_map(|worker| worker.preview.clone())
@@ -206,6 +218,57 @@ impl eframe::App for Capture {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn queue_actions_offer_host_connection_before_render_start() {
+        fn text(shape: &egui::Shape, result: &mut String) {
+            match shape {
+                egui::Shape::Text(shape) => result.push_str(&shape.galley.job.text),
+                egui::Shape::Vec(shapes) => {
+                    for shape in shapes {
+                        text(shape, result);
+                    }
+                }
+                _ => {}
+            }
+        }
+        for width in [560.0, 1440.0] {
+            for started in [None, Some(false), Some(true)] {
+                let mut app = fixture();
+                app.running = started.is_some();
+                app.queue_automatic = started == Some(true);
+                app.state.lock().unwrap().dispatch_enabled = started == Some(true);
+                let ctx = egui::Context::default();
+                let input = egui::RawInput { screen_rect: Some(egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(width, 740.0))), ..Default::default() };
+                let output = ctx.run_ui(input, |root| {
+                    egui::CentralPanel::default().show(root, |ui| {
+                        app.action_bar(ui);
+                    });
+                    assert!(root.min_rect().width() <= width + 1.0);
+                });
+                let mut labels = String::new();
+                for shape in &output.shapes {
+                    text(&shape.shape, &mut labels);
+                }
+                match started {
+                    None => {
+                        assert!(labels.contains("호스트 열기"));
+                        assert!(!labels.contains("큐 시작"));
+                    }
+                    Some(false) => {
+                        assert!(labels.contains("렌더 시작"));
+                        assert!(labels.contains("사용할 연결 PC"));
+                    }
+                    Some(true) => {
+                        assert!(!labels.contains("렌더 시작"));
+                        assert!(labels.contains("연결 종료"));
+                    }
+                }
+                assert_eq!(app.state.lock().unwrap().dispatch_enabled, started == Some(true));
+                output.drop_without_applying_deltas();
+            }
+        }
+    }
 
     #[test]
     fn responsive_views_and_modals_fit_at_supported_sizes() {

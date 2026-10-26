@@ -130,6 +130,7 @@ struct App {
     settings_in_memory: bool,
     queue_active: Option<u64>,
     queue_automatic: bool,
+    queue_workers: std::collections::BTreeSet<String>,
     queue_detail: Option<u64>,
     queue_edit: Option<queue::Task>,
     queue_previews: std::collections::BTreeMap<u64, farm::Preview>,
@@ -211,6 +212,7 @@ impl App {
             settings_in_memory: false,
             queue_active: None,
             queue_automatic: false,
+            queue_workers: Default::default(),
             queue_detail: None,
             queue_edit: None,
             queue_previews: Default::default(),
@@ -533,11 +535,6 @@ impl App {
         self.pending_start = None;
         match result {
             Ok(job) => {
-                if self.queue_active.is_some()
-                    && let Some(config) = &self.pending_config
-                {
-                    farm::begin_render(config, &job, &self.state);
-                }
                 self.inspect_frame = job.start;
                 self.monitor = true;
                 self.job = Some(job);
