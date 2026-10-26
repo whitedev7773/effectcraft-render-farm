@@ -4,7 +4,6 @@ use super::*;
 fn fixture() -> App {
     let settings = Settings {
         project: "D:/Studio/Projects/2026/Autumn Campaign/Title Sequence.ecproj".into(),
-        output: "D:/Studio/Renders/Title Sequence/frames".into(),
         final_video: "D:/Studio/Renders/Title Sequence/final.mp4".into(),
         comp: "Title Sequence · Final".into(),
         range_start: 0,

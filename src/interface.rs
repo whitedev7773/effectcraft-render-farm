@@ -119,14 +119,6 @@ fn metric(ui: &mut egui::Ui, label: &str, value: &str) {
 
 impl App {
     pub(super) fn draw_interface(&mut self, root: &mut egui::Ui) {
-        if self.settings.host && self.settings.output.trim().is_empty() {
-            let final_path = PathBuf::from(&self.settings.final_video);
-            if final_path.is_absolute()
-                && let (Some(parent), Some(stem)) = (final_path.parent(), final_path.file_stem())
-            {
-                self.settings.output = parent.join(format!("{}.frames", stem.to_string_lossy())).display().to_string();
-            }
-        }
         let ctx = root.ctx().clone();
         ctx.style_mut_of(egui::Theme::Dark, |style| style.animation_time = if self.settings.reduced_motion { 0.0 } else { 0.24 });
         egui::Panel::bottom("primary-actions")
@@ -341,17 +333,10 @@ impl App {
                     ui.add_space(12.0);
                     self.range_controls(ui);
                     ui.add_space(12.0);
-                    let previous_video = self.settings.final_video.clone();
                     if path_row(ui, "최종 MP4", &mut self.settings.final_video)
                         && let Some(path) = rfd::FileDialog::new().add_filter("MP4 video", &["mp4"]).save_file()
                     {
                         self.settings.final_video = path.display().to_string();
-                    }
-                    if previous_video != self.settings.final_video {
-                        let previous_frames = PathBuf::from(previous_video).with_extension("frames");
-                        if self.settings.output.is_empty() || std::path::Path::new(&self.settings.output) == previous_frames {
-                            self.settings.output = PathBuf::from(&self.settings.final_video).with_extension("frames").display().to_string();
-                        }
                     }
                     ui.add_space(8.0);
                     if ui.button("+ 렌더 큐에 추가").clicked() {
@@ -820,11 +805,7 @@ impl App {
             options.ffmpeg = path.display().to_string();
         }
         ui.add_space(10.0);
-        if path_row(ui, "프레임 저장 폴더 · 고급", &mut self.settings.output)
-            && let Some(path) = rfd::FileDialog::new().pick_folder()
-        {
-            self.settings.output = path.display().to_string();
-        }
+        caption(ui, format!("프레임 저장 폴더 · 자동: {}", settings::frame_output(&self.settings.project).display()));
         ui.add_space(14.0);
         section_title(ui, "작업 분배와 복구");
         ui.horizontal_wrapped(|ui| {

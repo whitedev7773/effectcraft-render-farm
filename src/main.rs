@@ -348,9 +348,6 @@ impl App {
         if self.settings.project.trim().is_empty() {
             missing.push("프로젝트 파일");
         }
-        if self.settings.output.trim().is_empty() {
-            missing.push("호스트 프레임 저장 폴더");
-        }
         if self.settings.final_video.trim().is_empty() {
             missing.push("최종 MP4 저장 위치");
         }
@@ -449,7 +446,7 @@ impl App {
         Config {
             project: PathBuf::from(&s.project),
             cli: PathBuf::from(&s.cli),
-            output: PathBuf::from(&s.output),
+            output: s.frame_output(),
             comp: s.comp.clone(),
             address: if s.host { s.host_address.clone() } else { s.client_address.clone() },
             token: s.token.clone(),
@@ -469,7 +466,7 @@ impl App {
         self.textures.clear();
         self.inspected = None;
         if self.settings.host {
-            let output = PathBuf::from(&self.settings.output);
+            let output = self.settings.frame_output();
             if output.is_absolute()
                 && !output.exists()
                 && let Err(error) = std::fs::create_dir_all(&output)

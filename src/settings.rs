@@ -75,7 +75,6 @@ pub struct Settings {
     pub revision: u64,
     pub project: String,
     pub cli: String,
-    pub output: String,
     pub comp: String,
     pub host_address: String,
     pub client_address: String,
@@ -106,7 +105,6 @@ impl Default for Settings {
             revision: 0,
             project: String::new(),
             cli: String::new(),
-            output: String::new(),
             comp: String::new(),
             host_address: "0.0.0.0:9778".into(),
             client_address: String::new(),
@@ -129,6 +127,10 @@ impl Default for Settings {
 }
 
 impl Settings {
+    pub fn frame_output(&self) -> PathBuf {
+        frame_output(&self.project)
+    }
+
     pub fn effective_chunk_frames(&self, total_frames: i64) -> Result<i64, String> {
         let end = if self.range_end == 0 { total_frames } else { self.range_end };
         if !(1..=100_000).contains(&total_frames) || self.range_start < 0 || end <= self.range_start || end > total_frames {
@@ -156,6 +158,11 @@ impl Settings {
         }
         Ok(frames)
     }
+}
+
+/// Derive the host frame directory from the selected project, never from an MP4 or saved setting.
+pub fn frame_output(project: &str) -> PathBuf {
+    PathBuf::from(project).parent().unwrap_or_else(|| std::path::Path::new("")).join("frame-share")
 }
 
 fn directory() -> Result<PathBuf, String> {

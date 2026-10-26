@@ -189,11 +189,7 @@ impl App {
                     {
                         edit.final_video = path.display().to_string();
                     }
-                    if path_row(ui, "프레임 저장 폴더", &mut edit.output)
-                        && let Some(path) = rfd::FileDialog::new().pick_folder()
-                    {
-                        edit.output = path.display().to_string();
-                    }
+                    caption(ui, format!("프레임 저장 폴더 · 자동: {}", settings::frame_output(&edit.project).display()));
                     ui.horizontal_wrapped(|ui| {
                         ui.checkbox(&mut edit.render.automatic, "자동 최적화");
                         ui.checkbox(&mut edit.render.draft, "Draft 품질");
