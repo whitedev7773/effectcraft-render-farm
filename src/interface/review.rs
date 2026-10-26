@@ -77,6 +77,22 @@ fn fixture() -> App {
     });
     app.running = true;
     app.monitor = true;
+    let mut task = crate::queue::Task::capture(1, &app.settings, app.catalog[0].clone());
+    task.status = crate::queue::Status::Rendering;
+    task.done = 86;
+    task.detail = "프레임 렌더링 중".into();
+    app.settings.queue.push(task.clone());
+    app.queue_active = Some(1);
+    app.queue_previews.insert(1, preview);
+    for id in 2..=4 {
+        let mut waiting = task.clone();
+        waiting.id = id;
+        waiting.composition.name = format!("Scene {id} · Final");
+        waiting.status = crate::queue::Status::Pending;
+        waiting.done = 0;
+        waiting.detail.clear();
+        app.settings.queue.push(waiting);
+    }
     app
 }
 
@@ -129,6 +145,10 @@ const CASES: &[(&str, f32, f32)] = &[
     ("logs-compact", 560.0, 740.0),
     ("worker-compact", 560.0, 740.0),
     ("preview-compact", 780.0, 850.0),
+    ("queue-cards", 1440.0, 940.0),
+    ("queue-cards-compact", 560.0, 740.0),
+    ("queue-detail", 1440.0, 940.0),
+    ("queue-detail-compact", 560.0, 740.0),
 ];
 
 #[cfg(debug_assertions)]
@@ -166,6 +186,8 @@ impl eframe::App for Capture {
             self.app.logs_open = name.starts_with("logs");
             self.app.worker_details = (name == "worker-compact").then_some(2);
             self.app.preview_open = name == "preview-compact";
+            self.app.settings.queue_cards = name.starts_with("queue-cards");
+            self.app.queue_detail = name.starts_with("queue-detail").then_some(2);
             self.app.inspected = (name == "preview-compact")
                 .then(|| {
                     self.app.state.lock().unwrap_or_else(std::sync::PoisonError::into_inner).worker_info.values().find_map(|worker| worker.preview.clone())
@@ -190,7 +212,7 @@ mod tests {
     fn responsive_views_and_modals_fit_at_supported_sizes() {
         let prototype = fixture();
         for width in [560.0, 780.0, 1120.0, 1440.0, 1920.0, 2560.0] {
-            for view in 0_u8..9 {
+            for view in 0_u8..12 {
                 let mut app = App::with_state(prototype.settings.clone(), None, prototype.state.clone());
                 app.catalog = prototype.catalog.clone();
                 app.job = prototype.job.clone();
@@ -202,6 +224,9 @@ mod tests {
                 app.logs_open = view == 6;
                 app.worker_details = (view == 7).then_some(1);
                 app.preview_open = view == 8;
+                app.settings.queue_cards = view >= 9;
+                app.queue_previews = prototype.queue_previews.clone();
+                app.queue_detail = (view >= 10).then_some(if view == 10 { 1 } else { 2 });
                 let ctx = egui::Context::default();
                 for frame in 0..3 {
                     let input = egui::RawInput {

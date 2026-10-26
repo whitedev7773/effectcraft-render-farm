@@ -66,6 +66,8 @@ impl RenderOptions {
 #[derive(Clone, PartialEq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct Settings {
+    pub queue: Vec<crate::queue::Task>,
+    pub queue_cards: bool,
     pub reduced_motion: bool,
     #[serde(default)]
     pub gpu_defaults_applied: bool,
@@ -96,6 +98,8 @@ pub struct Settings {
 impl Default for Settings {
     fn default() -> Self {
         Self {
+            queue: Vec::new(),
+            queue_cards: false,
             gpu_defaults_applied: true,
             reduced_motion: false,
             check_updates: true,
@@ -181,7 +185,7 @@ fn read_slot(path: &std::path::Path) -> Result<Option<(Settings, std::time::Syst
         return Ok(None);
     }
     let metadata = std::fs::metadata(path).map_err(|e| format!("설정 정보 읽기: {e}"))?;
-    if metadata.len() > 128_000 {
+    if metadata.len() > 4_000_000 {
         return Err(format!("설정 파일이 너무 큽니다: {}", path.display()));
     }
     let bytes = std::fs::read(path).map_err(|e| format!("설정 읽기: {e}"))?;

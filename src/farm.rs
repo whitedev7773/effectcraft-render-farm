@@ -101,7 +101,7 @@ pub struct Job {
     pub output: PathBuf,
 }
 
-#[derive(Clone)]
+#[derive(Clone, PartialEq, Serialize, Deserialize)]
 pub struct CompInfo {
     pub name: String,
     pub frames: i64,
@@ -226,6 +226,10 @@ pub struct Preview {
 
 #[derive(Default)]
 pub struct State {
+    pub queue_session: bool,
+    pub remote_queue: bool,
+    pub coordinator_active: bool,
+    pub final_result: Option<Result<(), String>>,
     chunks: Vec<Chunk>,
     pub messages: Vec<String>,
     pub workers: usize,
@@ -243,6 +247,7 @@ pub struct State {
     pub log_path: Option<PathBuf>,
     log_error_reported: bool,
     pub local_preview: Option<Preview>,
+    pub latest_preview: Option<Preview>,
     pub local_profile: String,
     pub started: Option<Instant>,
     pub finished_elapsed: Option<Duration>,
@@ -322,6 +327,8 @@ enum Message {
     },
     Ready {
         comp: String,
+        #[serde(default)]
+        queue: bool,
     },
     Bundle {
         options: RenderOptions,
@@ -953,7 +960,11 @@ pub fn start_coordinator(config: Config, state: Shared, stop: Arc<AtomicBool>) -
         s.bundle = Arc::new(OnceLock::new());
         s.started = None;
         s.finished_elapsed = None;
+        s.final_result = None;
+        s.coordinator_active = true;
         s.local_preview = None;
+        s.latest_preview = None;
+        s.local_progress = None;
     }
     log(&state, format!("호스트 시작: {} / {}–{}프레임", config.address, job.start, job.end));
     log(
@@ -970,14 +981,19 @@ pub fn start_coordinator(config: Config, state: Shared, stop: Arc<AtomicBool>) -
             config.render.video_bitrate
         ),
     );
-    match listener.local_addr() {
-        Ok(address) => {
-            if let Err(error) = crate::discovery::start_responder(address, stop.clone()) {
+    let discovery = match listener.local_addr() {
+        Ok(address) => match crate::discovery::start_responder(address, stop.clone()) {
+            Ok(handle) => Some(handle),
+            Err(error) => {
                 log(&state, format!("자동 LAN 검색을 사용할 수 없습니다: {error}"));
+                None
             }
+        },
+        Err(error) => {
+            log(&state, format!("LAN 검색 주소 확인 실패: {error}"));
+            None
         }
-        Err(error) => log(&state, format!("LAN 검색 주소 확인 실패: {error}")),
-    }
+    };
     let server_job = job.clone();
     let server_state = state.clone();
     let server_stop = stop.clone();
@@ -1003,6 +1019,11 @@ pub fn start_coordinator(config: Config, state: Shared, stop: Arc<AtomicBool>) -
                 }
             }
         }
+        drop(listener);
+        if let Some(discovery) = discovery {
+            let _ = discovery.join();
+        }
+        lock(&server_state).coordinator_active = false;
         log(&server_state, "서버 종료");
     });
     Ok(job)
@@ -1247,7 +1268,8 @@ fn serve_worker(mut stream: TcpStream, peer: SocketAddr, config: &Config, job: &
             return Err(detail.into());
         }
     };
-    if let Err(error) = send(&mut stream, &Message::Ready { comp: job.comp.clone() }) {
+    let queue = lock(state).queue_session;
+    if let Err(error) = send(&mut stream, &Message::Ready { comp: job.comp.clone(), queue }) {
         let mut s = lock(state);
         s.workers = s.workers.saturating_sub(1);
         s.worker_info.remove(&worker_id);
@@ -1380,8 +1402,11 @@ fn serve_worker(mut stream: TcpStream, peer: SocketAddr, config: &Config, job: &
                     let mut jpeg = vec![0; len];
                     reader.read_exact(&mut jpeg).map_err(|e| format!("미리보기 수신: {e}"))?;
                     validate_preview(&jpeg)?;
-                    if let Some(info) = lock(state).worker_info.get_mut(&worker_id) {
-                        info.preview = Some(Preview { frame, jpeg: Arc::new(jpeg) });
+                    let preview = Preview { frame, jpeg: Arc::new(jpeg) };
+                    let mut s = lock(state);
+                    s.latest_preview = Some(preview.clone());
+                    if let Some(info) = s.worker_info.get_mut(&worker_id) {
+                        info.preview = Some(preview);
                     }
                 }
                 Ok(Message::Frame { frame, len, sha256 }) if assigned.is_some() => {
@@ -1510,7 +1535,10 @@ pub fn run_worker(config: Config, state: Shared, stop: Arc<AtomicBool>) -> Resul
     let name = std::env::var("COMPUTERNAME").or_else(|_| std::env::var("HOSTNAME")).unwrap_or_else(|_| "worker".into());
     send(&mut stream, &Message::Hello { token: config.token.clone(), name, protocol: PROTOCOL_VERSION })?;
     let comp = match receive(&mut reader)? {
-        Message::Ready { comp } => comp,
+        Message::Ready { comp, queue } => {
+            lock(&state).remote_queue = queue;
+            comp
+        }
         Message::Error { detail } => return Err(detail),
         _ => return Err("서버 인증 응답이 잘못됐습니다".into()),
     };
@@ -1873,6 +1901,7 @@ fn maybe_start_assembly(config: &Config, job: &Job, state: &Shared) {
             .unwrap_or_else(|_| Err("최종 영상 합치기 중 예상하지 못한 오류가 발생했습니다".into()));
         let mut s = lock(&state);
         s.finished_elapsed = s.started.map(|at| at.elapsed());
+        s.final_result = Some(result.clone());
         match result {
             Ok(()) => {
                 s.final_status = format!("최종 영상 완료: {}", config.final_video.display());
@@ -2371,7 +2400,7 @@ mod tests {
         let server = thread::spawn(move || serve_worker(stream, peer, &server_config, &server_job, &server_state, &AtomicBool::new(false)));
         let mut reader = BufReader::new(client.try_clone().unwrap());
         send(&mut client, &Message::Hello { token: "password".into(), name: "test-worker".into(), protocol: PROTOCOL_VERSION }).unwrap();
-        assert!(matches!(receive(&mut reader), Ok(Message::Ready { comp }) if comp == "Test"));
+        assert!(matches!(receive(&mut reader), Ok(Message::Ready { comp, .. }) if comp == "Test"));
         thread::sleep(Duration::from_millis(100));
         send(&mut client, &Message::Request).unwrap();
         assert!(matches!(receive(&mut reader), Ok(Message::Wait)));
@@ -2631,7 +2660,7 @@ mod tests {
         first.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
         let mut first_reader = BufReader::new(first.try_clone().unwrap());
         send(&mut first, &Message::Hello { token: "password".into(), name: "first".into(), protocol: PROTOCOL_VERSION }).unwrap();
-        assert!(matches!(receive(&mut first_reader), Ok(Message::Ready { comp }) if comp == "Test"));
+        assert!(matches!(receive(&mut first_reader), Ok(Message::Ready { comp, .. }) if comp == "Test"));
         send(&mut first, &Message::Request).unwrap();
         receive_test_bundle(&mut first_reader);
         send(&mut first, &Message::Request).unwrap();
@@ -2640,7 +2669,7 @@ mod tests {
         second.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
         let mut second_reader = BufReader::new(second.try_clone().unwrap());
         send(&mut second, &Message::Hello { token: "password".into(), name: "second".into(), protocol: PROTOCOL_VERSION }).unwrap();
-        assert!(matches!(receive(&mut second_reader), Ok(Message::Ready { comp }) if comp == "Test"));
+        assert!(matches!(receive(&mut second_reader), Ok(Message::Ready { comp, .. }) if comp == "Test"));
         send(&mut second, &Message::Request).unwrap();
         assert!(matches!(receive(&mut second_reader), Ok(Message::Wait)));
         send_test_frames(&mut first, 0, 2);

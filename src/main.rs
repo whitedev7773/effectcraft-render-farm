@@ -6,6 +6,7 @@ mod encoding;
 mod farm;
 mod installation;
 mod interface;
+mod queue;
 mod resources;
 mod settings;
 mod updater;
@@ -125,6 +126,13 @@ fn range_bar(ui: &mut egui::Ui, start: &mut i64, end: &mut i64, total: i64, work
 }
 
 struct App {
+    #[cfg(test)]
+    settings_in_memory: bool,
+    queue_active: Option<u64>,
+    queue_automatic: bool,
+    queue_detail: Option<u64>,
+    queue_edit: Option<queue::Task>,
+    queue_previews: std::collections::BTreeMap<u64, farm::Preview>,
     updater: updater::Updater,
     updater_logged_status: String,
     settings: Settings,
@@ -189,9 +197,23 @@ impl Default for App {
 
 impl App {
     fn with_state(settings: Settings, warning: Option<String>, state: Shared) -> Self {
+        let mut settings = settings;
+        for task in &mut settings.queue {
+            if task.status.in_progress() {
+                task.status = queue::Status::Interrupted;
+                task.detail = "앱이 종료되어 작업이 중단됐습니다. 재대기하면 저장된 프레임부터 이어서 렌더합니다.".into();
+            }
+        }
         let catalog_path = settings.project.clone();
         let catalog_changed = (!catalog_path.is_empty()).then(Instant::now);
         Self {
+            #[cfg(test)]
+            settings_in_memory: false,
+            queue_active: None,
+            queue_automatic: false,
+            queue_detail: None,
+            queue_edit: None,
+            queue_previews: Default::default(),
             updater: updater::Updater::default(),
             updater_logged_status: String::new(),
             settings,
@@ -477,7 +499,7 @@ impl App {
         } else {
             self.settings.chunk_frames
         };
-        if let Err(e) = settings::save(&mut self.settings) {
+        if let Err(e) = self.persist_settings() {
             self.last_error = e;
             return;
         }
@@ -486,6 +508,7 @@ impl App {
         self.stop = Arc::new(AtomicBool::new(false));
         self.stopping = false;
         if self.settings.host {
+            self.state.lock().unwrap_or_else(std::sync::PoisonError::into_inner).queue_session = self.queue_active.is_some();
             let (sender, receiver) = mpsc::channel();
             self.pending_config = Some(config.clone());
             self.pending_start = Some(receiver);
@@ -513,6 +536,11 @@ impl App {
         self.pending_start = None;
         match result {
             Ok(job) => {
+                if self.queue_active.is_some()
+                    && let Some(config) = &self.pending_config
+                {
+                    farm::begin_render(config, &job, &self.state);
+                }
                 self.inspect_frame = job.start;
                 self.monitor = true;
                 self.job = Some(job);
@@ -529,8 +557,11 @@ impl App {
                 }
             }
             Err(e) => {
-                self.last_error = e;
+                self.last_error = e.clone();
                 self.pending_config = None;
+                if self.queue_active.is_some() {
+                    self.fail_queued(e);
+                }
             }
         }
     }
@@ -539,20 +570,49 @@ impl App {
         let state = self.state.clone();
         let stop = self.stop.clone();
         let active = self.worker_active.clone();
+        let reconnect = !self.settings.host;
         active.store(true, Ordering::Relaxed);
         thread::spawn(move || {
-            let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| farm::run_worker(config, state.clone(), stop)))
-                .unwrap_or_else(|_| Err("클라이언트 작업 중 예상하지 못한 오류가 발생했습니다".into()));
-            if let Err(e) = result {
-                let mut s = state.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
-                s.note(format!("클라이언트 오류: {e}"));
+            let mut completed_session = false;
+            loop {
+                let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| farm::run_worker(config.clone(), state.clone(), stop.clone())))
+                    .unwrap_or_else(|_| Err("클라이언트 작업 중 예상하지 못한 오류가 발생했습니다".into()));
+                match result {
+                    Ok(()) if reconnect && !stop.load(Ordering::Relaxed) && state.lock().unwrap_or_else(std::sync::PoisonError::into_inner).remote_queue => {
+                        completed_session = true;
+                        state.lock().unwrap_or_else(std::sync::PoisonError::into_inner).final_status = "다음 큐 작업 연결 대기".into();
+                    }
+                    Err(_) if reconnect && completed_session && !stop.load(Ordering::Relaxed) => {}
+                    Err(e) => {
+                        state.lock().unwrap_or_else(std::sync::PoisonError::into_inner).note(format!("클라이언트 오류: {e}"));
+                        break;
+                    }
+                    Ok(()) => break,
+                }
+                for _ in 0..30 {
+                    if stop.load(Ordering::Relaxed) {
+                        break;
+                    }
+                    thread::sleep(Duration::from_millis(100));
+                }
+                if stop.load(Ordering::Relaxed) {
+                    break;
+                }
             }
             active.store(false, Ordering::Relaxed);
         });
     }
 
+    fn persist_settings(&mut self) -> Result<(), String> {
+        #[cfg(test)]
+        if self.settings_in_memory {
+            return Ok(());
+        }
+        settings::save(&mut self.settings)
+    }
+
     fn save_settings(&mut self) {
-        if let Err(e) = settings::save(&mut self.settings) {
+        if let Err(e) = self.persist_settings() {
             self.last_error = e;
         }
     }
@@ -596,14 +656,18 @@ impl eframe::App for App {
         {
             self.start_discovery();
         }
-        let before = self.settings.clone();
         if self.stopping {
             let connected = farm::progress_snapshot(&self.state).2;
-            if connected == 0 && !self.worker_active.load(Ordering::Relaxed) {
+            let state = self.state.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+            let host_stopped = !self.settings.host || (!state.coordinator_active && (!state.assembly_started || state.final_result.is_some()));
+            drop(state);
+            if connected == 0 && !self.worker_active.load(Ordering::Relaxed) && host_stopped {
                 self.running = false;
                 self.stopping = false;
             }
         }
+        self.poll_queue();
+        let before = self.settings.clone();
         self.draw_interface(ui);
         self.update_ui(ui);
         if self.last_error != self.last_logged_error {

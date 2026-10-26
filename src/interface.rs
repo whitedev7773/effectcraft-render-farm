@@ -1,4 +1,5 @@
 use super::*;
+mod queue;
 
 #[cfg(any(test, debug_assertions))]
 pub(super) mod review;
@@ -176,7 +177,13 @@ impl App {
                 ui.scope_builder(egui::UiBuilder::new().max_rect(right_rect), |ui| {
                     ui.set_width(right_rect.width());
                     ui.set_clip_rect(right_rect.intersect(ui.clip_rect()));
-                    egui::ScrollArea::vertical().id_salt("monitor-scroll").auto_shrink([false, false]).show(ui, |ui| self.monitor_panel(ui));
+                    egui::ScrollArea::vertical().id_salt("monitor-scroll").auto_shrink([false, false]).show(ui, |ui| {
+                        if self.settings.host {
+                            self.queue_panel(ui);
+                            ui.add_space(14.0);
+                        }
+                        self.monitor_panel(ui);
+                    });
                 });
             } else {
                 let page_id = egui::Id::new("active-compact-page");
@@ -189,6 +196,10 @@ impl App {
                 egui::ScrollArea::vertical().id_salt(("compact", self.monitor)).auto_shrink([false, false]).show(ui, |ui| {
                     let reveal = motion(ui.ctx(), egui::Id::new(("page-reveal", self.monitor)), 1.0, self.settings.reduced_motion);
                     ui.set_opacity(reveal);
+                    if self.settings.host {
+                        self.queue_panel(ui);
+                        ui.add_space(14.0);
+                    }
                     if self.monitor {
                         self.monitor_panel(ui);
                     } else {
@@ -200,6 +211,7 @@ impl App {
         self.settings_dialog(&ctx);
         self.logs_dialog(&ctx);
         self.worker_dialog(&ctx);
+        self.queue_dialog(&ctx);
     }
 
     fn toolbar(&mut self, ui: &mut egui::Ui, wide: bool) {
@@ -245,6 +257,17 @@ impl App {
                 ui.label("프로젝트와 소스를 준비하고 있습니다…");
             });
         } else if !self.running {
+            if self.settings.host && !self.settings.queue.is_empty() {
+                let ready = self.settings.queue.iter().any(|task| task.status == crate::queue::Status::Pending)
+                    && !self.updater.installing()
+                    && self.pending_preview.is_none()
+                    && !self.worker_active.load(Ordering::Relaxed);
+                if ui.add_enabled(ready, primary_button("큐 시작").min_size(egui::vec2(130.0, 42.0))).clicked() {
+                    self.queue_automatic = true;
+                    self.start_next_queued();
+                }
+                return;
+            }
             let enabled = !self.updater.installing() && self.pending_preview.is_none() && (!self.settings.host || self.missing_host_settings().is_empty());
             let response = ui.add_enabled(
                 enabled,
@@ -268,6 +291,7 @@ impl App {
                     farm::begin_render(&self.config(), job, &self.state);
                 }
                 if ui.add_enabled(!self.stopping, egui::Button::new("연결 종료").min_size(egui::vec2(100.0, 40.0))).clicked() {
+                    self.queue_automatic = false;
                     self.stop.store(true, Ordering::Relaxed);
                     self.stopping = true;
                 }
@@ -317,11 +341,23 @@ impl App {
                     ui.add_space(12.0);
                     self.range_controls(ui);
                     ui.add_space(12.0);
+                    let previous_video = self.settings.final_video.clone();
                     if path_row(ui, "최종 MP4", &mut self.settings.final_video)
                         && let Some(path) = rfd::FileDialog::new().add_filter("MP4 video", &["mp4"]).save_file()
                     {
                         self.settings.final_video = path.display().to_string();
                     }
+                    if previous_video != self.settings.final_video {
+                        let previous_frames = PathBuf::from(previous_video).with_extension("frames");
+                        if self.settings.output.is_empty() || std::path::Path::new(&self.settings.output) == previous_frames {
+                            self.settings.output = PathBuf::from(&self.settings.final_video).with_extension("frames").display().to_string();
+                        }
+                    }
+                    ui.add_space(8.0);
+                    if ui.button("+ 렌더 큐에 추가").clicked() {
+                        self.enqueue_current();
+                    }
+                    caption(ui, "프로젝트·컴포지션과 출력 위치를 바꿔 여러 작업을 추가하세요.");
                 } else {
                     text_row(ui, "호스트 주소", &mut self.settings.client_address, false);
                     caption(ui, "예: 192.168.0.10:9778");

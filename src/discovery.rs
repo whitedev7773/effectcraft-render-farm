@@ -73,18 +73,18 @@ fn respond(socket: &UdpSocket, response: &[u8]) -> Result<(), String> {
 
 /// Start the LAN responder after the TCP coordinator is ready. Discovery is optional;
 /// an unavailable UDP port must not prevent rendering through a manually entered IP.
-pub fn start_responder(tcp_address: SocketAddr, stop: Arc<AtomicBool>) -> Result<(), String> {
+pub fn start_responder(tcp_address: SocketAddr, stop: Arc<AtomicBool>) -> Result<thread::JoinHandle<()>, String> {
     let socket = UdpSocket::bind(("0.0.0.0", DISCOVERY_PORT)).map_err(|e| format!("LAN 검색 포트 {DISCOVERY_PORT}: {e}"))?;
     socket.set_read_timeout(Some(Duration::from_millis(250))).map_err(|e| format!("LAN 검색 수신 설정: {e}"))?;
     let response = reply_bytes(tcp_address.port(), tcp_address.ip(), host_name())?;
-    thread::spawn(move || {
+    let handle = thread::spawn(move || {
         while !stop.load(Ordering::Relaxed) {
             if respond(&socket, &response).is_err() {
                 thread::sleep(Duration::from_millis(250));
             }
         }
     });
-    Ok(())
+    Ok(handle)
 }
 
 fn scan_targets(targets: &[SocketAddr], timeout: Duration) -> Result<Vec<Host>, String> {
