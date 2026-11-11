@@ -16,119 +16,109 @@ impl App {
         self.queue_edit = self.settings.queue.iter().find(|task| task.id == id).cloned();
     }
 
-    pub(super) fn queue_panel(&mut self, ui: &mut egui::Ui) {
-        card().show(ui, |ui| {
-            ui.set_width(ui.available_width());
-            ui.horizontal_wrapped(|ui| {
-                section_title(ui, "렌더 큐");
-                let pending = self.settings.queue.iter().filter(|task| task.status == Status::Pending).count();
-                caption(ui, format!("{}개 작업 · 대기 {pending}개", self.settings.queue.len()));
-                ui.selectable_value(&mut self.settings.queue_cards, false, "리스트");
-                ui.selectable_value(&mut self.settings.queue_cards, true, "카드");
-            });
-            if self.settings.queue.is_empty() {
-                ui.add_space(12.0);
-                ui.label("프로젝트와 컴포지션을 선택해 렌더 큐에 추가하세요.");
-                caption(ui, "작업마다 별도 설정을 저장하며, 최종 MP4 출력 후 다음 작업으로 진행합니다.");
-                return;
-            }
-            caption(ui, "항목을 선택하면 렌더 설정·진행 상태·프레임을 확인할 수 있습니다.");
-            let tasks = self.settings.queue.clone();
-            let columns = if self.settings.queue_cards { ((ui.available_width() + 12.0) / 250.0).floor().max(1.0) as usize } else { 1 };
-            egui::ScrollArea::vertical().id_salt("render-queue").max_height(if self.settings.queue_cards { 370.0 } else { 270.0 }).show(ui, |ui| {
-                if self.settings.queue_cards {
-                    // Reserve a few pixels for fractional column rounding and the scroll bar.
-                    ui.set_width((ui.available_width() - 8.0).max(1.0));
-                    for row in tasks.chunks(columns) {
-                        ui.columns(columns, |columns| {
-                            for (column, task) in columns.iter_mut().zip(row) {
-                                column.push_id(task.id, |ui| self.queue_item(ui, task, true));
-                            }
-                        });
-                    }
-                } else {
-                    for task in &tasks {
-                        ui.push_id(task.id, |ui| self.queue_item(ui, task, false));
-                    }
-                }
-            });
-            if self.queue_automatic {
-                caption(ui, "참여 PC들과 큐를 순차 처리합니다. 다음 작업은 PC 재연결을 확인한 뒤 시작합니다.");
-            } else if self.queue_active.is_some() && self.running {
-                caption(ui, "호스트 준비 완료 · 작업 PC를 연결·선택한 뒤 렌더 시작을 누르세요.");
-            }
+    pub(super) fn queue_panel(&mut self, ui: &mut egui::Ui, height: f32) {
+        ui.horizontal_wrapped(|ui| {
+            section_title(ui, "렌더 큐");
+            let pending = self.settings.queue.iter().filter(|task| task.status == Status::Pending).count();
+            caption(ui, format!("{}개 작업 · 대기 {pending}개", self.settings.queue.len()));
+            ui.selectable_value(&mut self.settings.queue_cards, false, "리스트");
+            ui.selectable_value(&mut self.settings.queue_cards, true, "카드");
         });
+        if self.settings.queue.is_empty() {
+            ui.add_space(layout::SPACE);
+            ui.label("등록된 렌더 작업이 없습니다.");
+            caption(ui, "프로젝트와 컴포지션, 출력 파일을 준비한 뒤 렌더 큐에 추가하세요.");
+            for (label, ready) in [
+                ("프로젝트", !self.settings.project.is_empty()),
+                ("컴포지션", !self.settings.comp.is_empty()),
+                ("출력 파일", !self.settings.final_video.is_empty()),
+            ] {
+                layout::value_row(ui, label, if ready { "준비됨" } else { "선택 전" });
+            }
+            return;
+        }
+        let tasks = self.settings.queue.clone();
+        let cards = self.settings.queue_cards;
+        let columns = if cards { ((ui.available_width() + layout::GAP) / 272.0).floor().clamp(1.0, 3.0) as usize } else { 1 };
+        let rows = tasks.len().div_ceil(columns);
+        let item_height = if cards {
+            let smallest_row = (tasks.len() / rows).max(1);
+            let widest_cell = (ui.available_width() - layout::GAP * (smallest_row - 1) as f32) / smallest_row as f32;
+            let media_height = (widest_cell - layout::PADDING as f32 * 2.0) * 9.0 / 16.0;
+            ((media_height + 216.0) / layout::SPACE).ceil() * layout::SPACE
+        } else {
+            216.0
+        };
+        let height = (rows as f32 * item_height + rows.saturating_sub(1) as f32 * layout::GAP).max(height - 44.0);
+        let (rect, _) = ui.allocate_exact_size(egui::vec2(ui.available_width(), height), egui::Sense::hover());
+        for (task, rect) in tasks.iter().zip(layout::grid_cells(rect, tasks.len(), columns, item_height)) {
+            layout::tile(ui, rect, ("queue-item", task.id), true, |ui| self.queue_item(ui, task, cards, rect.height() - layout::PADDING as f32 * 2.0));
+        }
     }
 
-    fn queue_item(&mut self, ui: &mut egui::Ui, task: &Task, cards: bool) {
+    fn queue_item(&mut self, ui: &mut egui::Ui, task: &Task, cards: bool, height: f32) {
+        let top = ui.cursor().top();
         let active = self.queue_active == Some(task.id);
-        let frame =
-            egui::Frame::new().fill(SURFACE_SECONDARY).stroke(egui::Stroke::new(1.0, if active { BLUE } else { BORDER })).corner_radius(12).inner_margin(12);
-        frame.show(ui, |ui| {
-            ui.set_width(ui.available_width());
-            let title = format!("{}  ·  {}", task.composition.name, task.status.label());
-            if ui
-                .add(
-                    egui::Button::new(egui::RichText::new(title).color(if active { egui::Color32::WHITE } else { status_color(task.status) }))
-                        .wrap()
-                        .selected(active),
-                )
-                .clicked()
-            {
+        ui.horizontal(|ui| {
+            let width = (ui.available_width() - 88.0).max(80.0);
+            let (rect, response) = ui.allocate_exact_size(egui::vec2(width, layout::CONTROL), egui::Sense::click());
+            let mut title = ui.new_child(egui::UiBuilder::new().max_rect(rect).layout(egui::Layout::left_to_right(egui::Align::Center)));
+            title.set_clip_rect(rect.intersect(ui.clip_rect()));
+            title.add(egui::Label::new(egui::RichText::new(&task.composition.name).strong()).truncate());
+            if response.on_hover_text(&task.composition.name).on_hover_cursor(egui::CursorIcon::PointingHand).clicked() {
                 self.open_queue_task(task.id);
             }
-            let name = std::path::Path::new(&task.project).file_name().unwrap_or_default().to_string_lossy();
-            ui.add(egui::Label::new(egui::RichText::new(name).size(12.0).color(MUTED)).truncate()).on_hover_text(&task.project);
-            if cards {
-                if let Some(preview) = self.queue_previews.get(&task.id).cloned() {
-                    self.show_preview_sized(ui, u64::MAX / 2 + task.id, &preview, 135.0);
-                } else {
-                    let (rect, _) = ui.allocate_exact_size(egui::vec2(ui.available_width(), 112.0), egui::Sense::hover());
-                    ui.painter().rect_filled(rect, 8.0, BACKGROUND);
-                    ui.painter().text(
-                        rect.center(),
-                        egui::Align2::CENTER_CENTER,
-                        if task.status.in_progress() { "첫 프레임 수신 대기" } else { "프레임 미리보기 대기" },
-                        egui::FontId::proportional(12.0),
-                        MUTED,
-                    );
-                }
-            }
-            let total = (task.range_end - task.range_start).max(1);
-            ui.add(
-                egui::ProgressBar::new((task.done as f32 / total as f32).clamp(0.0, 1.0))
-                    .desired_width(ui.available_width())
-                    .text(format!("{} / {total} 프레임", task.done)),
-            );
-            if !task.detail.is_empty() {
-                ui.add(egui::Label::new(egui::RichText::new(&task.detail).size(12.0).color(MUTED)).truncate()).on_hover_text(&task.detail);
-            }
-            ui.horizontal_wrapped(|ui| {
-                if ui.small_button("상세 설정").clicked() {
-                    self.open_queue_task(task.id);
-                }
-                let movable = task.status == Status::Pending && !active;
-                let index = self.settings.queue.iter().position(|entry| entry.id == task.id).unwrap_or(0);
-                if ui
-                    .add_enabled(movable && index > 0 && !self.settings.queue[index - 1].status.in_progress(), egui::Button::new("↑").small())
-                    .on_hover_text("순서 올리기")
-                    .clicked()
-                {
-                    self.settings.queue.swap(index, index - 1);
-                }
-                if ui
-                    .add_enabled(
-                        movable && index + 1 < self.settings.queue.len() && !self.settings.queue.get(index + 1).is_some_and(|entry| entry.status.in_progress()),
-                        egui::Button::new("↓").small(),
-                    )
-                    .on_hover_text("순서 내리기")
-                    .clicked()
-                {
-                    self.settings.queue.swap(index, index + 1);
-                }
-            });
+            badge(ui, task.status.label(), status_color(task.status));
         });
-        ui.add_space(6.0);
+        let name = std::path::Path::new(&task.project).file_name().unwrap_or_default().to_string_lossy();
+        ui.add(egui::Label::new(egui::RichText::new(name).size(12.0).color(MUTED)).truncate()).on_hover_text(&task.project);
+        if cards {
+            let preview = self.queue_previews.get(&task.id).cloned();
+            self.dashboard_image(ui, u64::MAX / 2 + task.id, preview.as_ref(), (height - 184.0).max(128.0));
+        }
+        let total = (task.range_end - task.range_start).max(1);
+        ui.add(egui::ProgressBar::new((task.done as f32 / total as f32).clamp(0.0, 1.0)).desired_height(6.0));
+        caption(ui, format!("{} / {total} 프레임", task.done));
+        let detail = if task.detail.is_empty() {
+            format!("{} × {} · {}–{} 프레임", task.composition.width, task.composition.height, task.range_start, task.range_end)
+        } else {
+            task.detail.clone()
+        };
+        ui.add(egui::Label::new(egui::RichText::new(&detail).size(12.0).color(MUTED)).truncate()).on_hover_text(&detail);
+        ui.add_space((top + height - layout::CONTROL - ui.cursor().top()).max(0.0));
+        let (footer, _) = ui.allocate_exact_size(egui::vec2(ui.available_width(), layout::CONTROL), egui::Sense::hover());
+        let movable = task.status == Status::Pending && !active;
+        let index = self.settings.queue.iter().position(|entry| entry.id == task.id).unwrap_or(0);
+        let up = egui::Rect::from_min_size(
+            footer.min + egui::vec2(0.0, (layout::CONTROL - layout::COMPACT_CONTROL) / 2.0),
+            egui::Vec2::splat(layout::COMPACT_CONTROL),
+        );
+        let down = up.translate(egui::vec2(layout::COMPACT_CONTROL + 4.0, 0.0));
+        if button_at(ui, up, "queue-up", ButtonSpec::new("↑", ButtonKind::Quiet, movable && index > 0 && !self.settings.queue[index - 1].status.in_progress()))
+            .on_hover_text("순서 올리기")
+            .clicked()
+        {
+            self.settings.queue.swap(index, index - 1);
+        }
+        if button_at(
+            ui,
+            down,
+            "queue-down",
+            ButtonSpec::new(
+                "↓",
+                ButtonKind::Quiet,
+                movable && index + 1 < self.settings.queue.len() && !self.settings.queue.get(index + 1).is_some_and(|entry| entry.status.in_progress()),
+            ),
+        )
+        .on_hover_text("순서 내리기")
+        .clicked()
+        {
+            self.settings.queue.swap(index, index + 1);
+        }
+        let details = egui::Rect::from_min_size(egui::pos2(footer.right() - 96.0, footer.top()), egui::vec2(96.0, layout::CONTROL));
+        if button_at(ui, details, "queue-details", ButtonSpec::new("상세 설정", ButtonKind::Normal, true)).clicked() {
+            self.open_queue_task(task.id);
+        }
     }
 
     pub(super) fn queue_dialog(&mut self, ctx: &egui::Context) {
@@ -144,14 +134,12 @@ impl App {
         let mut retry = false;
         let mut remove = false;
         let mut close = false;
+        let mut saved = false;
         let response = egui::Modal::new(egui::Id::new("queue-detail")).frame(card()).show(ctx, |ui| {
             ui.set_width((ctx.content_rect().width() - 80.0).clamp(280.0, 650.0));
-            ui.horizontal_wrapped(|ui| {
-                section_title(ui, &live.composition.name);
-                ui.colored_label(status_color(live.status), live.status.label());
-                close = icon_button(ui, UiIcon::Close, "닫기").clicked();
-            });
-            egui::ScrollArea::vertical().id_salt("queue-detail-scroll").max_height((ctx.content_rect().height() - 200.0).max(180.0)).show(ui, |ui| {
+            close = dialog_header(ui, &live.composition.name, "닫기");
+            badge(ui, live.status.label(), status_color(live.status));
+            egui::ScrollArea::vertical().id_salt("queue-detail-scroll").max_height((ctx.content_rect().height() - 240.0).max(140.0)).show(ui, |ui| {
                 ui.add(egui::Label::new(&live.project).wrap());
                 caption(
                     ui,
@@ -235,15 +223,21 @@ impl App {
                 if !editable {
                     caption(ui, "진행 중이거나 완료된 작업의 설정은 잠겨 있습니다.");
                 }
+                if !self.last_error.is_empty() {
+                    ui.colored_label(egui::Color32::LIGHT_RED, &self.last_error);
+                }
             });
-            ui.horizontal_wrapped(|ui| {
-                save = ui.add_enabled(editable, primary_button("설정 저장")).clicked();
-                retry = ui.add_enabled(editable && matches!(live.status, Status::Failed | Status::Interrupted), egui::Button::new("저장하고 재대기")).clicked();
-                remove = ui.add_enabled(!live.status.in_progress() && self.queue_active != Some(id), egui::Button::new("큐에서 제거")).clicked();
-            });
-            if !self.last_error.is_empty() {
-                ui.colored_label(egui::Color32::LIGHT_RED, &self.last_error);
-            }
+            ui.separator();
+            let can_retry = editable && matches!(live.status, Status::Failed | Status::Interrupted);
+            let leading =
+                (!live.status.in_progress() && self.queue_active != Some(id)).then_some(ButtonSpec::new("큐에서 제거", ButtonKind::Destructive, true));
+            let primary = editable.then_some(ButtonSpec::new(if can_retry { "저장 후 재대기" } else { "설정 저장" }, ButtonKind::Primary, true));
+            let clicks =
+                footer_buttons(ui, leading, primary, Some(ButtonSpec::new(if editable { "취소" } else { "닫기" }, ButtonKind::Normal, true)), layout::CONTROL);
+            save = clicks.primary && !can_retry;
+            retry = clicks.primary && can_retry;
+            remove = clicks.leading;
+            close |= clicks.dismiss;
         });
         if save || retry {
             match crate::queue::validate_unique(&edit, &self.settings.queue) {
@@ -255,6 +249,7 @@ impl App {
                         *task = edit.clone();
                     }
                     self.last_error.clear();
+                    saved = true;
                 }
                 Err(error) => self.last_error = error,
             }
@@ -264,7 +259,7 @@ impl App {
             self.settings.queue.retain(|task| task.id != id);
             self.queue_previews.remove(&id);
         }
-        if response.should_close() || close || remove {
+        if response.should_close() || close || remove || saved {
             self.queue_detail = None;
             self.queue_edit = None;
         }

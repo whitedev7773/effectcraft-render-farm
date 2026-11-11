@@ -127,7 +127,9 @@ mod tests {
     #[test]
     fn installed_effectcraft_can_be_discovered_when_requested() {
         if std::env::var_os("EFFECTCRAFT_FARM_TEST_INSTALLED").is_some() {
-            assert!(detect("").unwrap().cli.is_file());
+            let installation = detect("").unwrap();
+            assert!(installation.cli.is_file());
+            crate::effectcraft_update::installed_version(&installation.cli).unwrap();
         }
     }
 }

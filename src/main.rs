@@ -2,6 +2,7 @@
 #![cfg_attr(all(windows, not(debug_assertions)), windows_subsystem = "windows")]
 
 mod discovery;
+mod effectcraft_update;
 mod encoding;
 mod farm;
 mod installation;
@@ -29,23 +30,25 @@ fn install_ui_font(ctx: &egui::Context) -> Result<(), String> {
     ctx.set_fonts(fonts);
     ctx.set_theme(egui::Theme::Dark);
     let mut style = (*ctx.style_of(egui::Theme::Dark)).clone();
-    style.spacing.item_spacing = egui::vec2(10.0, 9.0);
-    style.spacing.button_padding = egui::vec2(12.0, 7.0);
-    style.spacing.interact_size.y = 34.0;
-    style.visuals.panel_fill = egui::Color32::from_rgb(6, 6, 7);
-    style.visuals.window_fill = egui::Color32::from_rgb(24, 24, 27);
-    style.visuals.extreme_bg_color = egui::Color32::from_rgb(35, 35, 37);
-    style.visuals.faint_bg_color = egui::Color32::from_rgb(35, 35, 37);
+    style.spacing.item_spacing = egui::vec2(interface::layout::SPACE, interface::layout::SPACE);
+    style.spacing.button_padding = egui::vec2(12.0, 6.0);
+    style.spacing.interact_size.y = interface::layout::CONTROL;
+    style.visuals.panel_fill = egui::Color32::from_rgb(13, 15, 20);
+    style.visuals.window_fill = egui::Color32::from_rgb(22, 25, 32);
+    style.visuals.extreme_bg_color = egui::Color32::from_rgb(29, 33, 42);
+    style.visuals.faint_bg_color = egui::Color32::from_rgb(29, 33, 42);
     style.visuals.override_text_color = Some(egui::Color32::from_rgb(252, 252, 252));
-    style.visuals.widgets.inactive.bg_fill = egui::Color32::from_rgb(35, 35, 37);
-    style.visuals.widgets.hovered.bg_fill = egui::Color32::from_rgb(48, 48, 51);
-    style.visuals.widgets.active.bg_fill = egui::Color32::from_rgb(58, 58, 62);
-    style.visuals.widgets.inactive.bg_stroke = egui::Stroke::new(1.0, egui::Color32::from_rgb(40, 40, 44));
-    style.visuals.widgets.hovered.bg_stroke = egui::Stroke::new(1.0, egui::Color32::from_rgb(66, 66, 72));
+    style.visuals.widgets.inactive.bg_fill = egui::Color32::from_rgb(29, 33, 42);
+    style.visuals.widgets.hovered.bg_fill = egui::Color32::from_rgb(40, 47, 60);
+    style.visuals.widgets.active.bg_fill = egui::Color32::from_rgb(49, 58, 74);
+    style.visuals.widgets.inactive.bg_stroke = egui::Stroke::new(1.0, egui::Color32::from_rgb(47, 53, 66));
+    style.visuals.widgets.hovered.bg_stroke = egui::Stroke::new(1.0, egui::Color32::from_rgb(77, 91, 112));
     style.visuals.widgets.active.bg_stroke = egui::Stroke::new(1.0, egui::Color32::from_rgb(4, 133, 247));
-    style.visuals.widgets.inactive.corner_radius = egui::CornerRadius::same(12);
-    style.visuals.widgets.hovered.corner_radius = egui::CornerRadius::same(12);
-    style.visuals.widgets.active.corner_radius = egui::CornerRadius::same(12);
+    style.visuals.widgets.inactive.corner_radius = egui::CornerRadius::same(4);
+    style.visuals.widgets.hovered.corner_radius = egui::CornerRadius::same(4);
+    style.visuals.widgets.active.corner_radius = egui::CornerRadius::same(4);
+    style.text_styles.insert(egui::TextStyle::Body, egui::FontId::proportional(14.0));
+    style.text_styles.insert(egui::TextStyle::Button, egui::FontId::proportional(14.0));
     style.visuals.selection.bg_fill = egui::Color32::from_rgb(4, 93, 171);
     ctx.set_style_of(egui::Theme::Dark, style);
     Ok(())
@@ -54,16 +57,16 @@ fn install_ui_font(ctx: &egui::Context) -> Result<(), String> {
 fn path_row(ui: &mut egui::Ui, label: &str, value: &mut String) -> bool {
     ui.label(egui::RichText::new(label).strong());
     ui.horizontal(|ui| {
-        let width = (ui.available_width() - 100.0).max(120.0);
-        ui.add_sized([width, 27.0], egui::TextEdit::singleline(value));
-        ui.button("찾아보기").clicked()
+        let width = (ui.available_width() - 80.0 - interface::layout::SPACE).max(120.0);
+        ui.add_sized([width, interface::layout::CONTROL], egui::TextEdit::singleline(value).hint_text("파일 경로를 선택하세요")).on_hover_text(value.as_str());
+        ui.add_sized([80.0, interface::layout::CONTROL], egui::Button::new("찾아보기")).clicked()
     })
     .inner
 }
 
 fn text_row(ui: &mut egui::Ui, label: &str, value: &mut String, secret: bool) {
     ui.label(egui::RichText::new(label).strong());
-    ui.add_sized([ui.available_width(), 27.0], egui::TextEdit::singleline(value).password(secret));
+    ui.add_sized([ui.available_width(), interface::layout::CONTROL], egui::TextEdit::singleline(value).password(secret));
 }
 
 fn section_title(ui: &mut egui::Ui, title: &str) {
@@ -136,6 +139,9 @@ struct App {
     queue_previews: std::collections::BTreeMap<u64, farm::Preview>,
     updater: updater::Updater,
     updater_logged_status: String,
+    engine_updater: effectcraft_update::Updater,
+    engine_logged_status: String,
+    engine_install_requested: bool,
     settings: Settings,
     running: bool,
     stopping: bool,
@@ -158,6 +164,7 @@ struct App {
     catalog_status: String,
     range_handle: Option<RangeHandle>,
     monitor: bool,
+    queue_view: bool,
     settings_open: bool,
     settings_tab: u8,
     logs_open: bool,
@@ -218,6 +225,9 @@ impl App {
             queue_previews: Default::default(),
             updater: updater::Updater::default(),
             updater_logged_status: String::new(),
+            engine_updater: effectcraft_update::Updater::default(),
+            engine_logged_status: String::new(),
+            engine_install_requested: false,
             settings,
             running: false,
             stopping: false,
@@ -240,6 +250,7 @@ impl App {
             catalog_status: String::new(),
             range_handle: None,
             monitor: false,
+            queue_view: false,
             settings_open: false,
             settings_tab: 0,
             logs_open: false,
@@ -256,7 +267,11 @@ impl App {
     }
 
     fn update_ui(&mut self, ui: &mut egui::Ui) {
-        let idle = !self.running && self.pending_start.is_none() && !self.worker_active.load(Ordering::Relaxed) && self.pending_preview.is_none();
+        let idle = !self.running
+            && self.pending_start.is_none()
+            && !self.worker_active.load(Ordering::Relaxed)
+            && self.pending_preview.is_none()
+            && !self.engine_updater.installing();
         if let Some(result) = self.updater.poll(self.settings.check_updates) {
             let result = result.and_then(|prepared| {
                 if !idle {
@@ -274,37 +289,8 @@ impl App {
                 Err(error) => self.updater.status = format!("업데이트 실패: {error}"),
             }
         }
-        if self.updater.prompt
-            && let Some(release) = self.updater.available.clone()
-        {
-            let mut consent = false;
-            let mut later = false;
-            let response = egui::Modal::new(egui::Id::new("update-consent")).show(ui.ctx(), |ui| {
-                ui.set_width((ui.ctx().content_rect().width() - 80.0).clamp(280.0, 500.0));
-                ui.heading(format!("{} → {}", env!("CARGO_PKG_VERSION"), release.tag_name));
-                ui.label("동의하면 설치 프로그램을 다운로드·검증하고 Render Farm을 업데이트한 뒤 다시 시작합니다. EffectCraft 설치는 변경하지 않습니다.");
-                ui.label("연결할 모든 PC를 같은 버전으로 업데이트하세요.");
-                ui.hyperlink_to("GitHub 릴리스 보기", &release.html_url);
-                egui::ScrollArea::vertical().id_salt("release_notes").max_height((ui.ctx().content_rect().height() - 320.0).clamp(80.0, 240.0)).show(
-                    ui,
-                    |ui| {
-                        ui.label(release.body.as_deref().unwrap_or("등록된 변경 내용이 없습니다."));
-                    },
-                );
-                if !idle {
-                    ui.colored_label(egui::Color32::YELLOW, "호스트·클라이언트와 진행 중인 작업을 종료하면 업데이트할 수 있습니다.");
-                }
-                ui.horizontal_wrapped(|ui| {
-                    consent = ui.add_enabled(idle && !self.updater.busy(), primary_button("동의하고 업데이트 · 재시작")).clicked();
-                    later = ui.button("나중에").clicked();
-                });
-            });
-            if response.should_close() || later {
-                self.updater.prompt = false;
-            }
-            if consent {
-                self.updater.consent_and_download();
-            }
+        if self.updater.prompt && !self.engine_updater.prompt {
+            self.farm_update_ui(ui, idle && !self.engine_install_requested);
         }
         if self.updater.status != self.updater_logged_status {
             if !self.updater.status.is_empty() {
@@ -314,11 +300,77 @@ impl App {
         }
     }
 
+    fn engine_ready(&mut self) -> bool {
+        self.poll_engine_update();
+        if self.engine_install_requested || self.engine_updater.installing() || self.updater.installing() {
+            self.last_error = "업데이트 설치가 끝난 뒤 연결하세요".into();
+            return false;
+        }
+        if self.engine_updater.local.is_none() || self.engine_updater.checking() {
+            self.last_error = format!("EffectCraft 버전 확인을 완료한 뒤 연결하세요. {}", self.engine_updater.status);
+            return false;
+        }
+        // Permit the version handshake even when an update is known, so a newer peer
+        // can raise the target before either computer downloads an installer.
+        true
+    }
+
+    fn poll_engine_update(&mut self) {
+        if let Some(cli) = self.engine_updater.poll() {
+            self.settings.cli = cli.display().to_string();
+            self.state.lock().unwrap_or_else(std::sync::PoisonError::into_inner).engine_update = None;
+            self.save_settings();
+        }
+        let required = self.state.lock().unwrap_or_else(std::sync::PoisonError::into_inner).engine_update.clone();
+        if let Some(required) = required
+            && let Some(local) = &self.engine_updater.local
+            && let Ok(required) = effectcraft_update::requirement(local, required.peer.as_deref(), required.latest.as_deref())
+        {
+            self.engine_updater.observe(required);
+        }
+        if self.engine_install_requested && self.engine_update_idle() && !self.updater.busy() && !self.engine_updater.checking() {
+            self.engine_install_requested = false;
+            self.engine_updater.consent_and_install(PathBuf::from(&self.settings.cli));
+        }
+        if self.engine_updater.status != self.engine_logged_status {
+            if !self.engine_updater.status.is_empty() {
+                self.state.lock().unwrap_or_else(std::sync::PoisonError::into_inner).note(format!("EffectCraft 업데이트: {}", self.engine_updater.status));
+            }
+            self.engine_logged_status = self.engine_updater.status.clone();
+        }
+    }
+
+    fn engine_update_idle(&self) -> bool {
+        !self.running && self.pending_start.is_none() && !self.worker_active.load(Ordering::Relaxed) && self.pending_preview.is_none()
+    }
+
+    fn request_engine_install(&mut self) {
+        if self.engine_updater.required.is_none() || self.updater.busy() || self.engine_updater.checking() || self.engine_updater.installing() {
+            return;
+        }
+        self.engine_install_requested = true;
+        if !self.engine_update_idle() {
+            self.queue_automatic = false;
+            self.stop.store(true, Ordering::Relaxed);
+            self.stopping = true;
+        }
+    }
+
     fn show_preview(&mut self, ui: &mut egui::Ui, key: u64, preview: &farm::Preview) {
         self.show_preview_sized(ui, key, preview, 220.0);
     }
 
     fn show_preview_sized(&mut self, ui: &mut egui::Ui, key: u64, preview: &farm::Preview, max_height: f32) {
+        if let Some(texture) = self.preview_texture(ui, key, preview) {
+            let size = egui::vec2(ui.available_width().min(max_height * 16.0 / 9.0), (ui.available_width() * 9.0 / 16.0).min(max_height));
+            ui.with_layout(egui::Layout::top_down(egui::Align::Center), |ui| {
+                ui.add(egui::Image::new(&texture).fit_to_exact_size(size).maintain_aspect_ratio(true));
+                ui.small(format!("프레임 {}", preview.frame));
+            });
+        }
+    }
+
+    fn preview_texture(&mut self, ui: &egui::Ui, key: u64, preview: &farm::Preview) -> Option<egui::TextureHandle> {
         let changed = self.textures.get(&key).is_none_or(|(bytes, _)| !Arc::ptr_eq(bytes, &preview.jpeg));
         if changed && let Ok(image) = image::load_from_memory(&preview.jpeg) {
             let rgba = image.to_rgba8();
@@ -326,13 +378,7 @@ impl App {
             let texture = ui.ctx().load_texture(format!("preview-{key}"), color, egui::TextureOptions::LINEAR);
             self.textures.insert(key, (preview.jpeg.clone(), texture));
         }
-        if let Some((_, texture)) = self.textures.get(&key) {
-            let size = egui::vec2(ui.available_width().min(max_height * 16.0 / 9.0), (ui.available_width() * 9.0 / 16.0).min(max_height));
-            ui.with_layout(egui::Layout::top_down(egui::Align::Center), |ui| {
-                ui.add(egui::Image::new(texture).fit_to_exact_size(size).maintain_aspect_ratio(true));
-                ui.small(format!("프레임 {}", preview.frame));
-            });
-        }
+        self.textures.get(&key).map(|(_, texture)| texture.clone())
     }
 
     fn sync_selected_comp_range(&mut self) {
@@ -446,6 +492,10 @@ impl App {
     fn config(&self) -> Config {
         let s = &self.settings;
         Config {
+            engine: farm::EngineVersion {
+                installed: self.engine_updater.local.clone().unwrap_or_default(),
+                latest: self.engine_updater.latest.as_ref().map(|release| release.tag_name.clone()),
+            },
             project: PathBuf::from(&s.project),
             cli: PathBuf::from(&s.cli),
             output: s.frame_output(),
@@ -464,6 +514,9 @@ impl App {
     }
 
     fn start(&mut self) {
+        if !self.engine_ready() {
+            return;
+        }
         self.last_error.clear();
         self.textures.clear();
         self.inspected = None;
@@ -537,6 +590,7 @@ impl App {
             Ok(job) => {
                 self.inspect_frame = job.start;
                 self.monitor = true;
+                self.queue_view = false;
                 self.job = Some(job);
                 self.running = true;
                 let pending_config = self.pending_config.take();
@@ -576,7 +630,11 @@ impl App {
                         completed_session = true;
                         state.lock().unwrap_or_else(std::sync::PoisonError::into_inner).final_status = "다음 큐 작업 연결 대기".into();
                     }
-                    Err(_) if reconnect && completed_session && !stop.load(Ordering::Relaxed) => {}
+                    Err(_)
+                        if reconnect
+                            && completed_session
+                            && !stop.load(Ordering::Relaxed)
+                            && !state.lock().unwrap_or_else(std::sync::PoisonError::into_inner).engine_mismatch => {}
                     Err(e) => {
                         state.lock().unwrap_or_else(std::sync::PoisonError::into_inner).note(format!("클라이언트 오류: {e}"));
                         break;
@@ -615,6 +673,7 @@ impl App {
 impl eframe::App for App {
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
         ui.ctx().request_repaint_after(Duration::from_millis(500));
+        self.poll_engine_update();
         self.poll_start();
         self.poll_discovery();
         self.poll_catalog();
@@ -664,6 +723,7 @@ impl eframe::App for App {
         let before = self.settings.clone();
         self.draw_interface(ui);
         self.update_ui(ui);
+        self.engine_update_ui(ui);
         if self.last_error != self.last_logged_error {
             if !self.last_error.is_empty() && !self.last_error.starts_with("클라이언트 오류:") {
                 self.state.lock().unwrap_or_else(std::sync::PoisonError::into_inner).note(format!("화면 오류: {}", self.last_error));
@@ -711,6 +771,7 @@ fn main() {
         Box::new(move |cc| {
             let mut app = App::default();
             app.settings.cli = installation.cli.display().to_string();
+            app.engine_updater.check(installation.cli.clone());
             app.state.lock().unwrap_or_else(std::sync::PoisonError::into_inner).note(format!("설치된 EffectCraft 감지: {}", installation.root.display()));
             app.save_settings();
             if let Err(error) = install_ui_font(&cc.egui_ctx) {

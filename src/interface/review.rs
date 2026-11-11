@@ -53,6 +53,7 @@ fn fixture() -> App {
     }
     state.messages = vec!["[INFO] [autotune] CPU/GPU 자동 비교 완료 · GPU 선택".into(), "[WARN] [encoder] 지원하지 않는 인코더를 제외했습니다".into()];
     let mut app = App::with_state(settings, None, Arc::new(Mutex::new(state)));
+    app.engine_updater.local = Some("0.23.1".into());
     app.catalog = vec![CompInfo {
         name: "Title Sequence · Final".into(),
         frames: 240,
@@ -150,6 +151,14 @@ const CASES: &[(&str, f32, f32)] = &[
     ("queue-detail-compact", 560.0, 740.0),
     ("queue-connect", 1440.0, 940.0),
     ("queue-connect-compact", 560.0, 740.0),
+    ("engine-update", 1440.0, 940.0),
+    ("engine-update-compact", 560.0, 740.0),
+    ("engine-update-connected", 560.0, 520.0),
+    ("empty-host", 1440.0, 940.0),
+    ("empty-host-compact", 560.0, 740.0),
+    ("empty-client", 560.0, 740.0),
+    ("prepared-host-compact", 560.0, 740.0),
+    ("farm-update", 560.0, 520.0),
 ];
 
 #[cfg(debug_assertions)]
@@ -181,6 +190,7 @@ impl eframe::App for Capture {
             let (name, width, height) = CASES[self.stage];
             ctx.send_viewport_cmd(egui::ViewportCommand::InnerSize(egui::vec2(width, height)));
             self.app.monitor = name != "compact-project";
+            self.app.queue_view = name.starts_with("queue-cards");
             self.app.running = !name.starts_with("settings");
             self.app.settings_open = name.starts_with("settings");
             self.app.settings_tab = u8::from(name == "settings-render");
@@ -189,6 +199,33 @@ impl eframe::App for Capture {
             self.app.preview_open = name == "preview-compact";
             self.app.settings.queue_cards = name.starts_with("queue-cards");
             self.app.queue_detail = name.starts_with("queue-detail").then_some(2);
+            if name.starts_with("engine-update") {
+                self.app.running = name == "engine-update-connected";
+                self.app.engine_updater.required = crate::effectcraft_update::requirement("0.22.0", Some("0.23.0"), Some("0.23.1")).ok().flatten();
+                self.app.engine_updater.prompt = true;
+                self.app.engine_updater.status = "공식 EffectCraft 최신 버전 v0.23.1".into();
+            }
+            if name.starts_with("empty-") {
+                self.app = App::with_state(Settings { check_updates: false, ..Settings::default() }, None, Arc::new(Mutex::new(State::default())));
+                self.app.engine_updater.local = Some("0.23.1".into());
+                self.app.settings.host = name != "empty-client";
+                self.app.monitor = name == "empty-host";
+            }
+            if name == "farm-update" {
+                self.app = fixture();
+                self.app.running = false;
+                self.app.updater.prompt = true;
+                self.app.updater.available = serde_json::from_value(serde_json::json!({
+                    "tag_name": "v0.12.0", "html_url": "https://github.com/whitedev7773/effectcraft-render-farm/releases/tag/v0.12.0",
+                    "draft": false, "prerelease": false, "assets": [], "body": "렌더링과 작업 관리가 개선되었습니다."
+                }))
+                .ok();
+            }
+            if name == "prepared-host-compact" {
+                self.app = fixture();
+                self.app.running = false;
+                self.app.monitor = false;
+            }
             if name.starts_with("queue-connect") {
                 let mut state = self.app.state.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
                 state.dispatch_enabled = false;
@@ -206,6 +243,10 @@ impl eframe::App for Capture {
                 .flatten();
         }
         self.app.draw_interface(ui);
+        if self.app.updater.prompt {
+            self.app.farm_update_ui(ui, true);
+        }
+        self.app.engine_update_ui(ui);
         self.frames += 1;
         if self.frames >= 24 && !self.requested {
             ctx.send_viewport_cmd(egui::ViewportCommand::Screenshot(egui::UserData::default()));
@@ -218,6 +259,67 @@ impl eframe::App for Capture {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn compact_project_page_keeps_inputs_visible_without_queue_rows() {
+        let mut app = fixture();
+        app.running = false;
+        app.monitor = false;
+        app.settings.reduced_motion = true;
+        let ctx = egui::Context::default();
+        let mut labels = String::new();
+        fn collect(shape: &egui::Shape, labels: &mut String) {
+            match shape {
+                egui::Shape::Text(text) => labels.push_str(&text.galley.job.text),
+                egui::Shape::Vec(shapes) => {
+                    for shape in shapes {
+                        collect(shape, labels);
+                    }
+                }
+                _ => {}
+            }
+        }
+        for _ in 0..3 {
+            let input = egui::RawInput { screen_rect: Some(egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(560.0, 740.0))), ..Default::default() };
+            let output = ctx.run_ui(input, |ui| app.draw_interface(ui));
+            labels.clear();
+            for shape in &output.shapes {
+                collect(&shape.shape, &mut labels);
+            }
+            output.drop_without_applying_deltas();
+        }
+        assert!(labels.contains("프로젝트 준비"));
+        assert!(labels.contains("컴포지션"));
+        assert!(!labels.contains("Scene 2 · Final"));
+        assert!(!labels.contains("상세 설정"));
+    }
+
+    #[test]
+    fn update_consent_finishes_current_work_and_can_be_cancelled_before_install() {
+        let mut app = fixture();
+        app.queue_automatic = true;
+        app.engine_updater.required = crate::effectcraft_update::requirement("0.22.0", Some("0.23.1"), None).unwrap();
+        let assignment = app.state.lock().unwrap().worker_info.get(&1).unwrap().assigned;
+        app.request_engine_install();
+        assert!(app.engine_install_requested && app.stopping && app.stop.load(Ordering::Relaxed));
+        assert!(!app.queue_automatic && !app.engine_updater.installing());
+        assert_eq!(app.state.lock().unwrap().worker_info.get(&1).unwrap().assigned, assignment);
+        app.engine_install_requested = false;
+        app.poll_engine_update();
+        assert!(!app.engine_updater.installing());
+    }
+
+    #[test]
+    fn participation_toggle_updates_scheduler_and_remembered_pc_choice() {
+        let mut app = fixture();
+        let worker = app.state.lock().unwrap().worker_info.get(&2).unwrap().clone();
+        app.set_worker_participation(&worker, false);
+        assert!(!app.state.lock().unwrap().worker_info.get(&2).unwrap().enabled);
+        assert!(app.settings.disabled_workers.contains(&worker.ip));
+        app.set_worker_participation(&worker, true);
+        assert!(app.state.lock().unwrap().worker_info.get(&2).unwrap().enabled);
+        assert!(!app.settings.disabled_workers.contains(&worker.ip));
+    }
 
     #[test]
     fn queue_actions_offer_host_connection_before_render_start() {
@@ -287,6 +389,7 @@ mod tests {
                 app.worker_details = (view == 7).then_some(1);
                 app.preview_open = view == 8;
                 app.settings.queue_cards = view >= 9;
+                app.queue_view = view >= 9;
                 app.queue_previews = prototype.queue_previews.clone();
                 app.queue_detail = (view >= 10).then_some(if view == 10 { 1 } else { 2 });
                 let ctx = egui::Context::default();

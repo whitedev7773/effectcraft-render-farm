@@ -34,7 +34,7 @@ fn project_hash(bytes: &[u8]) -> String {
 const MAX_LINE: usize = 4096;
 const MAX_FRAMES: i64 = 100_000;
 const MAX_WORKERS: usize = 64;
-const PROTOCOL_VERSION: u32 = 6;
+const PROTOCOL_VERSION: u32 = 7;
 const MAX_TRANSFER_FILE: u64 = 32 * 1024 * 1024 * 1024;
 const MAX_TRANSFER_TOTAL: u64 = 256 * 1024 * 1024 * 1024;
 const MAX_TRANSFER_FILES: usize = 20_000;
@@ -71,6 +71,7 @@ fn work_frame_range(rate: FrameRate, duration: Tick, work_area: (Tick, Tick), to
 
 #[derive(Clone)]
 pub struct Config {
+    pub engine: EngineVersion,
     pub project: PathBuf,
     pub cli: PathBuf,
     pub output: PathBuf,
@@ -85,6 +86,27 @@ pub struct Config {
     pub final_video: PathBuf,
     pub disabled_workers: Vec<String>,
     pub render: RenderOptions,
+}
+
+#[derive(Clone, Default, Serialize, Deserialize)]
+pub struct EngineVersion {
+    pub installed: String,
+    pub latest: Option<String>,
+}
+
+/// Authenticated peers exchange version numbers only; installer URLs always come from official GitHub.
+fn check_engine(config: &Config, peer: &EngineVersion, state: &Shared) -> Result<bool, String> {
+    let latest = crate::effectcraft_update::latest_version(config.engine.latest.as_deref(), peer.latest.as_deref())?;
+    let local_update = crate::effectcraft_update::requirement(&config.engine.installed, Some(&peer.installed), latest.as_deref())?;
+    let peer_update = crate::effectcraft_update::requirement(&peer.installed, Some(&config.engine.installed), latest.as_deref())?;
+    let compatible = local_update.is_none() && peer_update.is_none();
+    if let Some(required) = local_update {
+        let mut state = lock(state);
+        if state.engine_update.as_ref().is_none_or(|old| !crate::effectcraft_update::higher(&old.target, &required.target).unwrap_or(false)) {
+            state.engine_update = Some(required);
+        }
+    }
+    Ok(compatible)
 }
 
 #[derive(Clone)]
@@ -226,6 +248,8 @@ pub struct Preview {
 
 #[derive(Default)]
 pub struct State {
+    pub engine_update: Option<crate::effectcraft_update::Requirement>,
+    pub engine_mismatch: bool,
     pub queue_session: bool,
     pub remote_queue: bool,
     pub coordinator_active: bool,
@@ -324,11 +348,18 @@ enum Message {
         name: String,
         #[serde(default)]
         protocol: u32,
+        #[serde(default)]
+        engine: EngineVersion,
     },
     Ready {
         comp: String,
         #[serde(default)]
         queue: bool,
+        #[serde(default)]
+        engine: EngineVersion,
+    },
+    EffectCraftUpdate {
+        engine: EngineVersion,
     },
     Bundle {
         options: RenderOptions,
@@ -1205,8 +1236,8 @@ fn serve_worker(mut stream: TcpStream, peer: SocketAddr, config: &Config, job: &
     stream.set_nodelay(true).map_err(|e| e.to_string())?;
     stream.set_read_timeout(Some(Duration::from_secs(3600))).map_err(|e| e.to_string())?;
     let mut reader = BufReader::with_capacity(1024 * 1024, stream.try_clone().map_err(|e| e.to_string())?);
-    let (name, given_token, protocol) = match receive(&mut reader)? {
-        Message::Hello { token, name, protocol, .. } => (name, token, protocol),
+    let (name, given_token, protocol, engine) = match receive(&mut reader)? {
+        Message::Hello { token, name, protocol, engine } => (name, token, protocol, engine),
         _ => return Err("인증 메시지가 필요합니다".into()),
     };
     if protocol != PROTOCOL_VERSION {
@@ -1221,6 +1252,12 @@ fn serve_worker(mut stream: TcpStream, peer: SocketAddr, config: &Config, job: &
     if given_token != config.token || name.len() > 80 {
         send(&mut stream, &Message::Error { detail: "접속 암호가 올바르지 않습니다".into() })?;
         return Err("접속 정보 검증 실패".into());
+    }
+    let latest = crate::effectcraft_update::latest_version(config.engine.latest.as_deref(), engine.latest.as_deref())?;
+    let host_engine = EngineVersion { installed: config.engine.installed.clone(), latest };
+    if !check_engine(config, &engine, state)? {
+        send(&mut stream, &Message::EffectCraftUpdate { engine: host_engine })?;
+        return Err(format!("EffectCraft 업데이트 필요 · 호스트 {} / 클라이언트 {} · 업데이트 후 다시 연결하세요", config.engine.installed, engine.installed));
     }
     let ip = peer.ip().to_string();
     let label = format!("{name} @ {ip}");
@@ -1269,7 +1306,7 @@ fn serve_worker(mut stream: TcpStream, peer: SocketAddr, config: &Config, job: &
         }
     };
     let queue = lock(state).queue_session;
-    if let Err(error) = send(&mut stream, &Message::Ready { comp: job.comp.clone(), queue }) {
+    if let Err(error) = send(&mut stream, &Message::Ready { comp: job.comp.clone(), queue, engine: host_engine }) {
         let mut s = lock(state);
         s.workers = s.workers.saturating_sub(1);
         s.worker_info.remove(&worker_id);
@@ -1525,6 +1562,7 @@ pub fn begin_render(config: &Config, job: &Job, state: &Shared) {
 }
 
 pub fn run_worker(config: Config, state: Shared, stop: Arc<AtomicBool>) -> Result<(), String> {
+    lock(&state).engine_mismatch = false;
     if !config.cli.is_file() {
         return Err(format!("렌더 CLI 파일이 없습니다: {}", config.cli.display()));
     }
@@ -1533,11 +1571,20 @@ pub fn run_worker(config: Config, state: Shared, stop: Arc<AtomicBool>) -> Resul
     stream.set_read_timeout(Some(Duration::from_secs(3600))).map_err(|e| e.to_string())?;
     let mut reader = BufReader::with_capacity(1024 * 1024, stream.try_clone().map_err(|e| e.to_string())?);
     let name = std::env::var("COMPUTERNAME").or_else(|_| std::env::var("HOSTNAME")).unwrap_or_else(|_| "worker".into());
-    send(&mut stream, &Message::Hello { token: config.token.clone(), name, protocol: PROTOCOL_VERSION })?;
+    send(&mut stream, &Message::Hello { token: config.token.clone(), name, protocol: PROTOCOL_VERSION, engine: config.engine.clone() })?;
     let comp = match receive(&mut reader)? {
-        Message::Ready { comp, queue } => {
+        Message::Ready { comp, queue, engine } => {
+            if !check_engine(&config, &engine, &state)? {
+                lock(&state).engine_mismatch = true;
+                return Err("호스트와 EffectCraft 버전을 맞춘 뒤 다시 연결하세요".into());
+            }
             lock(&state).remote_queue = queue;
             comp
+        }
+        Message::EffectCraftUpdate { engine } => {
+            lock(&state).engine_mismatch = true;
+            check_engine(&config, &engine, &state)?;
+            return Err(format!("EffectCraft 업데이트 필요 · 이 PC {} / 호스트 {} · 업데이트 후 다시 연결하세요", config.engine.installed, engine.installed));
         }
         Message::Error { detail } => return Err(detail),
         _ => return Err("서버 인증 응답이 잘못됐습니다".into()),
@@ -2188,6 +2235,67 @@ fn progress_metrics(s: &State) -> (i64, i64, usize, usize) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn engine_handshake_notifies_only_the_required_computers_before_registering_workers() {
+        for (host, client, host_latest, client_latest, host_update, client_update) in [
+            ("0.22.0", "0.23.0", None, None, true, false),
+            ("0.23.0", "0.22.0", None, None, false, true),
+            ("0.22.0", "0.23.0", Some("0.23.1"), None, true, true),
+            ("0.23.0", "0.22.0", None, Some("0.23.1"), true, true),
+            ("0.22.0", "0.22.0", Some("0.23.1"), None, true, true),
+        ] {
+            let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+            let config = Config {
+                engine: EngineVersion { installed: host.into(), latest: host_latest.map(str::to_owned) },
+                project: PathBuf::new(),
+                cli: std::env::current_exe().unwrap(),
+                output: PathBuf::new(),
+                comp: "Test".into(),
+                address: listener.local_addr().unwrap().to_string(),
+                token: "test-password".into(),
+                gpu: false,
+                range_start: 0,
+                range_end: 1,
+                chunk_frames: 1,
+                max_workers: 1,
+                final_video: PathBuf::new(),
+                disabled_workers: Vec::new(),
+                render: RenderOptions::default(),
+            };
+            let job = Job {
+                draft: false,
+                hash: String::new(),
+                comp: "Test".into(),
+                rate: FrameRate::FPS_60,
+                total: 1,
+                start: 0,
+                end: 1,
+                width: 64,
+                height: 64,
+                output: PathBuf::new(),
+            };
+            let host_state = Arc::new(Mutex::new(State::default()));
+            let server_state = host_state.clone();
+            let host_config = config.clone();
+            let server = thread::spawn(move || {
+                let (stream, peer) = listener.accept().unwrap();
+                serve_worker(stream, peer, &host_config, &job, &server_state, &AtomicBool::new(false))
+            });
+            let mut client_config = config;
+            client_config.engine = EngineVersion { installed: client.into(), latest: client_latest.map(str::to_owned) };
+            let client_state = Arc::new(Mutex::new(State::default()));
+            assert!(run_worker(client_config, client_state.clone(), Arc::new(AtomicBool::new(false))).is_err());
+            assert!(server.join().unwrap().is_err());
+            let host_state = host_state.lock().unwrap();
+            let client_state = client_state.lock().unwrap();
+            assert_eq!(host_state.engine_update.is_some(), host_update);
+            assert_eq!(client_state.engine_update.is_some(), client_update);
+            assert!(client_state.engine_mismatch);
+            assert!(host_state.worker_info.is_empty());
+            assert_eq!(host_state.workers, 0);
+        }
+    }
     use effectcraft_color::Label;
     use effectcraft_project::{Comp, ItemKind};
     use effectcraft_time::Tick;
@@ -2329,6 +2437,7 @@ mod tests {
         assert_eq!(catalog[0].frames, 120);
         assert_eq!((catalog[0].work_start, catalog[0].work_end), (30, 90));
         let config = Config {
+            engine: EngineVersion { installed: "0.23.1".into(), latest: None },
             project: project_path,
             cli: std::env::current_exe().unwrap(),
             output: dir.clone(),
@@ -2364,6 +2473,7 @@ mod tests {
         let project_path = dir.join("test.ecproj");
         std::fs::write(&project_path, project.to_json()).unwrap();
         let config = Config {
+            engine: EngineVersion { installed: "0.23.1".into(), latest: None },
             project: project_path,
             cli: std::env::current_exe().unwrap(),
             output: dir.clone(),
@@ -2399,7 +2509,16 @@ mod tests {
         let server_config = config.clone();
         let server = thread::spawn(move || serve_worker(stream, peer, &server_config, &server_job, &server_state, &AtomicBool::new(false)));
         let mut reader = BufReader::new(client.try_clone().unwrap());
-        send(&mut client, &Message::Hello { token: "password".into(), name: "test-worker".into(), protocol: PROTOCOL_VERSION }).unwrap();
+        send(
+            &mut client,
+            &Message::Hello {
+                token: "password".into(),
+                name: "test-worker".into(),
+                protocol: PROTOCOL_VERSION,
+                engine: EngineVersion { installed: "0.23.1".into(), latest: None },
+            },
+        )
+        .unwrap();
         assert!(matches!(receive(&mut reader), Ok(Message::Ready { comp, .. }) if comp == "Test"));
         thread::sleep(Duration::from_millis(100));
         send(&mut client, &Message::Request).unwrap();
@@ -2455,6 +2574,7 @@ mod tests {
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
         let address = listener.local_addr().unwrap();
         let mut config = Config {
+            engine: EngineVersion { installed: "0.23.1".into(), latest: None },
             project: project_path.clone(),
             cli: project_path,
             output: dir.clone(),
@@ -2530,6 +2650,7 @@ mod tests {
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
         let address = listener.local_addr().unwrap();
         let host = Config {
+            engine: EngineVersion { installed: "0.23.1".into(), latest: None },
             project: project_path,
             cli: cli.clone(),
             output: dir.clone(),
@@ -2563,6 +2684,7 @@ mod tests {
             serve_worker(stream, peer, &host, &job, &server_state, &AtomicBool::new(false))
         });
         let client = Config {
+            engine: EngineVersion { installed: "0.23.1".into(), latest: None },
             project: dir.join("missing-client.ecproj"),
             cli,
             output: dir.join("missing-shared-folder"),
@@ -2612,6 +2734,7 @@ mod tests {
         let project_path = dir.join("source.ecproj");
         std::fs::write(&project_path, project.to_json()).unwrap();
         let config = Config {
+            engine: EngineVersion { installed: "0.23.1".into(), latest: None },
             project: project_path,
             cli: std::env::current_exe().unwrap(),
             output: dir.clone(),
@@ -2659,7 +2782,16 @@ mod tests {
         let mut first = TcpStream::connect(address).unwrap();
         first.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
         let mut first_reader = BufReader::new(first.try_clone().unwrap());
-        send(&mut first, &Message::Hello { token: "password".into(), name: "first".into(), protocol: PROTOCOL_VERSION }).unwrap();
+        send(
+            &mut first,
+            &Message::Hello {
+                token: "password".into(),
+                name: "first".into(),
+                protocol: PROTOCOL_VERSION,
+                engine: EngineVersion { installed: "0.23.1".into(), latest: None },
+            },
+        )
+        .unwrap();
         assert!(matches!(receive(&mut first_reader), Ok(Message::Ready { comp, .. }) if comp == "Test"));
         send(&mut first, &Message::Request).unwrap();
         receive_test_bundle(&mut first_reader);
@@ -2668,7 +2800,16 @@ mod tests {
         let mut second = TcpStream::connect(address).unwrap();
         second.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
         let mut second_reader = BufReader::new(second.try_clone().unwrap());
-        send(&mut second, &Message::Hello { token: "password".into(), name: "second".into(), protocol: PROTOCOL_VERSION }).unwrap();
+        send(
+            &mut second,
+            &Message::Hello {
+                token: "password".into(),
+                name: "second".into(),
+                protocol: PROTOCOL_VERSION,
+                engine: EngineVersion { installed: "0.23.1".into(), latest: None },
+            },
+        )
+        .unwrap();
         assert!(matches!(receive(&mut second_reader), Ok(Message::Ready { comp, .. }) if comp == "Test"));
         send(&mut second, &Message::Request).unwrap();
         assert!(matches!(receive(&mut second_reader), Ok(Message::Wait)));
@@ -2714,6 +2855,7 @@ mod tests {
         let source = dir.join("source.ecproj");
         std::fs::write(&source, project.to_json()).unwrap();
         let config = Config {
+            engine: EngineVersion { installed: "0.23.1".into(), latest: None },
             project: source,
             cli: std::env::current_exe().unwrap(),
             output: dir.clone(),
@@ -2757,7 +2899,16 @@ mod tests {
         let mut first = TcpStream::connect(address).unwrap();
         first.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
         let mut a = BufReader::new(first.try_clone().unwrap());
-        send(&mut first, &Message::Hello { token: "password".into(), name: "slow".into(), protocol: PROTOCOL_VERSION }).unwrap();
+        send(
+            &mut first,
+            &Message::Hello {
+                token: "password".into(),
+                name: "slow".into(),
+                protocol: PROTOCOL_VERSION,
+                engine: EngineVersion { installed: "0.23.1".into(), latest: None },
+            },
+        )
+        .unwrap();
         assert!(matches!(receive(&mut a), Ok(Message::Ready { .. })));
         send(&mut first, &Message::Request).unwrap();
         receive_test_bundle(&mut a);
@@ -2767,7 +2918,16 @@ mod tests {
         let mut second = TcpStream::connect(address).unwrap();
         second.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
         let mut b = BufReader::new(second.try_clone().unwrap());
-        send(&mut second, &Message::Hello { token: "password".into(), name: "helper".into(), protocol: PROTOCOL_VERSION }).unwrap();
+        send(
+            &mut second,
+            &Message::Hello {
+                token: "password".into(),
+                name: "helper".into(),
+                protocol: PROTOCOL_VERSION,
+                engine: EngineVersion { installed: "0.23.1".into(), latest: None },
+            },
+        )
+        .unwrap();
         assert!(matches!(receive(&mut b), Ok(Message::Ready { .. })));
         send(&mut second, &Message::Request).unwrap();
         receive_test_bundle(&mut b);
@@ -2872,6 +3032,7 @@ mod tests {
         }
         let cli = std::env::var_os("EFFECTCRAFT_FARM_TEST_CLI").map(PathBuf::from).unwrap_or_else(|| std::env::current_exe().unwrap());
         let config = Config {
+            engine: EngineVersion { installed: "0.23.1".into(), latest: None },
             project: project_path,
             cli,
             output: dir.clone(),

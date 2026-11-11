@@ -15,10 +15,10 @@ const MAX_INSTALLER: u64 = 512 * 1024 * 1024;
 
 #[derive(Clone, Deserialize)]
 pub struct Asset {
-    name: String,
-    size: u64,
-    digest: Option<String>,
-    browser_download_url: String,
+    pub(crate) name: String,
+    pub(crate) size: u64,
+    pub(crate) digest: Option<String>,
+    pub(crate) browser_download_url: String,
 }
 
 #[derive(Clone, Deserialize)]
@@ -27,9 +27,9 @@ pub struct Release {
     pub html_url: String,
     #[serde(default)]
     pub body: Option<String>,
-    draft: bool,
-    prerelease: bool,
-    assets: Vec<Asset>,
+    pub(crate) draft: bool,
+    pub(crate) prerelease: bool,
+    pub(crate) assets: Vec<Asset>,
 }
 
 fn newer(release: &Release, current: &str) -> Result<bool, String> {
@@ -38,7 +38,7 @@ fn newer(release: &Release, current: &str) -> Result<bool, String> {
     Ok(!release.draft && !release.prerelease && candidate.pre.is_empty() && candidate > parse(current)?)
 }
 
-fn client() -> Result<Client, String> {
+pub(crate) fn client() -> Result<Client, String> {
     Client::builder()
         .user_agent(concat!("EffectCraft-Farm/", env!("CARGO_PKG_VERSION")))
         .connect_timeout(Duration::from_secs(10))
@@ -56,8 +56,13 @@ fn client() -> Result<Client, String> {
 }
 
 pub fn check() -> Result<Option<Release>, String> {
+    let release = fetch_release(API, REPO)?;
+    Ok(newer(&release, env!("CARGO_PKG_VERSION"))?.then_some(release))
+}
+
+pub(crate) fn fetch_release(api: &str, repo: &str) -> Result<Release, String> {
     let response = client()?
-        .get(API)
+        .get(api)
         .timeout(Duration::from_secs(20))
         .header("Accept", "application/vnd.github+json")
         .send()
@@ -69,10 +74,10 @@ pub fn check() -> Result<Option<Release>, String> {
         return Err("릴리스 응답이 너무 큽니다".into());
     }
     let release: Release = serde_json::from_slice(&bytes).map_err(|e| format!("릴리스 응답: {e}"))?;
-    if !release.html_url.starts_with(&format!("{REPO}releases/tag/")) {
+    if !release.html_url.starts_with(&format!("{repo}releases/tag/")) {
         return Err("릴리스 주소가 저장소와 다릅니다".into());
     }
-    Ok(newer(&release, env!("CARGO_PKG_VERSION"))?.then_some(release))
+    Ok(release)
 }
 
 fn windows_asset(release: &Release) -> Result<&Asset, String> {
@@ -85,7 +90,7 @@ fn windows_asset(release: &Release) -> Result<&Asset, String> {
     Ok(asset)
 }
 
-fn expected_digest(asset: &Asset) -> Result<&str, String> {
+pub(crate) fn expected_digest(asset: &Asset) -> Result<&str, String> {
     let digest = asset
         .digest
         .as_deref()
@@ -97,7 +102,7 @@ fn expected_digest(asset: &Asset) -> Result<&str, String> {
     Ok(digest)
 }
 
-fn validate_installer(path: &Path) -> Result<(), String> {
+pub(crate) fn validate_installer(path: &Path) -> Result<(), String> {
     let mut file = std::fs::File::open(path).map_err(|e| e.to_string())?;
     let mut signature = [0; 8];
     file.read_exact(&mut signature).map_err(|e| format!("설치 프로그램 헤더: {e}"))?;
@@ -125,9 +130,15 @@ fn prepare(release: Release, progress: Arc<AtomicU64>) -> Result<Prepared, Strin
     let nonce = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap_or_default().as_nanos();
     let stage = std::env::temp_dir().join(format!("effectcraft-farm-update-{}-{nonce}", std::process::id()));
     std::fs::create_dir(&stage).map_err(|e| format!("업데이트 임시 폴더: {e}"))?;
-    let mut response = client()?.get(&asset.browser_download_url).send().and_then(|r| r.error_for_status()).map_err(|e| format!("업데이트 다운로드: {e}"))?;
     let archive = stage.join("setup.msi");
-    let mut output = std::fs::File::create(&archive).map_err(|e| e.to_string())?;
+    download_installer(asset, &archive, &progress)?;
+    Ok(Prepared { stage, exe })
+}
+
+pub(crate) fn download_installer(asset: &Asset, archive: &Path, progress: &AtomicU64) -> Result<(), String> {
+    let digest = expected_digest(asset)?;
+    let mut response = client()?.get(&asset.browser_download_url).send().and_then(|r| r.error_for_status()).map_err(|e| format!("업데이트 다운로드: {e}"))?;
+    let mut output = std::fs::File::create(archive).map_err(|e| e.to_string())?;
     let mut hash = Sha256::new();
     let mut buffer = vec![0; 256 * 1024];
     let mut downloaded = 0;
@@ -146,11 +157,10 @@ fn prepare(release: Release, progress: Arc<AtomicU64>) -> Result<Prepared, Strin
     }
     output.sync_all().map_err(|e| e.to_string())?;
     drop(output);
-    if downloaded != asset.size || !format!("{:x}", hash.finalize()).eq_ignore_ascii_case(expected_digest(asset)?) {
+    if downloaded != asset.size || !format!("{:x}", hash.finalize()).eq_ignore_ascii_case(digest) {
         return Err("업데이트 크기 또는 SHA-256 검증 실패 · 설치하지 않았습니다".into());
     }
-    validate_installer(&archive)?;
-    Ok(Prepared { stage, exe })
+    validate_installer(archive)
 }
 
 impl Prepared {
@@ -280,7 +290,7 @@ impl Updater {
     }
 }
 
-fn poll_receiver<T>(rx: &Receiver<Result<T, String>>) -> Option<Result<T, String>> {
+pub(crate) fn poll_receiver<T>(rx: &Receiver<Result<T, String>>) -> Option<Result<T, String>> {
     match rx.try_recv() {
         Ok(value) => Some(value),
         Err(TryRecvError::Empty) => None,
@@ -355,6 +365,44 @@ mod tests {
         assert!(validate_installer(&path).is_err());
         std::fs::write(&path, [0xd0, 0xcf, 0x11, 0xe0, 0xa1, 0xb1, 0x1a, 0xe1]).unwrap();
         assert!(validate_installer(&path).is_ok());
+        std::fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn downloads_require_matching_size_digest_and_msi_header() {
+        use std::io::BufRead;
+        let valid = [0xd0, 0xcf, 0x11, 0xe0, 0xa1, 0xb1, 0x1a, 0xe1];
+        let nonce = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos();
+        let path = std::env::temp_dir().join(format!("farm-download-check-{}-{nonce}.msi", std::process::id()));
+        for (body, size, digest, accepted) in [
+            (valid.as_slice(), 8, format!("sha256:{:x}", Sha256::digest(valid)), true),
+            (valid.as_slice(), 8, format!("sha256:{}", "0".repeat(64)), false),
+            (valid.as_slice(), 7, format!("sha256:{:x}", Sha256::digest(valid)), false),
+            (valid.as_slice(), 9, format!("sha256:{:x}", Sha256::digest(valid)), false),
+            (b"not-msi!".as_slice(), 8, format!("sha256:{:x}", Sha256::digest(b"not-msi!")), false),
+        ] {
+            let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+            let address = listener.local_addr().unwrap();
+            let body = body.to_vec();
+            let server = std::thread::spawn(move || {
+                let (mut stream, _) = listener.accept().unwrap();
+                stream.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+                let mut reader = std::io::BufReader::new(stream.try_clone().unwrap());
+                loop {
+                    let mut line = String::new();
+                    reader.read_line(&mut line).unwrap();
+                    if line == "\r\n" || line.is_empty() {
+                        break;
+                    }
+                }
+                write!(stream, "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n", body.len()).unwrap();
+                stream.write_all(&body).unwrap();
+            });
+            // Synthetic local HTTP fixture; production callers validate the official HTTPS origin first.
+            let asset = Asset { name: "fixture.msi".into(), size, digest: Some(digest), browser_download_url: format!("http://{address}/fixture.msi") };
+            assert_eq!(download_installer(&asset, &path, &AtomicU64::default()).is_ok(), accepted);
+            server.join().unwrap();
+        }
         std::fs::remove_file(path).unwrap();
     }
 

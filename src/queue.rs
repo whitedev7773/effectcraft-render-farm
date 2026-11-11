@@ -153,6 +153,14 @@ impl App {
         if !self.settings.host || !self.running || self.stopping || self.pending_start.is_some() {
             return;
         }
+        if !self.engine_ready() {
+            return;
+        }
+        if self.engine_updater.required.is_some() {
+            self.engine_updater.prompt = true;
+            self.last_error = "필요한 EffectCraft 업데이트를 설치한 뒤 렌더링하세요".into();
+            return;
+        }
         let workers = self.connected_render_workers();
         if workers.is_empty() {
             self.last_error = "렌더링에 사용할 작업 PC를 연결하고 선택하세요".into();
@@ -167,6 +175,8 @@ impl App {
             self.queue_workers = workers;
         }
         self.last_error.clear();
+        self.monitor = true;
+        self.queue_view = false;
         farm::begin_render(&self.config(), job, &self.state);
     }
 
@@ -208,7 +218,10 @@ impl App {
         match validate_unique(&task, &self.settings.queue) {
             Ok(()) => {
                 self.settings.queue.push(task);
-                self.queue_detail = Some(id);
+                self.queue_detail = None;
+                self.queue_edit = None;
+                self.monitor = true;
+                self.queue_view = true;
                 self.last_error.clear();
             }
             Err(error) => self.last_error = error,
@@ -217,6 +230,10 @@ impl App {
 
     pub(crate) fn start_next_queued(&mut self) {
         if self.running || self.pending_start.is_some() || self.worker_active.load(Ordering::Relaxed) || self.pending_preview.is_some() {
+            return;
+        }
+        if !self.engine_ready() {
+            self.queue_automatic = false;
             return;
         }
         let Some(task) = self.settings.queue.iter().find(|task| task.status == Status::Pending).cloned() else {
@@ -350,6 +367,7 @@ mod tests {
     fn app() -> App {
         let settings = Settings { queue: vec![task(1), task(2)], queue_cards: true, ..Settings::default() };
         let mut app = App::with_state(settings, None, Arc::new(Mutex::new(State::default())));
+        app.engine_updater.local = Some("0.23.1".into());
         app.settings_in_memory = true;
         app
     }
@@ -630,7 +648,8 @@ mod tests {
                 let mut line = String::new();
                 reader.read_line(&mut line).unwrap();
                 assert_eq!(serde_json::from_str::<serde_json::Value>(&line).unwrap()["type"], "hello");
-                writeln!(stream, "{}", serde_json::json!({"type": "ready", "comp": comp, "queue": true})).unwrap();
+                writeln!(stream, "{}", serde_json::json!({"type": "ready", "comp": comp, "queue": true, "engine": {"installed": "0.23.1", "latest": null}}))
+                    .unwrap();
                 line.clear();
                 reader.read_line(&mut line).unwrap();
                 assert_eq!(serde_json::from_str::<serde_json::Value>(&line).unwrap()["type"], "request");
