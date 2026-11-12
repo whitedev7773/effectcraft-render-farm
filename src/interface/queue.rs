@@ -5,7 +5,7 @@ fn status_color(status: Status) -> egui::Color32 {
     match status {
         Status::Completed => GREEN,
         Status::Failed => egui::Color32::LIGHT_RED,
-        Status::Preparing | Status::Rendering | Status::Encoding => BLUE,
+        Status::Preparing | Status::Waiting | Status::Rendering | Status::Encoding => BLUE,
         _ => MUTED,
     }
 }
@@ -21,7 +21,7 @@ impl App {
             section_title(ui, "렌더 큐");
             let pending = self.settings.queue.iter().filter(|task| task.status == Status::Pending).count();
             caption(ui, format!("{}개 작업 · 대기 {pending}개", self.settings.queue.len()));
-            ui.selectable_value(&mut self.settings.queue_cards, false, "리스트");
+            ui.selectable_value(&mut self.settings.queue_cards, false, "목록");
             ui.selectable_value(&mut self.settings.queue_cards, true, "카드");
         });
         if self.settings.queue.is_empty() {
@@ -34,6 +34,11 @@ impl App {
                 ("출력 파일", !self.settings.final_video.is_empty()),
             ] {
                 layout::value_row(ui, label, if ready { "준비됨" } else { "선택 전" });
+            }
+            ui.add_space(layout::SPACE);
+            if ui.add_sized([136.0, layout::CONTROL], egui::Button::new(if self.running { "프로젝트 화면" } else { "프로젝트 준비" })).clicked() {
+                self.monitor = false;
+                self.queue_view = false;
             }
             return;
         }
@@ -60,7 +65,8 @@ impl App {
         let top = ui.cursor().top();
         let active = self.queue_active == Some(task.id);
         ui.horizontal(|ui| {
-            let width = (ui.available_width() - 88.0).max(80.0);
+            // Reserve enough room for long status labels such as “MP4 출력 중”.
+            let width = (ui.available_width() - 120.0 - ui.spacing().item_spacing.x).max(1.0);
             let (rect, response) = ui.allocate_exact_size(egui::vec2(width, layout::CONTROL), egui::Sense::click());
             let mut title = ui.new_child(egui::UiBuilder::new().max_rect(rect).layout(egui::Layout::left_to_right(egui::Align::Center)));
             title.set_clip_rect(rect.intersect(ui.clip_rect()));
@@ -89,11 +95,8 @@ impl App {
         let (footer, _) = ui.allocate_exact_size(egui::vec2(ui.available_width(), layout::CONTROL), egui::Sense::hover());
         let movable = task.status == Status::Pending && !active;
         let index = self.settings.queue.iter().position(|entry| entry.id == task.id).unwrap_or(0);
-        let up = egui::Rect::from_min_size(
-            footer.min + egui::vec2(0.0, (layout::CONTROL - layout::COMPACT_CONTROL) / 2.0),
-            egui::Vec2::splat(layout::COMPACT_CONTROL),
-        );
-        let down = up.translate(egui::vec2(layout::COMPACT_CONTROL + 4.0, 0.0));
+        let up = egui::Rect::from_min_size(footer.min, egui::Vec2::splat(layout::CONTROL));
+        let down = up.translate(egui::vec2(layout::CONTROL + 4.0, 0.0));
         if button_at(ui, up, "queue-up", ButtonSpec::new("↑", ButtonKind::Quiet, movable && index > 0 && !self.settings.queue[index - 1].status.in_progress()))
             .on_hover_text("순서 올리기")
             .clicked()
@@ -191,7 +194,7 @@ impl App {
                     });
                     ui.horizontal_wrapped(|ui| {
                         ui.checkbox(&mut edit.render.previews, "현재 프레임 미리보기");
-                        ui.add(egui::DragValue::new(&mut edit.render.preview_seconds).range(1..=30).suffix("초 간격"));
+                        ui.add_enabled(edit.render.previews, egui::DragValue::new(&mut edit.render.preview_seconds).range(1..=30).suffix("초 간격"));
                     });
                     ui.collapsing("작업 분배 · 고급 설정", |ui| {
                         ui.horizontal_wrapped(|ui| {

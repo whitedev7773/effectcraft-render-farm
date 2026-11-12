@@ -167,6 +167,7 @@ impl App {
         ui.horizontal_wrapped(|ui| {
             if !wide && ui.selectable_label(!self.monitor, "프로젝트 · 연결").clicked() {
                 self.monitor = false;
+                self.queue_view = false;
             }
             if ui.selectable_label((wide || self.monitor) && !self.queue_view, "진행 현황").clicked() {
                 self.monitor = true;
@@ -210,7 +211,7 @@ impl App {
                 if icon_button(ui, UiIcon::Settings, "설정").clicked() {
                     self.settings_open = true;
                 }
-                if icon_button(ui, UiIcon::History, "작업 기록").clicked() {
+                if icon_button(ui, UiIcon::History, "작업 로그").clicked() {
                     self.logs_open = true;
                 }
                 if (self.updater.available.is_some() || self.engine_updater.required.is_some())
@@ -245,7 +246,7 @@ impl App {
             return Some("EffectCraft 버전을 확인하고 있습니다…".into());
         }
         if self.engine_updater.local.is_none() {
-            return Some("설정 → 앱 정보에서 EffectCraft 설치 상태를 확인하세요.".into());
+            return Some("설정 → 앱과 업데이트에서 EffectCraft 설치 상태를 확인하세요.".into());
         }
         if self.pending_preview.is_some() || self.worker_active.load(Ordering::Relaxed) {
             return Some("진행 중인 작업을 마치고 있습니다…".into());
@@ -311,8 +312,13 @@ impl App {
                 "호스트와 연결되어 있습니다. 작업 지시를 기다립니다.".into()
             }
         };
+        let show_hint_above = !self.running && !busy && self.start_blocker().is_some() && ui.available_width() < 780.0;
+        if show_hint_above {
+            ui.add(egui::Label::new(egui::RichText::new(&hint).size(12.0).color(MUTED)).wrap());
+            ui.add_space(layout::SPACE);
+        }
         let clicks = footer_buttons(ui, None, primary, dismiss, layout::PRIMARY_CONTROL);
-        if let Some(rect) = clicks.free_left {
+        if let Some(rect) = clicks.free_left.filter(|_| !show_hint_above) {
             footer_status(ui, rect, &hint, busy);
         }
         if clicks.primary {
@@ -371,6 +377,9 @@ impl App {
                 ui.selectable_value(&mut self.settings.host, true, "호스트");
                 ui.selectable_value(&mut self.settings.host, false, "작업 PC");
             });
+            if !self.settings.host {
+                self.queue_view = false;
+            }
             ui.add_space(8.0);
             if self.settings.host {
                 if path_row(ui, "프로젝트", &mut self.settings.project)
@@ -391,6 +400,9 @@ impl App {
                     });
                 if previous != self.settings.comp {
                     self.sync_selected_comp_range();
+                }
+                if ui.add_enabled(!self.settings.project.trim().is_empty(), egui::Button::new("컴포지션 목록 새로고침")).clicked() {
+                    self.catalog_changed = Some(Instant::now());
                 }
                 if let Some(comp) = self.catalog.iter().find(|comp| comp.name == self.settings.comp) {
                     caption(ui, format!("{} × {}  ·  {:.3} fps", comp.width, comp.height, comp.rate.as_f64()));
@@ -511,7 +523,7 @@ impl App {
                     self.settings_open = false;
                 }
                 ui.horizontal_wrapped(|ui| {
-                    for (tab, label) in [(0, "일반"), (1, "렌더링"), (2, "연결"), (3, "앱 정보")] {
+                    for (tab, label) in [(0, "화면"), (1, "렌더링"), (2, "연결"), (3, "앱과 업데이트")] {
                         ui.selectable_value(&mut self.settings_tab, tab, label);
                     }
                 });
@@ -522,6 +534,7 @@ impl App {
                     .min_scrolled_height((ctx.content_rect().height() - 230.0).clamp(120.0, 620.0))
                     .show(ui, |ui| {
                         if self.settings_tab == 0 {
+                            section_title(ui, "화면 동작");
                             ui.checkbox(&mut self.settings.reduced_motion, "동작 줄이기 · 전환과 진행률 애니메이션 끄기");
                             ui.add_space(layout::GAP);
                         }
@@ -546,27 +559,22 @@ impl App {
     }
 
     fn general_settings(&mut self, ui: &mut egui::Ui) {
-        section_title(ui, "렌더링");
+        section_title(ui, "작업 화면 미리보기");
+        ui.checkbox(&mut self.settings.render.previews, "PC별 프레임 미리보기");
+        ui.add_enabled_ui(self.settings.render.previews, |ui| {
+            ui.horizontal_wrapped(|ui| {
+                ui.label("미리보기 주기");
+                ui.add(egui::DragValue::new(&mut self.settings.render.preview_seconds).range(1..=30).suffix("초"));
+            });
+        });
+    }
+
+    fn render_settings(&mut self, ui: &mut egui::Ui) {
+        section_title(ui, "렌더 성능과 참여");
         ui.checkbox(&mut self.settings.render.automatic, "자동 최적화").on_hover_text("CPU/GPU, 인코더, 스레드 수와 작업량을 PC 성능에 맞춰 조절합니다.");
         ui.checkbox(&mut self.settings.local_worker, "호스트 PC도 렌더링에 참여");
         ui.add_enabled(!self.settings.render.automatic, egui::Checkbox::new(&mut self.settings.gpu, "수동: 이 PC에서 GPU 가속 사용"));
         ui.add_space(layout::GAP);
-        section_title(ui, "화면과 동작");
-        ui.checkbox(&mut self.settings.render.previews, "PC별 프레임 미리보기");
-        ui.horizontal_wrapped(|ui| {
-            ui.label("미리보기 주기");
-            ui.add(egui::DragValue::new(&mut self.settings.render.preview_seconds).range(1..=30).suffix("초"));
-        });
-        ui.add_space(layout::GAP);
-        caption(ui, "EffectCraft CLI");
-        caption(ui, format!("EffectCraft {}", self.engine_updater.local.as_deref().unwrap_or("버전 확인 필요")));
-        ui.label(egui::RichText::new(&self.settings.cli).small());
-        if ui.button("컴포지션 목록 새로고침").clicked() {
-            self.catalog_changed = Some(Instant::now());
-        }
-    }
-
-    fn render_settings(&mut self, ui: &mut egui::Ui) {
         section_title(ui, "품질과 출력");
         let options = &mut self.settings.render;
         ui.checkbox(&mut options.draft, "Draft 품질").on_hover_text("빠른 검토용 품질입니다. 끄면 Best 품질을 사용합니다.");
@@ -575,52 +583,54 @@ impl App {
             ui.label("H.264 비트레이트");
             ui.add(egui::DragValue::new(&mut options.video_bitrate).range(100..=200_000).speed(100).suffix("kbps"));
         });
-        ui.add_enabled(!options.automatic, egui::Checkbox::new(&mut options.nvenc, "FFmpeg 직접 인코딩"));
-        if path_row(ui, "FFmpeg 경로 · 비워 두면 자동 감지", &mut options.ffmpeg)
-            && let Some(path) = rfd::FileDialog::new().pick_file()
-        {
-            options.ffmpeg = path.display().to_string();
-        }
-        ui.add_space(layout::SPACE);
-        caption(ui, format!("프레임 저장 폴더 · 자동: {}", settings::frame_output(&self.settings.project).display()));
-        ui.add_space(layout::GAP);
-        section_title(ui, "작업 분배와 복구");
-        ui.horizontal_wrapped(|ui| {
-            ui.label("목표 구간 시간");
-            ui.add(egui::DragValue::new(&mut options.target_seconds).range(5..=300).suffix("초"));
-        });
-        ui.horizontal_wrapped(|ui| {
-            ui.label("최대 시도 횟수");
-            ui.add(egui::DragValue::new(&mut options.retries).range(1..=10).suffix("회"));
-        });
-        ui.add_enabled(!options.automatic, egui::Checkbox::new(&mut options.adaptive, "처리 속도에 따라 구간 나누기"));
-        ui.checkbox(&mut options.durable_writes, "수신 프레임마다 디스크 동기화");
-        caption(ui, "디스크 동기화는 전원 장애에 대비하지만 저장 시간이 늘어납니다.");
-        ui.horizontal_wrapped(|ui| {
-            ui.label("프레임 감지 주기");
-            ui.add(egui::DragValue::new(&mut options.poll_ms).range(50..=2000).suffix("ms"));
-        });
-        ui.horizontal_wrapped(|ui| {
-            ui.label("구간 분배");
-            ui.selectable_value(&mut self.settings.distribution, Distribution::Auto, "자동");
-            ui.selectable_value(&mut self.settings.distribution, Distribution::Frames, "프레임");
-            ui.selectable_value(&mut self.settings.distribution, Distribution::Percent, "비율");
-        });
-        match self.settings.distribution {
-            Distribution::Frames => {
-                ui.add(egui::DragValue::new(&mut self.settings.chunk_frames).range(1..=100_000).suffix("프레임"));
+        ui.collapsing("고급 설정 · 인코딩과 작업 분배", |ui| {
+            ui.add_enabled(!options.automatic, egui::Checkbox::new(&mut options.nvenc, "FFmpeg 직접 인코딩"));
+            if path_row(ui, "FFmpeg 경로 · 비워 두면 자동 감지", &mut options.ffmpeg)
+                && let Some(path) = rfd::FileDialog::new().pick_file()
+            {
+                options.ffmpeg = path.display().to_string();
             }
-            Distribution::Percent => {
-                ui.add(egui::DragValue::new(&mut self.settings.chunk_percent).range(0.01..=100.0).suffix("%"));
-            }
-            Distribution::Auto => {}
-        }
-        if !self.settings.render.automatic {
+            ui.add_space(layout::SPACE);
+            caption(ui, format!("프레임 저장 폴더 · 자동: {}", settings::frame_output(&self.settings.project).display()));
+            ui.add_space(layout::GAP);
+            section_title(ui, "작업 분배와 복구");
             ui.horizontal_wrapped(|ui| {
-                ui.label("동시 작업 PC");
-                ui.add(egui::DragValue::new(&mut self.settings.max_workers).range(1..=64).suffix("대"));
+                ui.label("목표 구간 시간");
+                ui.add(egui::DragValue::new(&mut options.target_seconds).range(5..=300).suffix("초"));
             });
-        }
+            ui.horizontal_wrapped(|ui| {
+                ui.label("최대 시도 횟수");
+                ui.add(egui::DragValue::new(&mut options.retries).range(1..=10).suffix("회"));
+            });
+            ui.add_enabled(!options.automatic, egui::Checkbox::new(&mut options.adaptive, "처리 속도에 따라 구간 나누기"));
+            ui.checkbox(&mut options.durable_writes, "수신 프레임마다 디스크 동기화");
+            caption(ui, "디스크 동기화는 전원 장애에 대비하지만 저장 시간이 늘어납니다.");
+            ui.horizontal_wrapped(|ui| {
+                ui.label("프레임 감지 주기");
+                ui.add(egui::DragValue::new(&mut options.poll_ms).range(50..=2000).suffix("ms"));
+            });
+            ui.horizontal_wrapped(|ui| {
+                ui.label("구간 분배");
+                ui.selectable_value(&mut self.settings.distribution, Distribution::Auto, "자동");
+                ui.selectable_value(&mut self.settings.distribution, Distribution::Frames, "프레임");
+                ui.selectable_value(&mut self.settings.distribution, Distribution::Percent, "비율");
+            });
+            match self.settings.distribution {
+                Distribution::Frames => {
+                    ui.add(egui::DragValue::new(&mut self.settings.chunk_frames).range(1..=100_000).suffix("프레임"));
+                }
+                Distribution::Percent => {
+                    ui.add(egui::DragValue::new(&mut self.settings.chunk_percent).range(0.01..=100.0).suffix("%"));
+                }
+                Distribution::Auto => {}
+            }
+            if !options.automatic {
+                ui.horizontal_wrapped(|ui| {
+                    ui.label("동시 작업 PC");
+                    ui.add(egui::DragValue::new(&mut self.settings.max_workers).range(1..=64).suffix("대"));
+                });
+            }
+        });
     }
 
     fn connection_settings(&mut self, ui: &mut egui::Ui) {
@@ -635,6 +645,8 @@ impl App {
     fn about_settings(&mut self, ui: &mut egui::Ui) {
         section_title(ui, "EffectCraft");
         caption(ui, format!("설치 버전 {}", self.engine_updater.local.as_deref().unwrap_or("확인 필요")));
+        caption(ui, "CLI 경로");
+        ui.label(egui::RichText::new(&self.settings.cli).small());
         ui.label(&self.engine_updater.status);
         if ui
             .add_enabled(
@@ -683,7 +695,7 @@ impl App {
                 ui.disable();
             }
             ui.set_width((ctx.content_rect().width() - 64.0).clamp(280.0, 1000.0));
-            if dialog_header(ui, "작업 기록", "작업 기록 닫기") {
+            if dialog_header(ui, "작업 로그", "작업 로그 닫기") {
                 self.logs_open = false;
             }
             let wide = ui.available_width() >= 640.0;

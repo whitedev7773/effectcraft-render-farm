@@ -16,7 +16,7 @@ impl App {
             let height = if self.running {
                 224.0
             } else if self.settings.host {
-                624.0
+                664.0
             } else {
                 440.0
             };
@@ -24,7 +24,11 @@ impl App {
             ui.add_space(SPACE);
             flow_tile(ui, 224.0, "connection", |ui| self.connection_content(ui));
             ui.add_space(SPACE);
-            flow_tile(ui, 224.0, "configuration", |ui| self.configuration_content(ui));
+            flow_tile(ui, 256.0, "configuration", |ui| self.configuration_content(ui));
+            if self.settings.host {
+                ui.add_space(SPACE);
+                flow_tile(ui, 224.0, "project-queue", |ui| self.queue_summary(ui));
+            }
         } else if self.queue_view && self.settings.host {
             let height = viewport_height.max(440.0);
             flow_tile(ui, height, "queue-dashboard", |ui| self.queue_panel(ui, height - PADDING as f32 * 2.0));
@@ -51,7 +55,7 @@ impl App {
 
     fn project_grid(&mut self, ui: &mut egui::Ui, rect: egui::Rect) {
         let column = (rect.width() - GAP * 2.0) / 3.0;
-        let header_height = 224.0;
+        let header_height = 256.0;
         let form = egui::Rect::from_min_size(rect.min, egui::vec2(column, rect.height()));
         let connection = egui::Rect::from_min_size(egui::pos2(form.right() + GAP, rect.top()), egui::vec2(column, header_height));
         let configuration = egui::Rect::from_min_max(egui::pos2(connection.right() + GAP, rect.top()), egui::pos2(rect.right(), connection.bottom()));
@@ -61,7 +65,7 @@ impl App {
         tile(ui, configuration, "configuration", false, |ui| self.configuration_content(ui));
         tile(ui, queue, "project-queue", false, |ui| {
             if self.settings.host {
-                self.queue_panel(ui, queue.height() - PADDING as f32 * 2.0);
+                self.queue_summary(ui);
             } else {
                 section_title(ui, "연결 상태");
                 caption(ui, "호스트에 연결하면 작업 지시와 렌더 진행 상태를 확인할 수 있습니다.");
@@ -139,16 +143,58 @@ impl App {
         }
     }
 
-    fn configuration_content(&self, ui: &mut egui::Ui) {
-        section_title(ui, "렌더 설정");
+    fn configuration_content(&mut self, ui: &mut egui::Ui) {
+        section_title(ui, if self.settings.host { "렌더 설정" } else { "작업 설정" });
+        if !self.settings.host {
+            caption(ui, "렌더 품질과 출력 설정은 호스트에서 정합니다.");
+            value_row(ui, "EffectCraft", self.engine_updater.local.as_deref().unwrap_or("확인 중"));
+            return;
+        }
         for (label, value) in [
             ("품질", if self.settings.render.draft { "Draft".into() } else { "Best".into() }),
             ("최적화", if self.settings.render.automatic { "자동".into() } else { "수동".into() }),
             ("오디오", if self.settings.render.audio { "포함".into() } else { "제외".into() }),
             ("미리보기", if self.settings.render.previews { format!("{}초 간격", self.settings.render.preview_seconds) } else { "끄기".into() }),
-            ("EffectCraft", self.engine_updater.local.clone().unwrap_or_else(|| "확인 중".into())),
         ] {
             value_row(ui, label, &value);
+        }
+        if ui.add_sized([120.0, CONTROL], egui::Button::new("렌더 설정 변경")).clicked() {
+            self.settings_tab = 1;
+            self.settings_open = true;
+        }
+    }
+
+    fn queue_summary(&mut self, ui: &mut egui::Ui) {
+        section_title(ui, "렌더 큐");
+        let pending = self.settings.queue.iter().filter(|task| task.status == crate::queue::Status::Pending).count();
+        value_row(ui, "전체 작업", &format!("{}개", self.settings.queue.len()));
+        value_row(ui, "대기 중", &format!("{pending}개"));
+        if let Some(task) = self.settings.queue.iter().find(|task| task.status == crate::queue::Status::Pending) {
+            ui.add(egui::Label::new(egui::RichText::new(format!("다음 작업 · {}", task.composition.name)).color(MUTED)).truncate())
+                .on_hover_text(&task.composition.name);
+        } else if self.settings.queue.is_empty() {
+            caption(ui, "프로젝트를 준비해 작업을 추가하세요.");
+        } else {
+            caption(ui, "대기 중인 작업이 없습니다.");
+        }
+        if ui.add_sized([120.0, CONTROL], egui::Button::new("렌더 큐 열기")).clicked() {
+            self.monitor = true;
+            self.queue_view = true;
+        }
+        if ui.available_height() >= 100.0 && !self.settings.queue.is_empty() {
+            ui.add_space(SPACE);
+            ui.separator();
+            caption(ui, "작업 목록");
+            for task in self.settings.queue.iter().take(4) {
+                ui.horizontal(|ui| {
+                    let name_width = (ui.available_width() - 88.0).max(40.0);
+                    ui.add_sized([name_width, 20.0], egui::Label::new(&task.composition.name).truncate()).on_hover_text(&task.composition.name);
+                    caption(ui, task.status.label());
+                });
+            }
+            if self.settings.queue.len() > 4 {
+                caption(ui, format!("외 {}개 작업", self.settings.queue.len() - 4));
+            }
         }
     }
 
@@ -327,7 +373,7 @@ impl App {
 
     fn activity_content(&mut self, ui: &mut egui::Ui, workers: &[farm::WorkerInfo]) {
         ui.horizontal(|ui| {
-            section_title(ui, "작업 기록");
+            section_title(ui, "작업 로그");
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                 if ui.add_sized([80.0, CONTROL], egui::Button::new("전체 기록").frame(false)).clicked() {
                     self.logs_open = true;
