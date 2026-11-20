@@ -1,21 +1,44 @@
 use super::*;
 mod buttons;
+mod components;
+pub(super) mod import;
 use buttons::{ButtonKind, ButtonSpec, button_at, dialog_header, footer_buttons, footer_status};
 mod dashboard;
 pub(crate) mod layout;
 mod queue;
+mod shell;
 mod updates;
 
 #[cfg(any(test, debug_assertions))]
 pub(super) mod review;
 
-const BACKGROUND: egui::Color32 = egui::Color32::from_rgb(13, 15, 20);
-const SURFACE: egui::Color32 = egui::Color32::from_rgb(22, 25, 32);
-const SURFACE_SECONDARY: egui::Color32 = egui::Color32::from_rgb(29, 33, 42);
-const BORDER: egui::Color32 = egui::Color32::from_rgb(47, 53, 66);
-const MUTED: egui::Color32 = egui::Color32::from_rgb(169, 179, 196);
-const BLUE: egui::Color32 = egui::Color32::from_rgb(4, 133, 247);
-const GREEN: egui::Color32 = egui::Color32::from_rgb(76, 214, 124);
+fn background(ui: &egui::Ui) -> egui::Color32 {
+    ui.visuals().panel_fill
+}
+fn surface(ui: &egui::Ui) -> egui::Color32 {
+    ui.visuals().window_fill
+}
+fn secondary(ui: &egui::Ui) -> egui::Color32 {
+    ui.visuals().faint_bg_color
+}
+fn border(ui: &egui::Ui) -> egui::Color32 {
+    ui.visuals().widgets.noninteractive.bg_stroke.color
+}
+fn muted(ui: &egui::Ui) -> egui::Color32 {
+    if ui.visuals().dark_mode { egui::Color32::from_rgb(151, 158, 168) } else { egui::Color32::from_rgb(105, 111, 119) }
+}
+fn accent(ui: &egui::Ui) -> egui::Color32 {
+    if ui.visuals().dark_mode { egui::Color32::from_rgb(106, 170, 255) } else { egui::Color32::from_rgb(34, 102, 215) }
+}
+fn success(ui: &egui::Ui) -> egui::Color32 {
+    if ui.visuals().dark_mode { egui::Color32::from_rgb(116, 200, 160) } else { egui::Color32::from_rgb(34, 126, 85) }
+}
+fn danger(ui: &egui::Ui) -> egui::Color32 {
+    if ui.visuals().dark_mode { egui::Color32::from_rgb(255, 150, 150) } else { egui::Color32::from_rgb(168, 36, 36) }
+}
+fn warning(ui: &egui::Ui) -> egui::Color32 {
+    if ui.visuals().dark_mode { egui::Color32::from_rgb(245, 205, 120) } else { egui::Color32::from_rgb(135, 90, 0) }
+}
 
 #[derive(Clone, Copy)]
 enum UiIcon {
@@ -50,35 +73,39 @@ fn icon_image(ui: &egui::Ui, icon: UiIcon) -> egui::Image<'static> {
         ui.ctx().data_mut(|data| data.insert_temp(id, texture.clone()));
         texture
     };
-    egui::Image::new((texture.id(), texture.size_vec2())).fit_to_exact_size(egui::vec2(18.0, 18.0))
+    egui::Image::new((texture.id(), texture.size_vec2())).fit_to_exact_size(egui::vec2(18.0, 18.0)).tint(ui.visuals().text_color())
 }
 
 fn icon_button(ui: &mut egui::Ui, icon: UiIcon, label: &str) -> egui::Response {
     ui.add_sized([layout::CONTROL, layout::CONTROL], egui::Button::image(icon_image(ui, icon)).frame(false)).on_hover_text(label)
 }
 
-fn card() -> egui::Frame {
-    egui::Frame::new().fill(SURFACE).stroke(egui::Stroke::new(1.0, BORDER)).corner_radius(layout::RADIUS).inner_margin(layout::PADDING)
+fn card(ctx: &egui::Context) -> egui::Frame {
+    let style = ctx.style_of(ctx.theme());
+    let visuals = &style.visuals;
+    egui::Frame::new().fill(visuals.window_fill).stroke(visuals.widgets.noninteractive.bg_stroke).corner_radius(layout::RADIUS).inner_margin(layout::PADDING)
 }
 
 fn badge(ui: &mut egui::Ui, text: &str, color: egui::Color32) {
-    egui::Frame::new().fill(color.gamma_multiply(0.12)).corner_radius(4).inner_margin(egui::Margin::symmetric(8, 4)).show(ui, |ui| {
-        ui.label(egui::RichText::new(text).size(12.0).color(color));
-    });
+    components::status(ui, text, color);
 }
 
 fn animated_modal(ctx: &egui::Context, id: &str, open: bool, reduced: bool) -> Option<(egui::Modal, f32)> {
+    if !open {
+        ctx.data_mut(|data| data.insert_temp(egui::Id::new((id, "reveal")), Spring::default()));
+        return None;
+    }
     let reveal = motion(ctx, egui::Id::new((id, "reveal")), f32::from(open), reduced);
     if reveal < 0.001 {
         return None;
     }
     let area = egui::Modal::default_area(egui::Id::new(id)).anchor(egui::Align2::CENTER_CENTER, egui::vec2(0.0, (1.0 - reveal) * 14.0));
-    let frame = card().fill(SURFACE.gamma_multiply(reveal)).stroke(egui::Stroke::new(1.0, BORDER.gamma_multiply(reveal)));
+    let frame = card(ctx);
     Some((egui::Modal::new(egui::Id::new(id)).area(area).frame(frame).backdrop_color(egui::Color32::from_black_alpha((160.0 * reveal) as u8)), reveal))
 }
 
 fn caption(ui: &mut egui::Ui, text: impl Into<String>) {
-    ui.label(egui::RichText::new(text).size(12.0).color(MUTED));
+    ui.label(egui::RichText::new(text).size(12.0).color(muted(ui)));
 }
 
 fn duration(seconds: f64) -> String {
@@ -130,19 +157,38 @@ fn metric(ui: &mut egui::Ui, label: &str, value: &str) {
 impl App {
     pub(super) fn draw_interface(&mut self, root: &mut egui::Ui) {
         let ctx = root.ctx().clone();
-        ctx.style_mut_of(egui::Theme::Dark, |style| style.animation_time = if self.settings.reduced_motion { 0.0 } else { 0.24 });
+        ctx.set_theme(self.settings.theme.egui());
+        ctx.style_mut_of(self.settings.theme.egui(), |style| style.animation_time = if self.settings.reduced_motion { 0.0 } else { 0.24 });
+        let compact = ctx.content_rect().width() < 1000.0;
+        if !compact {
+            egui::Panel::left("workspace-sidebar")
+                .resizable(false)
+                .default_size(200.0)
+                .min_size(200.0)
+                .max_size(200.0)
+                .show_separator_line(false)
+                .frame(egui::Frame::new().fill(surface(root)).inner_margin(egui::Margin::symmetric(16, 20)))
+                .show(root, |ui| self.sidebar(ui));
+        }
         egui::Panel::bottom("primary-actions")
-            .frame(egui::Frame::new().fill(SURFACE).stroke(egui::Stroke::new(1.0, BORDER)).inner_margin(egui::Margin::symmetric(layout::PADDING, 8)))
+            .show_separator_line(false)
+            .frame(egui::Frame::new().fill(surface(root)).inner_margin(egui::Margin::symmetric(24, 14)))
             .show(root, |ui| {
+                ui.painter().hline(ui.max_rect().x_range(), ui.max_rect().top() - 14.0, egui::Stroke::new(1.0, border(ui)));
                 self.action_bar(ui);
             });
-        egui::CentralPanel::default().frame(egui::Frame::new().fill(BACKGROUND).inner_margin(layout::PADDING)).show(root, |ui| {
-            self.toolbar(ui);
-            ui.add_space(layout::SPACE);
+        let padding = if compact { 16 } else { 24 };
+        egui::CentralPanel::default().frame(egui::Frame::new().fill(background(root)).inner_margin(padding)).show(root, |ui| {
+            self.page_heading(ui, compact);
+            if compact {
+                self.workspace_tabs(ui);
+                ui.add_space(12.0);
+            }
             if !self.last_error.is_empty() {
-                egui::Frame::new().fill(egui::Color32::from_rgb(58, 31, 36)).corner_radius(layout::RADIUS).inner_margin(layout::PADDING).show(ui, |ui| {
+                let error_fill = if ui.visuals().dark_mode { egui::Color32::from_rgb(58, 31, 36) } else { egui::Color32::from_rgb(255, 239, 239) };
+                egui::Frame::new().fill(error_fill).corner_radius(layout::RADIUS).inner_margin(12).show(ui, |ui| {
                     ui.horizontal_wrapped(|ui| {
-                        ui.colored_label(egui::Color32::LIGHT_RED, &self.last_error);
+                        ui.colored_label(danger(ui), &self.last_error);
                         if ui.add_sized([64.0, layout::COMPACT_CONTROL], egui::Button::new("닫기").small()).clicked() {
                             self.last_error.clear();
                         }
@@ -150,8 +196,6 @@ impl App {
                 });
                 ui.add_space(layout::SPACE);
             }
-            self.workspace_tabs(ui, false);
-            ui.add_space(layout::SPACE);
             let height = ui.available_height();
             egui::ScrollArea::vertical().id_salt(("workspace", self.monitor, self.queue_view)).auto_shrink([false, false]).show(ui, |ui| {
                 self.workspace_grid(ui, height);
@@ -161,80 +205,23 @@ impl App {
         self.logs_dialog(&ctx);
         self.worker_dialog(&ctx);
         self.queue_dialog(&ctx);
+        self.project_import_ui(&ctx);
     }
 
-    fn workspace_tabs(&mut self, ui: &mut egui::Ui, wide: bool) {
-        ui.horizontal_wrapped(|ui| {
-            if !wide && ui.selectable_label(!self.monitor, "프로젝트 · 연결").clicked() {
-                self.monitor = false;
-                self.queue_view = false;
-            }
-            if ui.selectable_label((wide || self.monitor) && !self.queue_view, "진행 현황").clicked() {
-                self.monitor = true;
-                self.queue_view = false;
-            }
-            if self.settings.host && ui.selectable_label((wide || self.monitor) && self.queue_view, format!("렌더 큐  {}", self.settings.queue.len())).clicked()
-            {
-                self.monitor = true;
-                self.queue_view = true;
-            }
-        });
-    }
-
-    fn toolbar(&mut self, ui: &mut egui::Ui) {
-        ui.horizontal_wrapped(|ui| {
-            ui.vertical(|ui| {
-                ui.label(egui::RichText::new("Render Farm").size(26.0).strong());
-            });
-            ui.add_space(layout::SPACE);
-            let (label, color) = if self.stopping {
-                ("중지 중", MUTED)
-            } else if self.pending_start.is_some() {
-                ("준비 중", BLUE)
-            } else if self.running {
-                let rendering = self.state.lock().unwrap_or_else(std::sync::PoisonError::into_inner).dispatch_enabled;
-                (
-                    if self.settings.host && rendering {
-                        "렌더링 중"
-                    } else if self.settings.host {
-                        "PC 연결 대기"
-                    } else {
-                        "호스트 연결됨"
-                    },
-                    GREEN,
-                )
-            } else {
-                ("연결 대기", MUTED)
-            };
-            badge(ui, label, color);
-            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                if icon_button(ui, UiIcon::Settings, "설정").clicked() {
-                    self.settings_open = true;
-                }
-                if icon_button(ui, UiIcon::History, "작업 로그").clicked() {
-                    self.logs_open = true;
-                }
-                if (self.updater.available.is_some() || self.engine_updater.required.is_some())
-                    && ui
-                        .add(egui::Button::image_and_text(icon_image(ui, UiIcon::Update), "업데이트"))
-                        .on_hover_text("EffectCraft 및 Render Farm 업데이트")
-                        .clicked()
-                {
-                    if self.engine_updater.required.is_some() {
-                        self.engine_updater.prompt = true;
-                    } else {
-                        self.updater.prompt = true;
-                    }
-                }
-            });
-        });
-        if self.updater.installing() {
-            caption(ui, format!("업데이트 준비 중 · {:.1} MiB", self.updater.progress.load(Ordering::Relaxed) as f64 / 1048576.0));
-        }
-        if self.engine_updater.installing() {
-            caption(ui, format!("EffectCraft 다운로드·설치 중 · {:.1} MiB", self.engine_updater.progress.load(Ordering::Relaxed) as f64 / 1048576.0));
-        } else if self.engine_install_requested {
-            caption(ui, "현재 작업을 마친 뒤 EffectCraft를 업데이트합니다.");
+    fn workspace_tabs(&mut self, ui: &mut egui::Ui) {
+        let selected = if !self.monitor {
+            0
+        } else if self.queue_view {
+            2
+        } else {
+            1
+        };
+        let queue = format!("렌더 큐  {}", self.settings.queue.len());
+        let labels =
+            if self.settings.host { vec!["프로젝트 준비", "렌더 모니터", queue.as_str()] } else { vec!["프로젝트 준비", "렌더 모니터"] };
+        if let Some(view) = components::segmented(ui, "workspace-tabs", selected, &labels) {
+            self.monitor = view != 0;
+            self.queue_view = view == 2;
         }
     }
 
@@ -251,16 +238,9 @@ impl App {
         if self.pending_preview.is_some() || self.worker_active.load(Ordering::Relaxed) {
             return Some("진행 중인 작업을 마치고 있습니다…".into());
         }
-        if self.settings.host && !self.settings.queue.is_empty() {
+        if self.settings.host {
             if !self.settings.queue.iter().any(|task| task.status == crate::queue::Status::Pending) {
-                return Some("렌더 큐에 작업을 추가하거나 기존 작업을 다시 대기 상태로 바꾸세요.".into());
-            }
-        } else if self.settings.host {
-            if let Some(missing) = self.missing_host_settings().first() {
-                return Some(format!("{missing} 항목을 준비하세요."));
-            }
-            if !self.catalog.iter().any(|comp| comp.name == self.settings.comp) {
-                return Some("렌더할 컴포지션을 선택하세요.".into());
+                return Some("프로젝트를 불러와 컴포지션을 큐에 추가하세요.".into());
             }
         } else if self.settings.client_address.trim().is_empty() {
             return Some("주변 호스트를 선택하거나 호스트 주소를 입력하세요.".into());
@@ -305,7 +285,7 @@ impl App {
             if self.stopping {
                 "진행 중인 구간을 마치고 연결을 종료합니다.".into()
             } else if self.settings.host && !started {
-                format!("사용할 연결 PC {}대 · PC 카드에서 렌더 참여를 선택하세요.", selected.len())
+                format!("사용할 연결 PC {}대 · 작업 PC 표에서 렌더 참여를 선택하세요.", selected.len())
             } else if started {
                 "렌더링 중 · 연결을 종료하면 현재 구간을 마친 뒤 중지합니다.".into()
             } else {
@@ -314,7 +294,7 @@ impl App {
         };
         let show_hint_above = !self.running && !busy && self.start_blocker().is_some() && ui.available_width() < 780.0;
         if show_hint_above {
-            ui.add(egui::Label::new(egui::RichText::new(&hint).size(12.0).color(MUTED)).wrap());
+            ui.add(egui::Label::new(egui::RichText::new(&hint).size(12.0).color(muted(ui))).wrap());
             ui.add_space(layout::SPACE);
         }
         let clicks = footer_buttons(ui, None, primary, dismiss, layout::PRIMARY_CONTROL);
@@ -341,93 +321,25 @@ impl App {
 
     fn setup_content(&mut self, ui: &mut egui::Ui) {
         ui.set_width(ui.available_width());
-        ui.spacing_mut().item_spacing.y = 8.0;
-        section_title(
-            ui,
-            if self.running {
-                "현재 작업"
-            } else if self.settings.host {
-                "프로젝트 준비"
-            } else {
-                "호스트 연결"
-            },
-        );
-        if self.running || self.pending_start.is_some() {
-            ui.add_space(8.0);
-            if self.settings.host {
-                ui.label(egui::RichText::new(&self.settings.comp).size(16.0).strong());
-                let name = std::path::Path::new(&self.settings.project).file_name().unwrap_or_default().to_string_lossy();
-                ui.label(name).on_hover_text(&self.settings.project);
-                ui.add_space(layout::SPACE);
-                caption(ui, "출력 파일");
-                let output = std::path::Path::new(&self.settings.final_video).file_name().unwrap_or_default().to_string_lossy();
-                ui.add(egui::Label::new(output).truncate()).on_hover_text(&self.settings.final_video);
-            } else {
-                caption(ui, "연결된 호스트");
-                ui.label(&self.settings.client_address);
-                caption(ui, "렌더 설정은 호스트에서 자동으로 적용됩니다.");
-            }
-            ui.add_space(8.0);
-            caption(ui, "연결을 종료하면 프로젝트와 연결 설정을 바꿀 수 있습니다.");
-            return;
-        }
-        ui.add_space(8.0);
+        section_title(ui, "연결 설정");
         ui.add_enabled_ui(!self.running && self.pending_start.is_none(), |ui| {
-            ui.horizontal(|ui| {
-                ui.selectable_value(&mut self.settings.host, true, "호스트");
-                ui.selectable_value(&mut self.settings.host, false, "작업 PC");
-            });
-            if !self.settings.host {
+            if let Some(role) = components::segmented(ui, "connection-role", usize::from(!self.settings.host), &["호스트", "작업 PC"]) {
+                self.settings.host = role == 0;
                 self.queue_view = false;
             }
+            caption(
+                ui,
+                if self.settings.host {
+                    "이 PC에서 큐와 출력 결과를 관리합니다."
+                } else {
+                    "연결된 호스트의 렌더링에 참여합니다."
+                },
+            );
             ui.add_space(8.0);
             if self.settings.host {
-                if path_row(ui, "프로젝트", &mut self.settings.project)
-                    && let Some(path) = rfd::FileDialog::new().add_filter("EffectCraft project", &["ecproj"]).pick_file()
-                {
-                    self.settings.project = path.display().to_string();
-                }
-                ui.add_space(layout::SPACE);
-                ui.label("컴포지션");
-                let previous = self.settings.comp.clone();
-                egui::ComboBox::from_id_salt("composition")
-                    .width(ui.available_width())
-                    .selected_text(if self.settings.comp.is_empty() { "컴포지션 선택" } else { &self.settings.comp })
-                    .show_ui(ui, |ui| {
-                        for comp in &self.catalog {
-                            ui.selectable_value(&mut self.settings.comp, comp.name.clone(), &comp.name);
-                        }
-                    });
-                if previous != self.settings.comp {
-                    self.sync_selected_comp_range();
-                }
-                if ui.add_enabled(!self.settings.project.trim().is_empty(), egui::Button::new("컴포지션 목록 새로고침")).clicked() {
-                    self.catalog_changed = Some(Instant::now());
-                }
-                if let Some(comp) = self.catalog.iter().find(|comp| comp.name == self.settings.comp) {
-                    caption(ui, format!("{} × {}  ·  {:.3} fps", comp.width, comp.height, comp.rate.as_f64()));
-                } else {
-                    caption(ui, if self.catalog_status.is_empty() { "프로젝트를 선택하면 컴포지션을 불러옵니다." } else { &self.catalog_status });
-                }
-                if self.catalog.iter().any(|comp| comp.name == self.settings.comp) {
-                    ui.add_space(layout::SPACE);
-                    let frames = self.settings.range_end.saturating_sub(self.settings.range_start);
-                    egui::CollapsingHeader::new(format!("렌더 범위 · {frames} 프레임")).id_salt("render-range").show(ui, |ui| self.range_controls(ui));
-                }
-                ui.add_space(layout::GAP);
-                if path_row(ui, "최종 MP4", &mut self.settings.final_video)
-                    && let Some(path) = rfd::FileDialog::new().add_filter("MP4 video", &["mp4"]).save_file()
-                {
-                    self.settings.final_video = path.display().to_string();
-                }
-                ui.add_space(8.0);
-                if ui
-                    .add_enabled(!self.settings.comp.is_empty() && !self.settings.final_video.trim().is_empty(), egui::Button::new("+ 렌더 큐에 추가"))
-                    .on_hover_text("여러 작업을 모아서 순서대로 렌더링합니다.")
-                    .clicked()
-                {
-                    self.enqueue_current();
-                }
+                text_row(ui, "수신 IP:포트", &mut self.settings.host_address, false);
+                caption(ui, "0.0.0.0은 모든 네트워크에서 수신합니다.");
+                ui.checkbox(&mut self.settings.local_worker, "이 PC도 렌더링에 참여");
             } else {
                 text_row(ui, "호스트 주소", &mut self.settings.client_address, false);
                 caption(ui, "예: 192.168.0.10:9778");
@@ -449,56 +361,14 @@ impl App {
                 if !self.discovery_status.is_empty() {
                     caption(ui, &self.discovery_status);
                 }
-                ui.add_space(layout::SPACE);
             }
             ui.add_space(8.0);
             text_row(ui, "접속 암호 · 8자 이상", &mut self.settings.token, true);
+            caption(ui, "호스트와 작업 PC에 같은 암호를 입력하세요.");
         });
-        ui.add_space(layout::GAP);
-        ui.separator();
-        if self.settings.host {
-            caption(
-                ui,
-                format!(
-                    "{} · {}",
-                    if self.settings.render.automatic { "자동 최적화" } else { "수동 설정" },
-                    if self.settings.render.draft { "Draft" } else { "Best 품질" }
-                ),
-            );
-        } else {
-            caption(ui, "렌더 설정: 호스트 기준");
+        if self.running || self.pending_start.is_some() {
+            caption(ui, "연결을 종료하면 연결 설정을 바꿀 수 있습니다.");
         }
-        if self.running && self.settings.host {
-            caption(ui, format!("연결 포트: {}", self.settings.host_address));
-        }
-    }
-
-    fn range_controls(&mut self, ui: &mut egui::Ui) {
-        let Some(comp) = self.catalog.iter().find(|comp| comp.name == self.settings.comp).cloned() else { return };
-        let total = comp.frames.max(1);
-        if self.settings.range_end == 0 {
-            self.settings.range_end = total;
-        }
-        self.settings.range_end = self.settings.range_end.clamp(1, total);
-        self.settings.range_start = self.settings.range_start.clamp(0, self.settings.range_end - 1);
-        ui.horizontal_wrapped(|ui| {
-            ui.label("렌더 범위");
-            ui.add(egui::DragValue::new(&mut self.settings.range_start).range(0..=self.settings.range_end - 1));
-            ui.label("→");
-            ui.add(egui::DragValue::new(&mut self.settings.range_end).range(self.settings.range_start + 1..=total));
-        });
-        range_bar(ui, &mut self.settings.range_start, &mut self.settings.range_end, total, (comp.work_start, comp.work_end), &mut self.range_handle);
-        ui.horizontal_wrapped(|ui| {
-            if ui.add_sized([80.0, layout::COMPACT_CONTROL], egui::Button::new("작업 영역").small()).clicked() {
-                self.settings.range_start = comp.work_start;
-                self.settings.range_end = comp.work_end;
-            }
-            if ui.add_sized([80.0, layout::COMPACT_CONTROL], egui::Button::new("전체").small()).clicked() {
-                self.settings.range_start = 0;
-                self.settings.range_end = total;
-            }
-            caption(ui, format!("{}프레임 · 끝 프레임 미포함", self.settings.range_end - self.settings.range_start));
-        });
     }
 
     fn set_worker_participation(&mut self, worker: &farm::WorkerInfo, enabled: bool) {
@@ -514,7 +384,9 @@ impl App {
         let Some((modal, reveal)) = animated_modal(ctx, "settings-dialog", self.settings_open, self.settings.reduced_motion) else {
             return;
         };
-        let width = (ctx.content_rect().width() - 64.0).clamp(280.0, 640.0);
+        let wide = ctx.content_rect().width() >= 1000.0;
+        let width = (ctx.content_rect().width() - 64.0).clamp(280.0, if wide { 760.0 } else { 520.0 });
+        let body_height = (ctx.content_rect().height() - 240.0).clamp(160.0, 480.0);
         let response = modal.show(ctx, |ui| {
             ui.set_width(width);
             ui.set_opacity(reveal);
@@ -522,39 +394,112 @@ impl App {
                 if dialog_header(ui, "설정", "설정 닫기") {
                     self.settings_open = false;
                 }
-                ui.horizontal_wrapped(|ui| {
-                    for (tab, label) in [(0, "화면"), (1, "렌더링"), (2, "연결"), (3, "앱과 업데이트")] {
-                        ui.selectable_value(&mut self.settings_tab, tab, label);
-                    }
-                });
-                ui.separator();
-                egui::ScrollArea::vertical()
-                    .id_salt("settings-body")
-                    .max_height((ctx.content_rect().height() - 230.0).clamp(120.0, 620.0))
-                    .min_scrolled_height((ctx.content_rect().height() - 230.0).clamp(120.0, 620.0))
-                    .show(ui, |ui| {
-                        if self.settings_tab == 0 {
-                            section_title(ui, "화면 동작");
-                            ui.checkbox(&mut self.settings.reduced_motion, "동작 줄이기 · 전환과 진행률 애니메이션 끄기");
-                            ui.add_space(layout::GAP);
+                caption(ui, "작업 환경과 렌더링 기본값을 관리합니다.");
+                ui.add_space(layout::SPACE);
+                let tabs = [(0, "화면"), (1, "렌더링"), (2, "연결"), (3, "앱과 업데이트")];
+                if wide {
+                    let (body, _) = ui.allocate_exact_size(egui::vec2(ui.available_width(), body_height), egui::Sense::hover());
+                    let navigation = egui::Rect::from_min_size(body.min, egui::vec2(148.0, body.height()));
+                    ui.painter().rect_filled(navigation, 6, secondary(ui));
+                    let mut nav = ui.new_child(
+                        egui::UiBuilder::new().id_salt("settings-navigation").max_rect(navigation.shrink(8.0)).layout(egui::Layout::top_down(egui::Align::Min)),
+                    );
+                    for (tab, label) in tabs {
+                        let (rect, response) = nav.allocate_exact_size(egui::vec2(nav.available_width(), 40.0), egui::Sense::click());
+                        let selected = self.settings_tab == tab;
+                        if selected || response.hovered() {
+                            nav.painter().rect_filled(rect, 5, if selected { nav.visuals().selection.bg_fill } else { surface(&nav) });
                         }
-                        if self.settings_tab == 3 {
-                            self.about_settings(ui);
-                        } else {
-                            if self.running || self.pending_start.is_some() {
-                                caption(ui, "작업을 종료하면 설정을 변경할 수 있습니다.");
-                            }
-                            ui.add_enabled_ui(!self.running && self.pending_start.is_none(), |ui| match self.settings_tab {
-                                0 => self.general_settings(ui),
-                                1 => self.render_settings(ui),
-                                _ => self.connection_settings(ui),
-                            });
+                        nav.painter().text(
+                            rect.left_center() + egui::vec2(12.0, 0.0),
+                            egui::Align2::LEFT_CENTER,
+                            label,
+                            egui::FontId::proportional(13.0),
+                            if selected { accent(&nav) } else { muted(&nav) },
+                        );
+                        if response.on_hover_cursor(egui::CursorIcon::PointingHand).clicked() {
+                            self.settings_tab = tab;
+                        }
+                    }
+                    let content = egui::Rect::from_min_max(egui::pos2(navigation.right() + 24.0, body.top()), body.max);
+                    let mut page =
+                        ui.new_child(egui::UiBuilder::new().id_salt("settings-page").max_rect(content).layout(egui::Layout::top_down(egui::Align::Min)));
+                    page.set_clip_rect(content.intersect(ui.clip_rect()));
+                    egui::ScrollArea::vertical().id_salt(("settings-body", self.settings_tab)).max_height(body_height).auto_shrink([false, false]).show(
+                        &mut page,
+                        |ui| {
+                            self.settings_page(ui);
+                        },
+                    );
+                } else {
+                    ui.horizontal_wrapped(|ui| {
+                        for (tab, label) in tabs {
+                            ui.selectable_value(&mut self.settings_tab, tab, label);
                         }
                     });
+                    ui.separator();
+                    egui::ScrollArea::vertical()
+                        .id_salt(("settings-body", self.settings_tab))
+                        .max_height(body_height)
+                        .min_scrolled_height(body_height)
+                        .auto_shrink([false, false])
+                        .show(ui, |ui| self.settings_page(ui));
+                }
+                ui.add_space(layout::SPACE);
+                ui.separator();
+                let clicks = footer_buttons(ui, None, None, Some(ButtonSpec::new("닫기", ButtonKind::Normal, true)), layout::CONTROL);
+                if clicks.dismiss {
+                    self.settings_open = false;
+                }
+                if let Some(rect) = clicks.free_left {
+                    footer_status(ui, rect, "변경 사항은 자동으로 저장됩니다.", false);
+                }
             });
         });
         if response.should_close() {
             self.settings_open = false;
+        }
+    }
+
+    fn settings_page(&mut self, ui: &mut egui::Ui) {
+        ui.set_width(ui.available_width());
+        let (title, description) = match self.settings_tab {
+            0 => ("화면과 동작", "테마, 애니메이션과 미리보기 표시를 조정합니다."),
+            1 => ("렌더링", "작업 PC의 성능과 최종 영상의 품질을 설정합니다."),
+            2 => ("네트워크 연결", "호스트를 열거나 다른 PC에 연결할 주소를 설정합니다."),
+            _ => ("앱과 업데이트", "설치된 엔진과 Render Farm 버전을 확인합니다."),
+        };
+        ui.label(egui::RichText::new(title).size(20.0).strong());
+        caption(ui, description);
+        ui.add_space(layout::GAP);
+        if self.settings_tab == 0 {
+            egui::Frame::new().fill(secondary(ui)).corner_radius(6).inner_margin(16).show(ui, |ui| {
+                ui.set_width(ui.available_width());
+                section_title(ui, "화면 동작");
+                ui.horizontal(|ui| {
+                    ui.label("테마");
+                    ui.selectable_value(&mut self.settings.theme, settings::Theme::Dark, "다크");
+                    ui.selectable_value(&mut self.settings.theme, settings::Theme::Light, "라이트");
+                });
+                ui.checkbox(&mut self.settings.reduced_motion, "동작 줄이기");
+                caption(ui, "화면 전환과 진행률 애니메이션을 끕니다.");
+            });
+            ui.add_space(layout::GAP);
+        }
+        if self.settings_tab == 3 {
+            self.about_settings(ui);
+        } else {
+            if self.running || self.pending_start.is_some() {
+                egui::Frame::new().fill(ui.visuals().selection.bg_fill).corner_radius(6).inner_margin(12).show(ui, |ui| {
+                    caption(ui, "작업을 종료하면 렌더링과 연결 설정을 변경할 수 있습니다.");
+                });
+                ui.add_space(layout::SPACE);
+            }
+            ui.add_enabled_ui(!self.running && self.pending_start.is_none(), |ui| match self.settings_tab {
+                0 => self.general_settings(ui),
+                1 => self.render_settings(ui),
+                _ => self.connection_settings(ui),
+            });
         }
     }
 
@@ -571,7 +516,8 @@ impl App {
 
     fn render_settings(&mut self, ui: &mut egui::Ui) {
         section_title(ui, "렌더 성능과 참여");
-        ui.checkbox(&mut self.settings.render.automatic, "자동 최적화").on_hover_text("CPU/GPU, 인코더, 스레드 수와 작업량을 PC 성능에 맞춰 조절합니다.");
+        ui.checkbox(&mut self.settings.render.automatic, "자동 최적화")
+            .on_hover_text("GPU 렌더링을 기본으로 유지하고, 인코더·스레드 수·작업량을 PC 성능에 맞춰 조절합니다. GPU 렌더링 실패 시 CPU로 전환합니다.");
         ui.checkbox(&mut self.settings.local_worker, "호스트 PC도 렌더링에 참여");
         ui.add_enabled(!self.settings.render.automatic, egui::Checkbox::new(&mut self.settings.gpu, "수동: 이 PC에서 GPU 가속 사용"));
         ui.add_space(layout::GAP);
@@ -694,51 +640,103 @@ impl App {
             if !self.logs_open {
                 ui.disable();
             }
-            ui.set_width((ctx.content_rect().width() - 64.0).clamp(280.0, 1000.0));
+            ui.set_width((ctx.content_rect().width() - 64.0).clamp(280.0, 800.0));
             if dialog_header(ui, "작업 로그", "작업 로그 닫기") {
                 self.logs_open = false;
             }
+            caption(ui, "연결, 작업 배정과 렌더링 활동을 확인합니다.");
+            ui.add_space(layout::SPACE);
             let wide = ui.available_width() >= 640.0;
-            if !wide {
-                ui.add_sized([ui.available_width(), layout::CONTROL], egui::TextEdit::singleline(&mut self.log_filter).hint_text("기록 검색"));
-            }
             let mut copy = false;
-            ui.horizontal(|ui| {
-                if wide {
-                    let width = (ui.available_width() - 240.0).max(120.0);
-                    ui.add_sized([width, layout::CONTROL], egui::TextEdit::singleline(&mut self.log_filter).hint_text("기록 검색"));
+            egui::Frame::new().fill(secondary(ui)).corner_radius(6).inner_margin(12).show(ui, |ui| {
+                ui.set_width(ui.available_width());
+                if !wide {
+                    ui.add_sized([ui.available_width(), layout::CONTROL], egui::TextEdit::singleline(&mut self.log_filter).hint_text("기록 검색"));
                 }
-                ui.checkbox(&mut self.log_debug, "상세 로그");
-                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                    copy = ui
-                        .add_sized([128.0, layout::CONTROL], egui::Button::image_and_text(icon_image(ui, UiIcon::Copy), "기록 복사").frame(false))
-                        .on_hover_text("현재 검색 결과에 표시된 기록을 복사합니다.")
-                        .clicked();
+                ui.horizontal(|ui| {
+                    if wide {
+                        let width = (ui.available_width() - 236.0).max(120.0);
+                        ui.add_sized([width, layout::CONTROL], egui::TextEdit::singleline(&mut self.log_filter).hint_text("기록 검색"));
+                    }
+                    ui.checkbox(&mut self.log_debug, "상세 로그");
+                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                        copy = ui
+                            .add_sized([112.0, layout::CONTROL], egui::Button::image_and_text(icon_image(ui, UiIcon::Copy), "기록 복사"))
+                            .on_hover_text("현재 검색 결과에 표시된 기록을 복사합니다.")
+                            .clicked();
+                    });
                 });
             });
             let messages = farm::snapshot(&self.state).4;
+            let filtered: Vec<_> = messages.iter().rev().filter(|m| (self.log_debug || !m.contains("[DEBUG]")) && m.contains(&self.log_filter)).collect();
             if copy {
-                ctx.copy_text(
-                    messages
-                        .iter()
-                        .filter(|m| (self.log_debug || !m.contains("[DEBUG]")) && m.contains(&self.log_filter))
-                        .cloned()
-                        .collect::<Vec<_>>()
-                        .join("\n"),
-                );
+                ctx.copy_text(filtered.iter().rev().map(|message| message.as_str()).collect::<Vec<_>>().join("\n"));
             }
-            egui::ScrollArea::vertical().id_salt("log-body").max_height((ctx.content_rect().height() - 252.0).max(120.0)).show(ui, |ui| {
-                for message in messages.iter().rev().filter(|m| (self.log_debug || !m.contains("[DEBUG]")) && m.contains(&self.log_filter)) {
-                    let color = if message.contains("[ERROR]") {
-                        egui::Color32::LIGHT_RED
-                    } else if message.contains("[WARN]") {
-                        egui::Color32::LIGHT_YELLOW
-                    } else {
-                        MUTED
-                    };
-                    ui.add(egui::Label::new(egui::RichText::new(message).size(12.0).color(color)).wrap());
-                }
+            ui.horizontal(|ui| {
+                caption(ui, format!("{}개 기록 표시", filtered.len()));
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    caption(ui, "최신순");
+                });
             });
+            let log_height = (ctx.content_rect().height() - if wide { 304.0 } else { 344.0 }).clamp(96.0, 440.0);
+            egui::Frame::new().fill(background(ui)).corner_radius(6).inner_margin(12).show(ui, |ui| {
+                ui.set_width(ui.available_width());
+                egui::ScrollArea::vertical().id_salt("log-body").max_height(log_height).min_scrolled_height(log_height).auto_shrink([false, false]).show(
+                    ui,
+                    |ui| {
+                        if filtered.is_empty() {
+                            ui.add_space(32.0);
+                            ui.vertical_centered(|ui| {
+                                ui.label(
+                                    egui::RichText::new(if self.log_filter.is_empty() {
+                                        "아직 작업 기록이 없습니다"
+                                    } else {
+                                        "검색 결과가 없습니다"
+                                    })
+                                    .size(16.0)
+                                    .strong(),
+                                );
+                                caption(
+                                    ui,
+                                    if self.log_filter.is_empty() {
+                                        "호스트에 연결하거나 렌더링을 시작하면 기록이 표시됩니다."
+                                    } else {
+                                        "다른 검색어를 입력하거나 상세 로그를 켜 보세요."
+                                    },
+                                );
+                            });
+                        }
+                        for message in filtered {
+                            let (level, color) = if message.contains("[ERROR]") {
+                                ("ERROR", danger(ui))
+                            } else if message.contains("[WARN]") {
+                                ("WARN", warning(ui))
+                            } else if message.contains("[DEBUG]") {
+                                ("DEBUG", muted(ui))
+                            } else {
+                                ("INFO", success(ui))
+                            };
+                            ui.horizontal_top(|ui| {
+                                ui.add_sized(
+                                    [48.0, 18.0],
+                                    egui::Label::new(egui::RichText::new(level).monospace().size(10.0).color(color)).halign(egui::Align::Min),
+                                );
+                                let text = message.replacen(&format!("[{level}] "), "", 1);
+                                ui.add(egui::Label::new(egui::RichText::new(text).size(12.0)).wrap()).on_hover_text(message);
+                            });
+                            ui.separator();
+                        }
+                    },
+                );
+            });
+            ui.add_space(layout::SPACE);
+            let clicks = footer_buttons(ui, None, None, Some(ButtonSpec::new("닫기", ButtonKind::Normal, true)), layout::CONTROL);
+            if clicks.dismiss {
+                self.logs_open = false;
+            }
+            if let Some(rect) = clicks.free_left {
+                footer_status(ui, rect, "전체 기록은 로그 파일에 보관됩니다.", false);
+            }
         });
         if response.should_close() {
             self.logs_open = false;
@@ -758,34 +756,94 @@ impl App {
                 if self.worker_details.is_none() {
                     ui.disable();
                 }
-                ui.set_width((ctx.content_rect().width() - 64.0).clamp(280.0, 520.0));
+                ui.set_width((ctx.content_rect().width() - 64.0).clamp(280.0, 580.0));
                 if dialog_header(ui, "컴퓨터 상세 정보", "컴퓨터 상세 정보 닫기") {
                     self.worker_details = None;
                 }
-                egui::ScrollArea::vertical().id_salt("worker-body").max_height((ctx.content_rect().height() - 144.0).max(120.0)).show(ui, |ui| {
-                    if let Some(worker) = worker {
-                        ui.label(&worker.label);
-                        ui.label(&worker.profile);
-                        let mut enabled = worker.enabled;
-                        if ui.checkbox(&mut enabled, "이 PC를 렌더링에 사용").changed() {
-                            self.set_worker_participation(&worker, enabled);
-                        }
-                        if let Some(preview) = &worker.preview {
-                            self.show_preview_sized(ui, worker.id, preview, 200.0);
-                        }
-                        caption(ui, format!("완료 {}프레임 · {:.2} fps", worker.completed_frames, worker.fps));
-                        caption(
-                            ui,
-                            format!(
-                                "수신 {:.1} MiB · {:.1} MiB/s",
-                                worker.transferred_bytes as f64 / 1048576.0,
-                                worker.transferred_bytes as f64 / 1048576.0 / worker.transfer_seconds.max(0.001)
-                            ),
-                        );
-                    } else {
-                        ui.label("이 PC의 연결 정보가 더 이상 없습니다.");
-                    }
-                });
+                if let Some(worker) = worker {
+                    ui.horizontal_wrapped(|ui| {
+                        ui.label(egui::RichText::new(worker.label.split(" @ ").next().unwrap_or(&worker.label)).size(20.0).strong());
+                        badge(ui, if worker.connected { "연결됨" } else { "연결 끊김" }, if worker.connected { success(ui) } else { muted(ui) });
+                    });
+                    caption(ui, &worker.ip);
+                    ui.add_space(layout::SPACE);
+                    egui::ScrollArea::vertical()
+                        .id_salt("worker-body")
+                        .max_height((ctx.content_rect().height() - 270.0).clamp(160.0, 560.0))
+                        .auto_shrink([false, true])
+                        .show(ui, |ui| {
+                            egui::Frame::new().fill(secondary(ui)).corner_radius(6).inner_margin(14).show(ui, |ui| {
+                                ui.set_width(ui.available_width());
+                                let mut enabled = worker.enabled;
+                                if ui.checkbox(&mut enabled, "이 PC를 렌더링에 사용").changed() {
+                                    self.set_worker_participation(&worker, enabled);
+                                }
+                                if let Some((start, end)) = worker.assigned {
+                                    caption(ui, format!("현재 구간 {start}–{end} · {} / {} 프레임", worker.current_done, end - start));
+                                    ui.add(
+                                        egui::ProgressBar::new((worker.current_done as f32 / (end - start).max(1) as f32).clamp(0.0, 1.0))
+                                            .desired_width(ui.available_width())
+                                            .desired_height(4.0)
+                                            .fill(accent(ui)),
+                                    );
+                                } else {
+                                    caption(
+                                        ui,
+                                        if enabled {
+                                            "새 렌더 작업을 기다리고 있습니다."
+                                        } else {
+                                            "렌더링 참여에서 제외된 PC입니다."
+                                        },
+                                    );
+                                }
+                            });
+                            ui.add_space(layout::SPACE);
+                            egui::Frame::new().fill(secondary(ui)).corner_radius(6).inner_margin(14).show(ui, |ui| {
+                                ui.set_width(ui.available_width());
+                                ui.columns(2, |columns| {
+                                    metric(&mut columns[0], "누적 완료", &format!("{} 프레임", worker.completed_frames));
+                                    metric(&mut columns[1], "처리 속도", &format!("{:.2} fps", worker.fps));
+                                });
+                                ui.separator();
+                                layout::value_row(ui, "수신 데이터", &format!("{:.1} MiB", worker.transferred_bytes as f64 / 1048576.0));
+                                layout::value_row(
+                                    ui,
+                                    "전송 속도",
+                                    &format!("{:.1} MiB/s", worker.transferred_bytes as f64 / 1048576.0 / worker.transfer_seconds.max(0.001)),
+                                );
+                            });
+                            ui.add_space(layout::SPACE);
+                            section_title(ui, "렌더 환경");
+                            ui.add(
+                                egui::Label::new(
+                                    egui::RichText::new(if worker.profile.is_empty() {
+                                        "작업을 받으면 렌더 환경이 표시됩니다."
+                                    } else {
+                                        &worker.profile
+                                    })
+                                    .size(12.0)
+                                    .color(muted(ui)),
+                                )
+                                .wrap(),
+                            );
+                            if let Some(preview) = &worker.preview {
+                                ui.add_space(layout::SPACE);
+                                section_title(ui, "최근 렌더 프레임");
+                                self.dashboard_image(ui, worker.id, Some(preview), if ctx.content_rect().height() < 800.0 { 156.0 } else { 200.0 });
+                                caption(ui, format!("프레임 {}", preview.frame));
+                            }
+                            ui.add_space(layout::SPACE);
+                        });
+                } else {
+                    ui.add_space(layout::GAP);
+                    caption(ui, "이 PC의 연결 정보가 더 이상 없습니다.");
+                    ui.add_space(layout::GAP);
+                }
+                ui.add_space(layout::SPACE);
+                ui.separator();
+                if footer_buttons(ui, None, None, Some(ButtonSpec::new("닫기", ButtonKind::Normal, true)), layout::CONTROL).dismiss {
+                    self.worker_details = None;
+                }
             });
             if response.should_close() {
                 self.worker_details = None;

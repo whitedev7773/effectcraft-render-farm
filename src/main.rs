@@ -28,36 +28,58 @@ fn install_ui_font(ctx: &egui::Context) -> Result<(), String> {
     fonts.font_data.insert("wanted-sans".into(), std::sync::Arc::new(FontData::from_static(include_bytes!("../assets/ui/WantedSans-Regular.ttf"))));
     fonts.families.entry(FontFamily::Proportional).or_default().insert(0, "wanted-sans".into());
     ctx.set_fonts(fonts);
-    ctx.set_theme(egui::Theme::Dark);
-    let mut style = (*ctx.style_of(egui::Theme::Dark)).clone();
-    style.spacing.item_spacing = egui::vec2(interface::layout::SPACE, interface::layout::SPACE);
-    style.spacing.button_padding = egui::vec2(12.0, 6.0);
-    style.spacing.interact_size.y = interface::layout::CONTROL;
-    style.visuals.panel_fill = egui::Color32::from_rgb(13, 15, 20);
-    style.visuals.window_fill = egui::Color32::from_rgb(22, 25, 32);
-    style.visuals.extreme_bg_color = egui::Color32::from_rgb(29, 33, 42);
-    style.visuals.faint_bg_color = egui::Color32::from_rgb(29, 33, 42);
-    style.visuals.override_text_color = Some(egui::Color32::from_rgb(252, 252, 252));
-    style.visuals.widgets.inactive.bg_fill = egui::Color32::from_rgb(29, 33, 42);
-    style.visuals.widgets.hovered.bg_fill = egui::Color32::from_rgb(40, 47, 60);
-    style.visuals.widgets.active.bg_fill = egui::Color32::from_rgb(49, 58, 74);
-    style.visuals.widgets.inactive.bg_stroke = egui::Stroke::new(1.0, egui::Color32::from_rgb(47, 53, 66));
-    style.visuals.widgets.hovered.bg_stroke = egui::Stroke::new(1.0, egui::Color32::from_rgb(77, 91, 112));
-    style.visuals.widgets.active.bg_stroke = egui::Stroke::new(1.0, egui::Color32::from_rgb(4, 133, 247));
-    style.visuals.widgets.inactive.corner_radius = egui::CornerRadius::same(4);
-    style.visuals.widgets.hovered.corner_radius = egui::CornerRadius::same(4);
-    style.visuals.widgets.active.corner_radius = egui::CornerRadius::same(4);
-    style.text_styles.insert(egui::TextStyle::Body, egui::FontId::proportional(14.0));
-    style.text_styles.insert(egui::TextStyle::Button, egui::FontId::proportional(14.0));
-    style.visuals.selection.bg_fill = egui::Color32::from_rgb(4, 93, 171);
-    ctx.set_style_of(egui::Theme::Dark, style);
+    for theme in [egui::Theme::Dark, egui::Theme::Light] {
+        let mut style = (*ctx.style_of(theme)).clone();
+        let dark = theme == egui::Theme::Dark;
+        let rgb = egui::Color32::from_rgb;
+        let (canvas, surface, field, hovered, active, border, text) = if dark {
+            (rgb(16, 19, 24), rgb(23, 27, 34), rgb(29, 34, 42), rgb(39, 46, 57), rgb(34, 55, 85), rgb(45, 53, 65), rgb(231, 237, 246))
+        } else {
+            (rgb(246, 248, 251), rgb(255, 255, 255), rgb(250, 251, 253), rgb(239, 243, 249), rgb(225, 235, 251), rgb(222, 228, 238), rgb(31, 42, 59))
+        };
+        let accent = if dark { rgb(106, 170, 255) } else { rgb(34, 102, 215) };
+        style.spacing.item_spacing = egui::vec2(interface::layout::SPACE, interface::layout::SPACE);
+        style.spacing.button_padding = egui::vec2(12.0, 6.0);
+        style.spacing.interact_size.y = interface::layout::CONTROL;
+        style.spacing.window_margin = egui::Margin::same(24);
+        style.visuals.panel_fill = canvas;
+        style.visuals.window_fill = surface;
+        style.visuals.extreme_bg_color = field;
+        style.visuals.faint_bg_color = if dark { rgb(28, 33, 42) } else { rgb(245, 247, 251) };
+        style.visuals.override_text_color = None;
+        style.visuals.widgets.noninteractive.fg_stroke.color = text;
+        style.visuals.widgets.inactive.fg_stroke.color = text;
+        style.visuals.widgets.hovered.fg_stroke.color = text;
+        style.visuals.widgets.active.fg_stroke.color = text;
+        style.visuals.widgets.inactive.bg_fill = field;
+        style.visuals.widgets.inactive.weak_bg_fill = field;
+        style.visuals.widgets.hovered.bg_fill = hovered;
+        style.visuals.widgets.hovered.weak_bg_fill = hovered;
+        style.visuals.widgets.active.bg_fill = active;
+        style.visuals.widgets.active.weak_bg_fill = active;
+        style.visuals.widgets.noninteractive.bg_stroke = egui::Stroke::new(1.0, border);
+        style.visuals.widgets.inactive.bg_stroke = egui::Stroke::new(1.0, border);
+        style.visuals.widgets.hovered.bg_stroke = egui::Stroke::new(1.0, egui::Color32::from_gray(if dark { 0x70 } else { 0xb2 }));
+        style.visuals.widgets.active.bg_stroke = egui::Stroke::new(1.0, accent);
+        style.visuals.widgets.inactive.corner_radius = egui::CornerRadius::same(6);
+        style.visuals.widgets.hovered.corner_radius = egui::CornerRadius::same(6);
+        style.visuals.widgets.active.corner_radius = egui::CornerRadius::same(6);
+        style.text_styles.insert(egui::TextStyle::Body, egui::FontId::proportional(14.0));
+        style.text_styles.insert(egui::TextStyle::Button, egui::FontId::proportional(14.0));
+        style.text_styles.insert(egui::TextStyle::Small, egui::FontId::proportional(12.0));
+        style.visuals.selection.bg_fill = if dark { rgb(31, 48, 72) } else { rgb(229, 239, 255) };
+        style.visuals.selection.stroke = egui::Stroke::new(1.0, text);
+        style.visuals.hyperlink_color = accent;
+        ctx.set_style_of(theme, style);
+    }
     Ok(())
 }
 
 fn path_row(ui: &mut egui::Ui, label: &str, value: &mut String) -> bool {
     ui.label(egui::RichText::new(label).strong());
     ui.horizontal(|ui| {
-        let width = (ui.available_width() - 80.0 - interface::layout::SPACE).max(120.0);
+        let available = ui.available_width().min(ui.clip_rect().right() - ui.cursor().left());
+        let width = (available - 80.0 - interface::layout::SPACE).max(1.0);
         ui.add_sized([width, interface::layout::CONTROL], egui::TextEdit::singleline(value).hint_text("파일 경로를 선택하세요")).on_hover_text(value.as_str());
         ui.add_sized([80.0, interface::layout::CONTROL], egui::Button::new("찾아보기")).clicked()
     })
@@ -70,11 +92,11 @@ fn text_row(ui: &mut egui::Ui, label: &str, value: &mut String, secret: bool) {
 }
 
 fn section_title(ui: &mut egui::Ui, title: &str) {
-    ui.label(egui::RichText::new(title).size(18.0).strong().color(egui::Color32::from_rgb(230, 235, 242)));
+    ui.label(egui::RichText::new(title).size(15.0).strong().color(ui.visuals().text_color()));
 }
 
 fn primary_button(label: &str) -> egui::Button<'_> {
-    egui::Button::new(egui::RichText::new(label).strong().color(egui::Color32::WHITE)).fill(egui::Color32::from_rgb(4, 133, 247))
+    egui::Button::new(egui::RichText::new(label).strong().color(egui::Color32::WHITE)).fill(egui::Color32::from_rgb(39, 106, 224))
 }
 
 #[derive(Clone, Copy)]
@@ -94,20 +116,25 @@ fn range_bar(ui: &mut egui::Ui, start: &mut i64, end: &mut i64, total: i64, work
     let x = |frame: i64| left + width * (frame.clamp(0, total) as f32 / total as f32);
     let center = rect.center().y;
     let painter = ui.painter();
-    painter.rect_filled(egui::Rect::from_min_max(egui::pos2(left, center - 5.0), egui::pos2(right, center + 5.0)), 5.0, egui::Color32::from_gray(67));
+    let dark = ui.visuals().dark_mode;
+    painter.rect_filled(
+        egui::Rect::from_min_max(egui::pos2(left, center - 5.0), egui::pos2(right, center + 5.0)),
+        5.0,
+        egui::Color32::from_gray(if dark { 67 } else { 220 }),
+    );
     painter.rect_filled(
         egui::Rect::from_min_max(egui::pos2(x(work.0), center - 5.0), egui::pos2(x(work.1), center + 5.0)),
         5.0,
-        egui::Color32::from_rgb(82, 96, 111),
+        egui::Color32::from_gray(if dark { 110 } else { 180 }),
     );
     painter.rect_filled(
         egui::Rect::from_min_max(egui::pos2(x(*start), center - 5.0), egui::pos2(x(*end), center + 5.0)),
         5.0,
-        egui::Color32::from_rgb(55, 146, 227),
+        egui::Color32::from_rgb(89, 152, 242),
     );
     for frame in [*start, *end] {
         painter.circle_filled(egui::pos2(x(frame), center), 9.0, egui::Color32::WHITE);
-        painter.circle_stroke(egui::pos2(x(frame), center), 9.0, egui::Stroke::new(2.0, egui::Color32::from_rgb(35, 103, 169)));
+        painter.circle_stroke(egui::pos2(x(frame), center), 9.0, egui::Stroke::new(2.0, egui::Color32::from_rgb(39, 106, 224)));
     }
     if (response.drag_started() || response.clicked())
         && let Some(pointer) = response.interact_pointer_pos()
@@ -137,6 +164,7 @@ struct App {
     queue_detail: Option<u64>,
     queue_edit: Option<queue::Task>,
     queue_previews: std::collections::BTreeMap<u64, farm::Preview>,
+    project_import: Option<interface::import::ProjectImport>,
     updater: updater::Updater,
     updater_logged_status: String,
     engine_updater: effectcraft_update::Updater,
@@ -223,6 +251,7 @@ impl App {
             queue_detail: None,
             queue_edit: None,
             queue_previews: Default::default(),
+            project_import: None,
             updater: updater::Updater::default(),
             updater_logged_status: String::new(),
             engine_updater: effectcraft_update::Updater::default(),
@@ -502,7 +531,7 @@ impl App {
             comp: s.comp.clone(),
             address: if s.host { s.host_address.clone() } else { s.client_address.clone() },
             token: s.token.clone(),
-            gpu: s.gpu,
+            gpu: s.render.automatic || s.gpu,
             range_start: if s.host { s.range_start } else { 0 },
             range_end: if s.host { s.range_end } else { 0 },
             chunk_frames: s.chunk_frames,

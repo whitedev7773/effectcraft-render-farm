@@ -6,52 +6,27 @@ pub(crate) const PADDING: i8 = 16;
 pub(crate) const CONTROL: f32 = 32.0;
 pub(crate) const PRIMARY_CONTROL: f32 = 36.0;
 pub(crate) const COMPACT_CONTROL: f32 = 28.0;
-pub(crate) const RADIUS: u8 = 12;
+pub(crate) const RADIUS: u8 = 8;
 
 #[derive(Clone, Copy, Debug)]
 pub(super) struct DashboardGrid {
     pub job: egui::Rect,
     pub progress: egui::Rect,
     pub preview: egui::Rect,
-    pub activity: egui::Rect,
     pub workers: egui::Rect,
 }
 
 impl DashboardGrid {
     pub fn new(rect: egui::Rect) -> Self {
-        let column = (rect.width() - GAP * 2.0) / 3.0;
-        let top = ((rect.height() * 0.28).clamp(224.0, 256.0) / SPACE).round() * SPACE;
-        let lower_top = rect.top() + top + GAP;
-        let preview_height = (column * 9.0 / 16.0 + 96.0).clamp(240.0, (rect.bottom() - lower_top - GAP - 144.0).max(240.0));
-        let job = egui::Rect::from_min_size(rect.min, egui::vec2(column, top));
-        let progress = egui::Rect::from_min_max(egui::pos2(job.right() + GAP, rect.top()), egui::pos2(rect.right(), job.bottom()));
-        let preview = egui::Rect::from_min_size(egui::pos2(rect.left(), lower_top), egui::vec2(column, preview_height));
-        let activity = egui::Rect::from_min_max(egui::pos2(rect.left(), preview.bottom() + GAP), egui::pos2(job.right(), rect.bottom()));
-        let workers = egui::Rect::from_min_max(egui::pos2(progress.left(), lower_top), rect.max);
-        Self { job, progress, preview, activity, workers }
+        let left = ((rect.width() - GAP) * 0.58).round();
+        let hero_height = (rect.height() * 0.48).clamp(316.0, 460.0).min(rect.height() - 336.0 - GAP);
+        let progress_height = (hero_height * 0.60).max(188.0);
+        let preview = egui::Rect::from_min_size(rect.min, egui::vec2(left, hero_height));
+        let progress = egui::Rect::from_min_max(egui::pos2(preview.right() + GAP, rect.top()), egui::pos2(rect.right(), rect.top() + progress_height));
+        let job = egui::Rect::from_min_max(egui::pos2(progress.left(), progress.bottom() + GAP), egui::pos2(rect.right(), preview.bottom()));
+        let workers = egui::Rect::from_min_max(egui::pos2(rect.left(), preview.bottom() + GAP), rect.max);
+        Self { job, progress, preview, workers }
     }
-}
-
-/// Distribute the final row too, so every row uses its entire available width.
-pub(super) fn grid_cells(rect: egui::Rect, count: usize, max_columns: usize, min_height: f32) -> Vec<egui::Rect> {
-    if count == 0 {
-        return Vec::new();
-    }
-    let columns = max_columns.max(1).min(count);
-    let rows = count.div_ceil(columns);
-    let height = ((rect.height() - GAP * (rows - 1) as f32) / rows as f32).max(min_height);
-    let mut cells = Vec::with_capacity(count);
-    let mut remaining = count;
-    for row in 0..rows {
-        let in_row = remaining.div_ceil(rows - row).min(columns);
-        let width = (rect.width() - GAP * (in_row - 1) as f32) / in_row as f32;
-        for column in 0..in_row {
-            let min = rect.min + egui::vec2(column as f32 * (width + GAP), row as f32 * (height + GAP));
-            cells.push(egui::Rect::from_min_size(min, egui::vec2(width, height)));
-        }
-        remaining -= in_row;
-    }
-    cells
 }
 
 pub(super) fn tile<R>(
@@ -61,8 +36,8 @@ pub(super) fn tile<R>(
     secondary: bool,
     content: impl FnOnce(&mut egui::Ui) -> R,
 ) -> R {
-    ui.painter().rect_filled(rect, RADIUS, if secondary { SURFACE_SECONDARY } else { SURFACE });
-    ui.painter().rect_stroke(rect, RADIUS, egui::Stroke::new(1.0, BORDER), egui::StrokeKind::Inside);
+    ui.painter().rect_filled(rect, RADIUS, if secondary { super::secondary(ui) } else { surface(ui) });
+    ui.painter().rect_stroke(rect, RADIUS, egui::Stroke::new(1.0, border(ui)), egui::StrokeKind::Inside);
     let inner = rect.shrink(PADDING as f32);
     // The caller has allocated the outer rectangle. A child must not advance
     // the parent cursor again using its smaller padded content rectangle.
@@ -85,9 +60,29 @@ pub(super) fn flow_tile<R>(ui: &mut egui::Ui, height: f32, id: impl std::hash::H
     tile(ui, rect, id, false, content)
 }
 
+/// A naturally sized card for pages that already have a vertical scrollbar.
+pub(super) fn flow_content<R>(ui: &mut egui::Ui, id: impl std::hash::Hash + std::fmt::Debug, content: impl FnOnce(&mut egui::Ui) -> R) -> R {
+    egui::Frame::new()
+        .fill(surface(ui))
+        .stroke(egui::Stroke::new(1.0, border(ui)))
+        .corner_radius(RADIUS)
+        .inner_margin(PADDING)
+        .show(ui, |ui| {
+            ui.push_id(id, |ui| {
+                ui.set_width(ui.available_width());
+                ui.spacing_mut().item_spacing = egui::vec2(SPACE, SPACE);
+                content(ui)
+            })
+            .inner
+        })
+        .inner
+}
+
 pub(super) fn value_row(ui: &mut egui::Ui, label: &str, value: &str) {
     ui.allocate_ui_with_layout(egui::vec2(ui.available_width(), 20.0), egui::Layout::left_to_right(egui::Align::Center), |ui| {
-        caption(ui, label);
+        let label_width = (ui.available_width() * 0.4).max(40.0);
+        ui.add_sized([label_width, 20.0], egui::Label::new(egui::RichText::new(label).size(12.0).color(muted(ui))).truncate().halign(egui::Align::Min))
+            .on_hover_text(label);
         ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
             ui.add(egui::Label::new(value).truncate()).on_hover_text(value);
         });
@@ -100,40 +95,23 @@ mod tests {
 
     #[test]
     fn dashboard_tiles_fill_bounds_and_share_edges_and_gutters() {
-        for (width, height) in [(1120.0, 704.0), (1408.0, 784.0), (1888.0, 912.0), (2528.0, 1272.0)] {
+        for (width, height) in [(900.0, 680.0), (1120.0, 704.0), (1408.0, 784.0), (1888.0, 912.0), (2528.0, 1272.0)] {
             let bounds = egui::Rect::from_min_size(egui::pos2(16.0, 112.0), egui::vec2(width, height));
             let grid = DashboardGrid::new(bounds);
-            assert_eq!(grid.job.left(), grid.preview.left());
-            assert_eq!(grid.job.right(), grid.activity.right());
-            assert_eq!(grid.progress.left(), grid.workers.left());
-            assert_eq!(grid.job.bottom(), grid.progress.bottom());
-            assert_eq!(grid.preview.top(), grid.workers.top());
-            assert_eq!(grid.activity.bottom(), bounds.bottom());
+            assert_eq!(grid.job.left(), grid.progress.left());
+            assert_eq!(grid.job.right(), grid.workers.right());
+            assert_eq!(grid.preview.left(), grid.workers.left());
+            assert_eq!(grid.job.bottom(), grid.preview.bottom());
             assert_eq!(grid.workers.bottom(), bounds.bottom());
-            assert!((grid.progress.left() - grid.job.right() - GAP).abs() < 0.01);
-            assert!((grid.activity.top() - grid.preview.bottom() - GAP).abs() < 0.01);
-            let tiles = [grid.job, grid.progress, grid.preview, grid.activity, grid.workers];
+            assert!(grid.preview.width() > grid.progress.width());
+            assert!((grid.progress.left() - grid.preview.right() - GAP).abs() < 0.01);
+            assert!((grid.job.top() - grid.progress.bottom() - GAP).abs() < 0.01);
+            assert!((grid.workers.top() - grid.preview.bottom() - GAP).abs() < 0.01);
+            let tiles = [grid.job, grid.progress, grid.preview, grid.workers];
             for (i, tile) in tiles.iter().enumerate() {
                 assert!(bounds.contains_rect(*tile));
                 for other in tiles.iter().skip(i + 1) {
                     assert!(!tile.intersects(*other));
-                }
-            }
-        }
-    }
-
-    #[test]
-    fn pc_grid_fills_every_row_for_uneven_counts() {
-        let bounds = egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(900.0, 640.0));
-        for count in 1..=12 {
-            let cells = grid_cells(bounds, count, 3, 180.0);
-            assert_eq!(cells.len(), count);
-            for row in cells.chunk_by(|a, b| (a.top() - b.top()).abs() < 0.01) {
-                assert_eq!(row[0].left(), bounds.left());
-                assert!((row.last().unwrap().right() - bounds.right()).abs() < 0.01);
-                for pair in row.windows(2) {
-                    assert!((pair[1].left() - pair[0].right() - GAP).abs() < 0.01);
-                    assert!((pair[0].height() - pair[1].height()).abs() < 0.01);
                 }
             }
         }

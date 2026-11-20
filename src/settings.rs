@@ -2,6 +2,24 @@ use std::path::PathBuf;
 
 use serde::{Deserialize, Serialize};
 
+/// The theme is stored with the other app preferences so it survives restarts.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Theme {
+    #[default]
+    Dark,
+    Light,
+}
+
+impl Theme {
+    pub fn egui(self) -> eframe::egui::Theme {
+        match self {
+            Self::Dark => eframe::egui::Theme::Dark,
+            Self::Light => eframe::egui::Theme::Light,
+        }
+    }
+}
+
 #[derive(Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum Distribution {
@@ -66,6 +84,7 @@ impl RenderOptions {
 #[derive(Clone, PartialEq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct Settings {
+    pub theme: Theme,
     pub queue: Vec<crate::queue::Task>,
     pub queue_cards: bool,
     pub reduced_motion: bool,
@@ -97,8 +116,9 @@ pub struct Settings {
 impl Default for Settings {
     fn default() -> Self {
         Self {
+            theme: Theme::Dark,
             queue: Vec::new(),
-            queue_cards: false,
+            queue_cards: true,
             gpu_defaults_applied: true,
             reduced_motion: false,
             check_updates: true,
@@ -322,6 +342,7 @@ mod tests {
     #[test]
     fn settings_roundtrip_preserves_connection_and_distribution() {
         let value = Settings {
+            theme: Theme::Light,
             client_address: "192.168.1.7:9778".into(),
             range_start: 120,
             range_end: 960,
@@ -333,6 +354,18 @@ mod tests {
         let bytes = serde_json::to_vec(&value).unwrap();
         let restored: Settings = serde_json::from_slice(&bytes).unwrap();
         assert!(value == restored);
+    }
+
+    #[test]
+    fn theme_is_saved_and_older_settings_keep_dark_mode() {
+        let legacy: Settings = serde_json::from_str("{}").unwrap();
+        assert_eq!(legacy.theme, Theme::Dark);
+        for theme in [Theme::Dark, Theme::Light] {
+            let value = Settings { theme, ..Settings::default() };
+            let bytes = serde_json::to_vec(&value).unwrap();
+            let restored: Settings = serde_json::from_slice(&bytes).unwrap();
+            assert_eq!(restored.theme, theme);
+        }
     }
 
     #[test]

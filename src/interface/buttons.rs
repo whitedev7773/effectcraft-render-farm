@@ -41,7 +41,7 @@ pub(super) fn button_at(ui: &mut egui::Ui, rect: egui::Rect, id: &str, spec: But
         ButtonKind::Primary => primary_button(spec.label),
         ButtonKind::Normal => egui::Button::new(spec.label),
         ButtonKind::Quiet => egui::Button::new(spec.label).frame(false),
-        ButtonKind::Destructive => egui::Button::new(egui::RichText::new(spec.label).color(egui::Color32::LIGHT_RED)).frame(false),
+        ButtonKind::Destructive => egui::Button::new(egui::RichText::new(spec.label).color(danger(ui))).frame(false),
     };
     child.add_sized(rect.size(), button)
 }
@@ -124,7 +124,7 @@ pub(super) fn footer_status(ui: &mut egui::Ui, rect: egui::Rect, text: &str, bus
     if busy {
         child.add_sized([16.0, 16.0], egui::Spinner::new());
     }
-    child.add(egui::Label::new(egui::RichText::new(text).size(12.0).color(MUTED)).truncate()).on_hover_text(text);
+    child.add(egui::Label::new(egui::RichText::new(text).size(12.0).color(muted(ui))).truncate()).on_hover_text(text);
 }
 
 #[cfg(test)]

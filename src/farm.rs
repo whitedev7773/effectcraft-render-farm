@@ -1218,6 +1218,10 @@ fn receive_bundle(reader: &mut BufReader<TcpStream>, config: &mut Config, messag
     config.project = project_path;
     options.validate()?;
     config.render = options;
+    if config.render.automatic {
+        // Keep GPU rendering enabled until a real render failure requests CPU fallback.
+        config.gpu = true;
+    }
     config.output = output;
     config.comp = comp;
     config.range_start = 0;
@@ -1592,7 +1596,6 @@ pub fn run_worker(config: Config, state: Shared, stop: Arc<AtomicBool>) -> Resul
     let mut config = config;
     let mut workspace: Option<TempWorkspace> = None;
     let mut job: Option<Job> = None;
-    let mut calibrated = false;
     let mut previous_profile = String::new();
     log(&state, format!("호스트 연결 완료 · {comp} · 렌더 지시 대기"));
     while !stop.load(Ordering::Relaxed) {
@@ -1612,16 +1615,6 @@ pub fn run_worker(config: Config, state: Shared, stop: Arc<AtomicBool>) -> Resul
                 let job = job.as_ref().ok_or("호스트 프로젝트를 아직 받지 못했습니다")?;
                 if start < 0 || end <= start || end > job.total || fps_num != job.rate.num || fps_den != job.rate.den || comp != job.comp {
                     return Err("서버 작업 범위 또는 설정이 프로젝트와 다릅니다".into());
-                }
-                if config.render.automatic && !calibrated {
-                    send(&mut stream, &Message::Profile { detail: "CPU/GPU 자동 성능 비교 중".into() })?;
-                    lock(&state).local_profile = "CPU/GPU 자동 성능 비교 중".into();
-                    match choose_render_gpu(&config, job, start, end, &state, &stop) {
-                        Ok(gpu) => config.gpu = gpu,
-                        Err(_) if stop.load(Ordering::Relaxed) => break,
-                        Err(error) => return Err(error),
-                    }
-                    calibrated = true;
                 }
                 let resources = crate::resources::Resources::detect();
                 if config.render.automatic {
@@ -1769,44 +1762,6 @@ pub fn run_worker(config: Config, state: Shared, stop: Arc<AtomicBool>) -> Resul
     }
     log(&state, "클라이언트 임시 프로젝트·소스·프레임 삭제 완료");
     Ok(())
-}
-
-fn choose_render_gpu(config: &Config, job: &Job, start: i64, end: i64, state: &Shared, stop: &AtomicBool) -> Result<bool, String> {
-    if end - start < 8 {
-        lock(state).event("INFO", "autotune", "짧은 구간: 별도 렌더 비교를 생략하고 GPU 경로를 시도합니다");
-        return Ok(true);
-    }
-    let workspace = TempWorkspace::new()?;
-    let mut sample = config.clone();
-    sample.output = workspace.root.clone();
-    sample.render.poll_ms = 50;
-    let sample_end = (start + 2).min(end);
-    let mut timings = [None, None];
-    lock(state).event("INFO", "autotune", format!("CPU/GPU 자동 비교 시작 · 프레임 {start}–{sample_end} · 경로별 최대 5초"));
-    for (index, gpu) in [false, true].into_iter().enumerate() {
-        if stop.load(Ordering::Relaxed) {
-            return Err("자동 성능 비교 중 중지했습니다".into());
-        }
-        sample.gpu = gpu;
-        let started = Instant::now();
-        let result = render_chunk_controlled(&sample, job, start, sample_end, Some((started + Duration::from_secs(5), stop)), |_| Ok(sample_end));
-        match result {
-            Ok(_) => {
-                timings[index] = Some(started.elapsed().as_secs_f64());
-                lock(state).event("INFO", "autotune", format!("{} 샘플 렌더: {:.3}초", if gpu { "GPU" } else { "CPU" }, started.elapsed().as_secs_f64()));
-            }
-            Err(error) => lock(state).event("WARN", "autotune", format!("{} 샘플 비교 미완료: {error}", if gpu { "GPU" } else { "CPU" })),
-        }
-    }
-    // Prefer a proven path. When both samples exceed the budget, retain GPU and
-    // let a real failure trigger CPU fallback rather than calling timeout a failure.
-    let gpu = match timings {
-        [Some(cpu), Some(gpu)] => gpu < cpu * 0.95,
-        [Some(_), None] => false,
-        [None, Some(_)] | [None, None] => true,
-    };
-    lock(state).event("INFO", "autotune", format!("자동 렌더 경로 선택: {} · 동일 해상도/품질 샘플 비교", if gpu { "GPU" } else { "CPU" }));
-    Ok(gpu)
 }
 
 fn render_chunk(config: &Config, job: &Job, start: i64, end: i64, progress: impl FnMut(i64) -> Result<i64, String>) -> Result<i64, String> {

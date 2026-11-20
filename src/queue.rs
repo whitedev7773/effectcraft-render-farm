@@ -204,30 +204,6 @@ impl App {
         }
     }
 
-    pub(crate) fn enqueue_current(&mut self) {
-        if self.settings.queue.len() >= 200 {
-            self.last_error = "큐에는 최대 200개 작업을 등록할 수 있습니다".into();
-            return;
-        }
-        let Some(comp) = self.catalog.iter().find(|comp| comp.name == self.settings.comp).cloned() else {
-            self.last_error = "프로젝트와 컴포지션을 먼저 선택하세요".into();
-            return;
-        };
-        let id = self.settings.queue.iter().map(|task| task.id).max().unwrap_or(0) + 1;
-        let task = Task::capture(id, &self.settings, comp);
-        match validate_unique(&task, &self.settings.queue) {
-            Ok(()) => {
-                self.settings.queue.push(task);
-                self.queue_detail = None;
-                self.queue_edit = None;
-                self.monitor = true;
-                self.queue_view = true;
-                self.last_error.clear();
-            }
-            Err(error) => self.last_error = error,
-        }
-    }
-
     pub(crate) fn start_next_queued(&mut self) {
         if self.running || self.pending_start.is_some() || self.worker_active.load(Ordering::Relaxed) || self.pending_preview.is_some() {
             return;

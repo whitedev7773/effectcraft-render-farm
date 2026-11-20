@@ -1,13 +1,14 @@
 use super::*;
 
 fn version_comparison(ui: &mut egui::Ui, current: &str, target: &str) {
-    egui::Frame::new().fill(SURFACE_SECONDARY).corner_radius(8).inner_margin(layout::PADDING).show(ui, |ui| {
+    egui::Frame::new().fill(secondary(ui)).corner_radius(8).inner_margin(layout::PADDING).show(ui, |ui| {
         ui.set_width(ui.available_width());
         ui.columns(2, |columns| {
             caption(&mut columns[0], "이 PC의 버전");
             columns[0].label(egui::RichText::new(current.trim_start_matches('v')).size(25.0).strong());
             caption(&mut columns[1], "업데이트할 버전");
-            columns[1].label(egui::RichText::new(target.trim_start_matches('v')).size(25.0).strong().color(egui::Color32::from_rgb(106, 181, 255)));
+            let color = accent(&columns[1]);
+            columns[1].label(egui::RichText::new(target.trim_start_matches('v')).size(25.0).strong().color(color));
         });
     });
 }
@@ -24,7 +25,7 @@ impl App {
         let mut consent = false;
         let mut cancel = false;
         let mut close = false;
-        let response = egui::Modal::new(egui::Id::new("effectcraft-update")).frame(card()).show(ui.ctx(), |ui| {
+        let response = egui::Modal::new(egui::Id::new("effectcraft-update")).frame(card(ui.ctx())).show(ui.ctx(), |ui| {
             ui.set_width((ui.ctx().content_rect().width() - 88.0).clamp(280.0, 460.0));
             close = dialog_header(ui, "EffectCraft 업데이트", "업데이트 창 닫기");
             caption(ui, "같은 버전으로 맞추면 함께 렌더링할 수 있습니다.");
@@ -69,7 +70,7 @@ impl App {
                         || self.engine_updater.status.contains("취소")
                         || self.engine_updater.status.contains("재시작")
                     {
-                        ui.colored_label(egui::Color32::LIGHT_RED, &self.engine_updater.status);
+                        ui.colored_label(danger(ui), &self.engine_updater.status);
                     }
                     ui.collapsing("설치 및 버전 정보", |ui| {
                         if let Some(peer) = &required.peer {
@@ -125,7 +126,7 @@ impl App {
         let Some(release) = self.updater.available.clone() else { return };
         let mut consent = false;
         let mut close = false;
-        let response = egui::Modal::new(egui::Id::new("update-consent")).frame(card()).show(ui.ctx(), |ui| {
+        let response = egui::Modal::new(egui::Id::new("update-consent")).frame(card(ui.ctx())).show(ui.ctx(), |ui| {
             ui.set_width((ui.ctx().content_rect().width() - 88.0).clamp(280.0, 460.0));
             close = dialog_header(ui, "Render Farm 업데이트", "업데이트 창 닫기");
             caption(ui, "연결할 모든 PC의 Render Farm을 같은 버전으로 맞추세요.");
@@ -136,7 +137,7 @@ impl App {
                     version_comparison(ui, env!("CARGO_PKG_VERSION"), &release.tag_name);
                     ui.label("설치 파일을 받아 업데이트한 뒤 앱을 다시 실행합니다.");
                     if self.updater.status.starts_with("업데이트 실패:") {
-                        ui.colored_label(egui::Color32::LIGHT_RED, &self.updater.status);
+                        ui.colored_label(danger(ui), &self.updater.status);
                     }
                     ui.collapsing("변경 내용", |ui| {
                         ui.label(release.body.as_deref().unwrap_or("등록된 변경 내용이 없습니다."));
