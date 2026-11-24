@@ -270,6 +270,8 @@ pub struct State {
     pub output: PathBuf,
     bundle: Arc<OnceLock<Result<Arc<TransferBundle>, String>>>,
     pub local_progress: Option<(i64, i64, i64)>,
+    pub local_started: Option<Instant>,
+    pub worker_comp: Option<String>,
     pub log_path: Option<PathBuf>,
     log_error_reported: bool,
     pub local_preview: Option<Preview>,
@@ -940,23 +942,19 @@ pub fn render_preview(config: &Config, frame: i64) -> Result<Preview, String> {
     make_preview(&path, frame)
 }
 
-pub fn timeline(state: &Shared) -> Vec<(i64, i64, u8)> {
-    lock(state)
-        .chunks
-        .iter()
-        .map(|c| {
-            (
-                c.start,
-                c.end,
-                match c.status {
-                    ChunkStatus::Pending => 0,
-                    ChunkStatus::Running => 1,
-                    ChunkStatus::Done => 2,
-                    ChunkStatus::Failed => 3,
-                },
-            )
-        })
-        .collect()
+pub fn timeline(state: &State) -> impl Iterator<Item = (i64, i64, u8)> + '_ {
+    state.chunks.iter().map(|c| {
+        (
+            c.start,
+            c.end,
+            match c.status {
+                ChunkStatus::Pending => 0,
+                ChunkStatus::Running => 1,
+                ChunkStatus::Done => 2,
+                ChunkStatus::Failed => 3,
+            },
+        )
+    })
 }
 
 fn validate_preview(bytes: &[u8]) -> Result<(), String> {
@@ -1113,6 +1111,7 @@ fn initialize_coordinator_state(state: &Shared, config: &Config, job: &Job, scan
     s.local_preview = None;
     s.latest_preview = None;
     s.local_progress = None;
+    s.local_started = None;
     Ok(())
 }
 
@@ -1602,7 +1601,7 @@ fn serve_worker(mut stream: TcpStream, peer: SocketAddr, config: &Config, job: &
     result
 }
 
-pub fn set_worker_enabled(state: &Shared, id: u64, enabled: bool) -> Option<String> {
+pub fn set_worker_enabled(state: &Shared, id: u64, enabled: bool) -> Option<(String, String)> {
     let mut s = lock(state);
     let worker = s.worker_info.get_mut(&id)?;
     worker.enabled = enabled;
@@ -1612,7 +1611,7 @@ pub fn set_worker_enabled(state: &Shared, id: u64, enabled: bool) -> Option<Stri
     if !enabled {
         s.disabled_workers.push(ip.clone());
     }
-    Some(ip)
+    Some((ip, label))
 }
 
 pub fn begin_render(config: &Config, job: &Job, state: &Shared) {
@@ -1643,7 +1642,9 @@ pub fn run_worker(config: Config, state: Shared, stop: Arc<AtomicBool>) -> Resul
                 lock(&state).engine_mismatch = true;
                 return Err("호스트와 EffectCraft 버전을 맞춘 뒤 다시 연결하세요".into());
             }
-            lock(&state).remote_queue = queue;
+            let mut state = lock(&state);
+            state.remote_queue = queue;
+            state.worker_comp = Some(comp.clone());
             comp
         }
         Message::EffectCraftUpdate { engine } => {
@@ -1704,6 +1705,11 @@ pub fn run_worker(config: Config, state: Shared, stop: Arc<AtomicBool>) -> Resul
                     ),
                 );
                 let render_started = Instant::now();
+                {
+                    let mut state = lock(&state);
+                    state.local_started = Some(render_started);
+                    state.local_progress = Some((start, end, 0));
+                }
                 let original_end = end;
                 let mut assigned_end = end;
                 let mut sent_until = start;
@@ -2216,22 +2222,17 @@ fn assemble_legacy(config: &Config, job: &Job) -> Result<(), String> {
     Ok(())
 }
 
-pub fn worker_snapshot(state: &Shared) -> (Vec<WorkerInfo>, String) {
+#[cfg(test)]
+fn worker_snapshot(state: &Shared) -> (Vec<WorkerInfo>, String) {
     let s = lock(state);
     (s.worker_info.values().cloned().collect(), s.final_status.clone())
-}
-
-pub fn snapshot(state: &Shared) -> (i64, i64, usize, usize, Vec<String>, PathBuf) {
-    let s = lock(state);
-    let (done, total, workers, failed) = progress_metrics(&s);
-    (done, total, workers, failed, s.messages.clone(), s.output.clone())
 }
 
 pub fn progress_snapshot(state: &Shared) -> (i64, i64, usize, usize) {
     progress_metrics(&lock(state))
 }
 
-fn progress_metrics(s: &State) -> (i64, i64, usize, usize) {
+pub fn progress_metrics(s: &State) -> (i64, i64, usize, usize) {
     let mut done = 0_i64;
     let mut failed = 0_usize;
     let running = s.worker_info.values().filter_map(|worker| worker.assigned.map(|range| (range, worker.current_done))).collect::<BTreeMap<_, _>>();
@@ -2700,11 +2701,11 @@ mod tests {
         assert!(matches!(receive(&mut reader), Ok(Message::Wait)));
         lock(&state).dispatch_enabled = true;
         let worker_id = worker_snapshot(&state).0.first().unwrap().id;
-        assert_eq!(set_worker_enabled(&state, worker_id, false).as_deref(), Some("127.0.0.1"));
+        assert_eq!(set_worker_enabled(&state, worker_id, false).map(|(ip, _)| ip).as_deref(), Some("127.0.0.1"));
         assert_eq!(lock(&state).disabled_workers, vec!["127.0.0.1"]);
         send(&mut client, &Message::Request).unwrap();
         assert!(matches!(receive(&mut reader), Ok(Message::Wait)));
-        assert_eq!(set_worker_enabled(&state, worker_id, true).as_deref(), Some("127.0.0.1"));
+        assert_eq!(set_worker_enabled(&state, worker_id, true).map(|(ip, _)| ip).as_deref(), Some("127.0.0.1"));
         assert!(lock(&state).disabled_workers.is_empty());
         send(&mut client, &Message::Request).unwrap();
         receive_test_bundle(&mut reader);
@@ -2713,12 +2714,12 @@ mod tests {
         send(&mut client, &Message::Progress { start: 0, end: 2, done: 1 }).unwrap();
         assert!(matches!(receive(&mut reader), Ok(Message::Continue { end: 2 })));
         for _ in 0..100 {
-            if snapshot(&state).0 == 1 {
+            if progress_snapshot(&state).0 == 1 {
                 break;
             }
             thread::sleep(Duration::from_millis(10));
         }
-        assert_eq!(snapshot(&state).0, 1);
+        assert_eq!(progress_snapshot(&state).0, 1);
         assert_eq!(worker_snapshot(&state).0.first().unwrap().current_done, 1);
         send_test_frames(&mut client, 0, 2);
         lock(&state).queue_session = true;
@@ -2729,7 +2730,7 @@ mod tests {
         send(&mut client, &Message::Request).unwrap();
         assert!(matches!(receive(&mut reader), Ok(Message::Finished)));
         assert!(server.join().unwrap().is_ok());
-        assert_eq!(snapshot(&state).0, 2);
+        assert_eq!(progress_snapshot(&state).0, 2);
         assert_eq!(worker_snapshot(&state).0.first().unwrap().completed_frames, 2);
         let mut client = TcpStream::connect(address).unwrap();
         let (stream, peer) = listener.accept().unwrap();
@@ -3040,7 +3041,7 @@ mod tests {
         send(&mut second, &Message::Request).unwrap();
         assert!(matches!(receive(&mut second_reader), Ok(Message::Finished)));
         assert!(server.join().unwrap());
-        assert_eq!(snapshot(&state).0, 4);
+        assert_eq!(progress_snapshot(&state).0, 4);
         std::fs::remove_dir_all(dir).unwrap();
     }
 
@@ -3152,7 +3153,7 @@ mod tests {
         send(&mut first, &Message::Disconnect).unwrap();
         send(&mut second, &Message::Disconnect).unwrap();
         assert!(server.join().unwrap());
-        assert_eq!(snapshot(&state).0, 10);
+        assert_eq!(progress_snapshot(&state).0, 10);
         assert!(chunk_complete(&dir, 0, 10));
         assert!(lock(&state).messages.iter().any(|m| m.contains("대기 PC에 재분배")));
     }

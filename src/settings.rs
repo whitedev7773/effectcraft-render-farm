@@ -12,16 +12,6 @@ pub enum Theme {
     System,
 }
 
-impl Theme {
-    pub fn egui(self) -> eframe::egui::ThemePreference {
-        match self {
-            Self::Dark => eframe::egui::ThemePreference::Dark,
-            Self::Light => eframe::egui::ThemePreference::Light,
-            Self::System => eframe::egui::ThemePreference::System,
-        }
-    }
-}
-
 #[derive(Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum Distribution {
@@ -232,7 +222,7 @@ fn load_from(dir: &std::path::Path) -> (Settings, Option<String>) {
         }
     }
     valid.sort_by_key(|(settings, modified)| (settings.revision, *modified));
-    let mut settings = valid.pop().map(|(settings, _)| settings).unwrap_or_default();
+    let mut settings = valid.pop().map(|(settings, _)| settings).unwrap_or_else(|| Settings { theme: Theme::Light, ..Settings::default() });
     if !settings.gpu_defaults_applied {
         settings.gpu = true;
         settings.gpu_defaults_applied = true;

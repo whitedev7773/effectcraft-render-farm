@@ -46,9 +46,9 @@
         <File Source="$(var.Root)\assets\ui\OFL.txt" Name="WantedSans-OFL.txt" />
         <RegistryValue Root="HKCU" Key="Software\EffectCraft\RenderFarmInstaller" Name="WantedSansLicense" Value="1" Type="integer" KeyPath="yes" />
       </Component>
-      <Component Directory="INSTALLFOLDER" Id="GravityIconsLicense" Guid="01F30FE6-E905-483D-92B4-C4FB96B7C268">
-        <File Source="$(var.Root)\assets\ui\icons\LICENSE" Name="GravityIcons-LICENSE.txt" />
-        <RegistryValue Root="HKCU" Key="Software\EffectCraft\RenderFarmInstaller" Name="GravityIconsLicense" Value="1" Type="integer" KeyPath="yes" />
+      <Component Directory="INSTALLFOLDER" Id="WebUiNotices" Guid="861F6AE2-B37E-4CEA-816B-8CC0FDAD3C43">
+        <File Source="$(var.Root)\assets\ui\THIRD-PARTY.txt" Name="Farm-UI-Notices.txt" />
+        <RegistryValue Root="HKCU" Key="Software\EffectCraft\RenderFarmInstaller" Name="WebUiNotices" Value="1" Type="integer" KeyPath="yes" />
       </Component>
     </Feature>
   </Package>

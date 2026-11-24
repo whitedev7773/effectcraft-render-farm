@@ -12,7 +12,7 @@ const MARKER: &str = "effectcraft-farm-host-v1";
 const MAX_PACKET: usize = 512;
 const MAX_HOSTS: usize = 64;
 
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
 pub struct Host {
     pub name: String,
     pub address: SocketAddr,

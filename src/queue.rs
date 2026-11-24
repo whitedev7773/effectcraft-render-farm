@@ -108,8 +108,8 @@ impl Task {
     }
 }
 
-fn path_key(value: &str) -> PathBuf {
-    let path = PathBuf::from(value);
+pub(crate) fn path_key(value: impl AsRef<std::path::Path>) -> PathBuf {
+    let path = value.as_ref().to_path_buf();
     let path = path.canonicalize().unwrap_or_else(|_| {
         path.parent().and_then(|parent| parent.canonicalize().ok()).and_then(|parent| path.file_name().map(|name| parent.join(name))).unwrap_or(path)
     });
@@ -168,8 +168,6 @@ impl App {
             self.queue_workers = workers;
         }
         self.last_error.clear();
-        self.monitor = true;
-        self.queue_view = false;
         farm::begin_render(&self.config(), job, &self.state);
     }
 
@@ -736,7 +734,7 @@ mod tests {
     }
 
     #[test]
-    fn opening_host_with_local_worker_keeps_ui_responsive() {
+    fn opening_host_with_local_worker_keeps_controller_responsive() {
         use effectcraft_color::Label;
         use effectcraft_project::{Comp, ItemKind, Project};
         use effectcraft_time::{FrameRate, Tick};
@@ -767,8 +765,6 @@ mod tests {
                 app.settings.token = "local-test-password".into();
                 app.settings.local_worker = true;
                 app.settings.reduced_motion = true;
-                let ctx = egui::Context::default();
-                install_ui_font(&ctx)?;
                 app.start_next_queued();
                 let deadline = Instant::now() + Duration::from_secs(10);
                 let mut connected_frames = 0;
@@ -776,9 +772,6 @@ mod tests {
                     app.poll_start();
                     app.poll_engine_update();
                     app.poll_queue();
-                    let input =
-                        egui::RawInput { screen_rect: Some(egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(1280.0, 720.0))), ..Default::default() };
-                    ctx.run_ui(input, |ui| app.draw_interface(ui)).drop_without_applying_deltas();
                     if app.running && !app.connected_render_workers().is_empty() {
                         connected_frames += 1;
                     }

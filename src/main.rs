@@ -1,12 +1,13 @@
 #![deny(clippy::unwrap_used, clippy::expect_used, clippy::panic, clippy::unimplemented, clippy::todo, clippy::unreachable)]
 #![cfg_attr(all(windows, not(debug_assertions)), windows_subsystem = "windows")]
 
+mod desktop;
 mod discovery;
 mod effectcraft_update;
 mod encoding;
 mod farm;
 mod installation;
-mod interface;
+mod project_import;
 mod queue;
 mod resources;
 mod settings;
@@ -19,207 +20,17 @@ use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::{Duration, Instant};
 
-use eframe::egui::{self, FontData, FontDefinitions, FontFamily};
 use farm::{CompInfo, Config, Job, Shared, State};
 use settings::{Distribution, Settings};
 
-fn install_ui_font(ctx: &egui::Context) -> Result<(), String> {
-    let mut fonts = FontDefinitions::default();
-    fonts.font_data.insert("wanted-sans".into(), std::sync::Arc::new(FontData::from_static(include_bytes!("../assets/ui/WantedSans-Regular.ttf"))));
-    fonts.font_data.insert("wanted-medium".into(), std::sync::Arc::new(FontData::from_static(include_bytes!("../assets/ui/WantedSans-Medium.ttf"))));
-    fonts.font_data.insert("wanted-bold".into(), std::sync::Arc::new(FontData::from_static(include_bytes!("../assets/ui/WantedSans-Bold.ttf"))));
-    fonts.families.insert(FontFamily::Name("wanted-medium".into()), vec!["wanted-medium".into()]);
-    fonts.families.insert(FontFamily::Name("wanted-bold".into()), vec!["wanted-bold".into()]);
-    fonts.families.entry(FontFamily::Proportional).or_default().insert(0, "wanted-sans".into());
-    ctx.set_fonts(fonts);
-    use interface::layout::{CONTROL_RADIUS, DIALOG_PADDING, DIALOG_RADIUS, Palette};
-    for theme in [egui::Theme::Dark, egui::Theme::Light] {
-        let mut style = (*ctx.style_of(theme)).clone();
-        let palette = Palette::new(theme == egui::Theme::Dark);
-        style.spacing.item_spacing = egui::vec2(interface::layout::SPACE, interface::layout::SPACE);
-        style.spacing.button_padding = egui::vec2(12.0, 6.0);
-        style.spacing.interact_size.y = interface::layout::CONTROL;
-        style.spacing.window_margin = egui::Margin::same(DIALOG_PADDING);
-        style.visuals.window_corner_radius = egui::CornerRadius::same(DIALOG_RADIUS);
-        style.visuals.menu_corner_radius = egui::CornerRadius::same(CONTROL_RADIUS);
-        style.visuals.panel_fill = palette.canvas;
-        style.visuals.window_fill = palette.surface;
-        style.visuals.window_stroke = egui::Stroke::new(1.0, palette.border);
-        style.visuals.extreme_bg_color = palette.inset;
-        style.visuals.text_edit_bg_color = Some(palette.field);
-        style.visuals.faint_bg_color = palette.inset;
-        style.visuals.override_text_color = None;
-        let widgets = &mut style.visuals.widgets;
-        for (widget, fill, stroke) in [
-            (&mut widgets.noninteractive, palette.inset, palette.border),
-            (&mut widgets.inactive, palette.field, palette.border),
-            (&mut widgets.hovered, palette.hover, palette.accent),
-            (&mut widgets.active, palette.pressed, palette.accent),
-            (&mut widgets.open, palette.hover, palette.accent),
-        ] {
-            widget.corner_radius = egui::CornerRadius::same(CONTROL_RADIUS);
-            widget.fg_stroke.color = palette.text;
-            widget.bg_fill = fill;
-            widget.weak_bg_fill = fill;
-            widget.bg_stroke = egui::Stroke::new(1.0, stroke);
-            widget.expansion = 0.0;
-        }
-        style.text_styles.insert(egui::TextStyle::Body, egui::FontId::proportional(14.0));
-        style.text_styles.insert(egui::TextStyle::Button, figma_font(14.0, false));
-        style.text_styles.insert(egui::TextStyle::Heading, figma_font(24.0, true));
-        style.text_styles.insert(egui::TextStyle::Small, egui::FontId::proportional(12.0));
-        style.visuals.selection.bg_fill = palette.selection;
-        style.visuals.selection.stroke = egui::Stroke::new(1.0, palette.text);
-        style.visuals.weak_text_color = Some(palette.muted);
-        style.visuals.hyperlink_color = palette.accent;
-        style.visuals.warn_fg_color = palette.warning;
-        style.visuals.error_fg_color = palette.danger;
-        ctx.set_style_of(theme, style);
-    }
-    Ok(())
-}
-
-fn figma_font(size: f32, bold: bool) -> egui::FontId {
-    egui::FontId::new(size, FontFamily::Name(if bold { "wanted-bold" } else { "wanted-medium" }.into()))
-}
-
-fn window_resize_direction(rect: egui::Rect, pos: egui::Pos2) -> Option<egui::ResizeDirection> {
-    if !rect.contains(pos) {
-        return None;
-    }
-    let left = pos.x < rect.left() + 6.0;
-    let right = pos.x > rect.right() - 6.0;
-    let top = pos.y < rect.top() + 6.0;
-    let bottom = pos.y > rect.bottom() - 6.0;
-    match (left, right, top, bottom) {
-        (true, _, true, _) => Some(egui::ResizeDirection::NorthWest),
-        (_, true, true, _) => Some(egui::ResizeDirection::NorthEast),
-        (true, _, _, true) => Some(egui::ResizeDirection::SouthWest),
-        (_, true, _, true) => Some(egui::ResizeDirection::SouthEast),
-        (true, _, _, _) => Some(egui::ResizeDirection::West),
-        (_, true, _, _) => Some(egui::ResizeDirection::East),
-        (_, _, true, _) => Some(egui::ResizeDirection::North),
-        (_, _, _, true) => Some(egui::ResizeDirection::South),
-        _ => None,
-    }
-}
-
-fn handle_window_resize(ctx: &egui::Context) {
-    let (pointer, pressed, maximized) =
-        ctx.input(|input| (input.pointer.hover_pos(), input.pointer.primary_pressed(), input.viewport().maximized.unwrap_or(false)));
-    if maximized {
-        return;
-    }
-    if let Some(direction) = pointer.and_then(|pos| window_resize_direction(ctx.content_rect(), pos)) {
-        let cursor = match direction {
-            egui::ResizeDirection::North | egui::ResizeDirection::South => egui::CursorIcon::ResizeVertical,
-            egui::ResizeDirection::East | egui::ResizeDirection::West => egui::CursorIcon::ResizeHorizontal,
-            egui::ResizeDirection::NorthWest | egui::ResizeDirection::SouthEast => egui::CursorIcon::ResizeNwSe,
-            egui::ResizeDirection::NorthEast | egui::ResizeDirection::SouthWest => egui::CursorIcon::ResizeNeSw,
-        };
-        ctx.set_cursor_icon(cursor);
-        if pressed {
-            ctx.send_viewport_cmd(egui::ViewportCommand::BeginResize(direction));
-        }
-    }
-}
-
-#[cfg(test)]
-mod window_tests {
-    use super::*;
-
-    #[test]
-    fn borderless_window_has_resize_edges_and_corners() {
-        let rect = egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(550.0, 558.0));
-        assert_eq!(window_resize_direction(rect, egui::pos2(1.0, 1.0)), Some(egui::ResizeDirection::NorthWest));
-        assert_eq!(window_resize_direction(rect, egui::pos2(549.0, 557.0)), Some(egui::ResizeDirection::SouthEast));
-        assert_eq!(window_resize_direction(rect, egui::pos2(275.0, 1.0)), Some(egui::ResizeDirection::North));
-        assert_eq!(window_resize_direction(rect, rect.center()), None);
-    }
-}
-
-fn path_row(ui: &mut egui::Ui, label: &str, value: &mut String) -> bool {
-    ui.label(egui::RichText::new(label).strong());
-    ui.horizontal(|ui| {
-        let available = ui.available_width().min(ui.clip_rect().right() - ui.cursor().left());
-        let width = (available - 80.0 - interface::layout::SPACE).max(1.0);
-        ui.add_sized([width, interface::layout::CONTROL], egui::TextEdit::singleline(value).hint_text("파일 경로를 선택하세요")).on_hover_text(value.as_str());
-        ui.add_sized([80.0, interface::layout::CONTROL], egui::Button::new("찾아보기")).clicked()
-    })
-    .inner
-}
-
-fn text_row(ui: &mut egui::Ui, label: &str, value: &mut String, secret: bool) {
-    ui.label(egui::RichText::new(label).strong());
-    ui.add_sized([ui.available_width(), interface::layout::CONTROL], egui::TextEdit::singleline(value).password(secret));
-}
-
-fn section_title(ui: &mut egui::Ui, title: &str) {
-    ui.label(egui::RichText::new(title).size(15.0).strong().color(ui.visuals().text_color()));
-}
-
-fn primary_button(label: &str) -> egui::Button<'_> {
-    egui::Button::new(egui::RichText::new(label).strong().color(interface::layout::ON_PRIMARY))
-        .fill(interface::layout::PRIMARY_FILL)
-        .stroke(egui::Stroke::NONE)
-        .corner_radius(interface::layout::CONTROL_RADIUS)
-}
-
-#[derive(Clone, Copy)]
-enum RangeHandle {
-    Start,
-    End,
-}
-
-fn range_bar(ui: &mut egui::Ui, start: &mut i64, end: &mut i64, total: i64, work: (i64, i64), handle: &mut Option<RangeHandle>) {
-    if total < 1 {
-        return;
-    }
-    let (rect, response) = ui.allocate_exact_size(egui::vec2(ui.available_width().max(120.0), 44.0), egui::Sense::click_and_drag());
-    let left = rect.left() + 12.0;
-    let right = rect.right() - 12.0;
-    let width = (right - left).max(1.0);
-    let x = |frame: i64| left + width * (frame.clamp(0, total) as f32 / total as f32);
-    let center = rect.center().y;
-    let painter = ui.painter();
-    let palette = interface::layout::Palette::new(ui.visuals().dark_mode);
-    painter.rect_filled(egui::Rect::from_min_max(egui::pos2(left, center - 5.0), egui::pos2(right, center + 5.0)), 5.0, palette.inset);
-    painter.rect_filled(egui::Rect::from_min_max(egui::pos2(x(work.0), center - 5.0), egui::pos2(x(work.1), center + 5.0)), 5.0, palette.border);
-    painter.rect_filled(egui::Rect::from_min_max(egui::pos2(x(*start), center - 5.0), egui::pos2(x(*end), center + 5.0)), 5.0, interface::layout::PRIMARY_FILL);
-    for frame in [*start, *end] {
-        painter.circle_filled(egui::pos2(x(frame), center), 9.0, egui::Color32::WHITE);
-        painter.circle_stroke(egui::pos2(x(frame), center), 9.0, egui::Stroke::new(2.0, interface::layout::PRIMARY_FILL));
-    }
-    if (response.drag_started() || response.clicked())
-        && let Some(pointer) = response.interact_pointer_pos()
-    {
-        *handle = Some(if (pointer.x - x(*start)).abs() <= (pointer.x - x(*end)).abs() { RangeHandle::Start } else { RangeHandle::End });
-    }
-    if (response.dragged() || response.clicked())
-        && let (Some(pointer), Some(selected)) = (response.interact_pointer_pos(), *handle)
-    {
-        let frame = (((pointer.x - left) / width).clamp(0.0, 1.0) * total as f32).round() as i64;
-        match selected {
-            RangeHandle::Start => *start = frame.clamp(0, end.saturating_sub(1)),
-            RangeHandle::End => *end = frame.clamp(start.saturating_add(1), total),
-        }
-    }
-    if response.drag_stopped() || response.clicked() {
-        *handle = None;
-    }
-}
-
 struct App {
-    show_welcome: bool,
     #[cfg(test)]
     settings_in_memory: bool,
     queue_active: Option<u64>,
     queue_automatic: bool,
     queue_workers: std::collections::BTreeSet<String>,
-    queue_detail: Option<u64>,
-    queue_edit: Option<queue::Task>,
     queue_previews: std::collections::BTreeMap<u64, farm::Preview>,
-    project_import: Option<interface::import::ProjectImport>,
+    project_import: Option<project_import::ProjectImport>,
     updater: updater::Updater,
     updater_logged_status: String,
     engine_updater: effectcraft_update::Updater,
@@ -240,23 +51,13 @@ struct App {
     discovery_status: String,
     last_error: String,
     last_logged_error: String,
+    installation_error: String,
+    last_progress_save: Instant,
     catalog_path: String,
     catalog_changed: Option<Instant>,
     pending_catalog: Option<Receiver<Result<Vec<CompInfo>, String>>>,
     catalog: Vec<CompInfo>,
     catalog_status: String,
-    range_handle: Option<RangeHandle>,
-    monitor: bool,
-    queue_view: bool,
-    settings_open: bool,
-    settings_tab: u8,
-    logs_open: bool,
-    preview_open: bool,
-    worker_details: Option<u64>,
-    log_filter: String,
-    log_debug: bool,
-    textures: std::collections::BTreeMap<u64, (Arc<Vec<u8>>, egui::TextureHandle)>,
-    inspect_frame: i64,
     pending_preview: Option<Receiver<Result<farm::Preview, String>>>,
     inspected: Option<farm::Preview>,
     preview_status: String,
@@ -298,14 +99,11 @@ impl App {
         let catalog_path = settings.project.clone();
         let catalog_changed = (!catalog_path.is_empty()).then(Instant::now);
         Self {
-            show_welcome: false,
             #[cfg(test)]
             settings_in_memory: false,
             queue_active: None,
             queue_automatic: false,
             queue_workers: Default::default(),
-            queue_detail: None,
-            queue_edit: None,
             queue_previews: Default::default(),
             project_import: None,
             updater: updater::Updater::default(),
@@ -328,30 +126,20 @@ impl App {
             discovery_status: String::new(),
             last_error: warning.unwrap_or_default(),
             last_logged_error: String::new(),
+            installation_error: String::new(),
+            last_progress_save: Instant::now(),
             catalog_path,
             catalog_changed,
             pending_catalog: None,
             catalog: Vec::new(),
             catalog_status: String::new(),
-            range_handle: None,
-            monitor: false,
-            queue_view: false,
-            settings_open: false,
-            settings_tab: 0,
-            logs_open: false,
-            preview_open: false,
-            worker_details: None,
-            log_filter: String::new(),
-            log_debug: false,
-            textures: Default::default(),
-            inspect_frame: 0,
             pending_preview: None,
             inspected: None,
             preview_status: String::new(),
         }
     }
 
-    fn update_ui(&mut self, ui: &mut egui::Ui) {
+    fn poll_app_update(&mut self) {
         let idle = !self.running
             && self.pending_start.is_none()
             && !self.worker_active.load(Ordering::Relaxed)
@@ -369,13 +157,9 @@ impl App {
                 Ok(()) => {
                     self.updater.restarting = true;
                     self.updater.status = "업데이트 적용을 위해 앱을 종료하고 다시 시작합니다".into();
-                    ui.ctx().send_viewport_cmd(egui::ViewportCommand::Close);
                 }
                 Err(error) => self.updater.status = format!("업데이트 실패: {error}"),
             }
-        }
-        if self.updater.prompt && !self.engine_updater.prompt {
-            self.farm_update_ui(ui, idle && !self.engine_install_requested);
         }
         if self.updater.status != self.updater_logged_status {
             if !self.updater.status.is_empty() {
@@ -439,31 +223,6 @@ impl App {
             self.stop.store(true, Ordering::Relaxed);
             self.stopping = true;
         }
-    }
-
-    fn show_preview(&mut self, ui: &mut egui::Ui, key: u64, preview: &farm::Preview) {
-        self.show_preview_sized(ui, key, preview, 220.0);
-    }
-
-    fn show_preview_sized(&mut self, ui: &mut egui::Ui, key: u64, preview: &farm::Preview, max_height: f32) {
-        if let Some(texture) = self.preview_texture(ui, key, preview) {
-            let size = egui::vec2(ui.available_width().min(max_height * 16.0 / 9.0), (ui.available_width() * 9.0 / 16.0).min(max_height));
-            ui.with_layout(egui::Layout::top_down(egui::Align::Center), |ui| {
-                ui.add(egui::Image::new(&texture).fit_to_exact_size(size).maintain_aspect_ratio(true));
-                ui.small(format!("프레임 {}", preview.frame));
-            });
-        }
-    }
-
-    fn preview_texture(&mut self, ui: &egui::Ui, key: u64, preview: &farm::Preview) -> Option<egui::TextureHandle> {
-        let changed = self.textures.get(&key).is_none_or(|(bytes, _)| !Arc::ptr_eq(bytes, &preview.jpeg));
-        if changed && let Ok(image) = image::load_from_memory(&preview.jpeg) {
-            let rgba = image.to_rgba8();
-            let color = egui::ColorImage::from_rgba_unmultiplied([rgba.width() as usize, rgba.height() as usize], rgba.as_raw());
-            let texture = ui.ctx().load_texture(format!("preview-{key}"), color, egui::TextureOptions::LINEAR);
-            self.textures.insert(key, (preview.jpeg.clone(), texture));
-        }
-        self.textures.get(&key).map(|(_, texture)| texture.clone())
     }
 
     fn sync_selected_comp_range(&mut self) {
@@ -603,7 +362,6 @@ impl App {
             return;
         }
         self.last_error.clear();
-        self.textures.clear();
         self.inspected = None;
         if self.settings.host {
             let missing = self.missing_host_settings();
@@ -653,8 +411,17 @@ impl App {
                 let _ = sender.send(result);
             });
         } else {
+            {
+                let mut state = self.state.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+                state.worker_comp = None;
+                state.remote_queue = false;
+                state.engine_mismatch = false;
+                state.local_started = None;
+                state.local_progress = None;
+                state.local_preview = None;
+                state.final_status = "호스트에 연결하는 중…".into();
+            }
             self.running = true;
-            self.monitor = true;
             self.spawn_worker(config);
         }
     }
@@ -669,9 +436,6 @@ impl App {
         self.pending_start = None;
         match result {
             Ok(job) => {
-                self.inspect_frame = job.start;
-                self.monitor = true;
-                self.queue_view = false;
                 self.job = Some(job);
                 self.running = true;
                 let pending_config = self.pending_config.take();
@@ -724,7 +488,9 @@ impl App {
                 match result {
                     Ok(()) if reconnect && !stop.load(Ordering::Relaxed) && state.lock().unwrap_or_else(std::sync::PoisonError::into_inner).remote_queue => {
                         completed_session = true;
-                        state.lock().unwrap_or_else(std::sync::PoisonError::into_inner).final_status = "다음 큐 작업 연결 대기".into();
+                        let mut state = state.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+                        state.worker_comp = None;
+                        state.final_status = "다음 큐 작업 연결 대기".into();
                     }
                     Err(_)
                         if reconnect
@@ -747,6 +513,9 @@ impl App {
                     break;
                 }
             }
+            if reconnect {
+                state.lock().unwrap_or_else(std::sync::PoisonError::into_inner).worker_comp = None;
+            }
             active.store(false, Ordering::Relaxed);
         });
     }
@@ -764,12 +533,7 @@ impl App {
             self.last_error = e;
         }
     }
-}
-
-impl eframe::App for App {
-    fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
-        handle_window_resize(ui.ctx());
-        ui.ctx().request_repaint_after(Duration::from_millis(500));
+    fn poll(&mut self) {
         self.poll_engine_update();
         self.poll_start();
         self.poll_discovery();
@@ -816,75 +580,40 @@ impl eframe::App for App {
                 self.stopping = false;
             }
         }
+        let active = self.queue_active;
         self.poll_queue();
-        let before = self.settings.clone();
-        interface::theme_transition::advance(ui, &mut self.settings.theme, self.settings.reduced_motion);
-        if self.show_welcome {
-            self.draw_welcome(ui);
-        } else {
-            self.draw_interface(ui);
+        if active.is_some() && active == self.queue_active && self.last_progress_save.elapsed() >= Duration::from_secs(2) {
+            self.last_progress_save = Instant::now();
+            self.save_settings();
         }
-        self.update_ui(ui);
-        self.engine_update_ui(ui);
-        interface::theme_transition::paint(ui.ctx(), self.settings.reduced_motion);
+        if let Some(draft) = &mut self.project_import {
+            draft.poll();
+        }
+        self.poll_app_update();
         if self.last_error != self.last_logged_error {
             if !self.last_error.is_empty() && !self.last_error.starts_with("클라이언트 오류:") {
                 self.state.lock().unwrap_or_else(std::sync::PoisonError::into_inner).note(format!("화면 오류: {}", self.last_error));
             }
             self.last_logged_error = self.last_error.clone();
         }
-        if self.settings != before {
-            self.save_settings();
-        }
     }
 }
 
 fn main() {
-    #[cfg(debug_assertions)]
-    if interface::review::run_requested() {
-        return;
-    }
-    let (saved, _) = settings::load();
-    let installation = match installation::detect(&saved.cli) {
-        Ok(installation) => installation,
-        Err(reason) => {
-            State::with_log_path(settings::log_path().ok()).note(format!("EffectCraft 설치 확인 실패: {reason}"));
-            installation::guide_and_exit_reason(&reason);
-            return;
-        }
-    };
-    let icon = match eframe::icon_data::from_png_bytes(include_bytes!("../assets/app-icon/farm-256.png")) {
-        Ok(icon) => icon,
-        Err(error) => {
-            eprintln!("Render Farm icon: {error}");
-            return;
-        }
-    };
-    let options = eframe::NativeOptions {
-        viewport: egui::ViewportBuilder::default()
-            .with_title("EffectCraft Render Farm")
-            .with_decorations(false)
-            .with_icon(icon)
-            .with_inner_size([550.0, 558.0])
-            .with_min_inner_size([550.0, 520.0]),
-        centered: true,
-        ..Default::default()
-    };
-    if let Err(e) = eframe::run_native(
-        "EffectCraft Render Farm",
-        options,
-        Box::new(move |cc| {
-            let mut app = App { show_welcome: true, ..App::default() };
-            app.settings.cli = installation.cli.display().to_string();
-            app.engine_updater.check(installation.cli.clone());
-            app.state.lock().unwrap_or_else(std::sync::PoisonError::into_inner).note(format!("설치된 EffectCraft 감지: {}", installation.root.display()));
-            app.save_settings();
-            if let Err(error) = install_ui_font(&cc.egui_ctx) {
-                app.last_error = error;
+    if let Err(error) = desktop::run() {
+        State::with_log_path(settings::log_path().ok()).note(format!("Render Farm 시작 실패: {error}"));
+        eprintln!("EffectCraft Render Farm: {error}");
+        let dialog = rfd::MessageDialog::new().set_title("EffectCraft Render Farm").set_level(rfd::MessageLevel::Error);
+        if cfg!(windows) {
+            let result = dialog
+                .set_description(format!("앱을 시작할 수 없습니다. WebView2 Runtime 설치 페이지를 열까요?\n\n{error}"))
+                .set_buttons(rfd::MessageButtons::YesNo)
+                .show();
+            if result == rfd::MessageDialogResult::Yes {
+                let _ = webbrowser::open("https://developer.microsoft.com/en-us/microsoft-edge/webview2/#download-section");
             }
-            Ok(Box::new(app))
-        }),
-    ) {
-        eprintln!("EffectCraft Render Farm could not start: {e}");
+        } else {
+            dialog.set_description(format!("앱을 시작할 수 없습니다.\n\n{error}")).show();
+        }
     }
 }

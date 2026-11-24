@@ -1,4 +1,6 @@
 /target/
+/ui/node_modules/
+/ui/dist/
 *.mp4
 *.png
 !/assets/app-icon/*.png

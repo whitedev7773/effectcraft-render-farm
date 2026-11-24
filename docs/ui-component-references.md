@@ -1,33 +1,7 @@
-# UI component references
+# 데스크톱 UI
 
-The Render Farm UI is implemented in native Rust/egui. The references below guide component behavior, hierarchy, and layout; React, CSS, and browser components are not installed or embedded in the application. Existing GPU rendering and scheduling policies are independent of these UI changes.
+React 화면과 모달은 [HeroUI v3](https://heroui.com/en/docs/react/getting-started)의 Card, Button, Select, Table, Tabs, Modal, Switch, Slider, ProgressBar 및 피드백 컴포넌트로 구성합니다. Figma의 시작 화면과 렌더링 목록에서 가져온 색상, 글꼴, 간격, 모서리 토큰을 `ui/src/styles.css`에서 관리하고 모니터, 연결, 설정, 작업 기록, 대기열 관리에도 공유합니다. 원본 프레임의 배치는 `ui/src/reference.css`에 있습니다. 글꼴은 Wanted Sans이며, Figma에서 내보낸 아이콘은 같은 동작과 상태에 재사용합니다. 추가 동작에는 Lucide 아이콘을 사용합니다.
 
-## Framework comparison
+Cargo 빌드는 잠긴 npm 의존성으로 화면을 빌드하고 생성된 정적 자산을 실행 파일에 포함합니다. Wry가 운영체제의 WebView에서 자산을 열고, Rust와의 메시지 통신으로 대기열과 렌더 상태를 연결합니다. 앱 UI를 제공하기 위한 로컬 HTTP 서버나 CDN 의존성은 없습니다.
 
-| Reference | Relevant official guidance | Native adaptation |
-| --- | --- | --- |
-| [Blueprint](https://github.com/palantir/blueprint) | Designed for complex, data-dense desktop interfaces; includes an interactive table package. | Compact, aligned computer rows replace large repeated fleet cards. The desktop monitor allocates enough room for six computers before scrolling. |
-| [shadcn/ui Data Table](https://ui.shadcn.com/docs/components/base/data-table) | Composes tables with row actions, filtering, sorting, and selection. | Render queue has a real column header, search, status filtering, progress, and row-level actions. Queue processing order remains unchanged by filtering. |
-| [shadcn/ui Sidebar](https://ui.shadcn.com/docs/components/aria/sidebar) | Separates header, grouped navigation, content, and footer regions. | Sidebar separates the application identity, workspace navigation, utilities, and local connection information. Compact windows use top navigation. |
-| [Fluent 2 Badge](https://fluent2.microsoft.design/components/web/react/core/badge/usage) | Use short descriptive state labels near the content they describe; use semantic color intentionally and consistent sizes in a context. | Small status badges remain adjacent to each computer or queue task. Text communicates state as well as color. |
-| [Fluent 2 Progress Bar](https://fluent2.microsoft.design/components/web/react/core/progressbar/usage) | Prefer determinate progress when possible and pair it with a clear label and useful units. | Render progress uses percentage and completed/total frame counts. Indeterminate preparation is shown separately from completed frames. |
-| [Fluent 2 Toolbar](https://fluent2.microsoft.design/components/web/react/core/toolbar/usage) | Group related actions; use meaningful labels and keep destructive actions separate. | Search, state filter, and view selection form a queue toolbar. Task removal remains separated from save and dismissal actions in the detail dialog. |
-| [Ant Design Segmented](https://ant.design/components/segmented/) | Single-choice controls can switch associated content or views. | Connected segments select queue list/card views with a clearly persistent selection. |
-
-## Layout decisions
-
-These are application-specific decisions inferred from the references, rather than prescribed framework defaults:
-
-- A render farm needs a fleet overview more than large decorative computer cards. At 1440 × 940, all six fixture computer names must be fully inside their clip rectangles with no scroll interaction.
-- A live frame preview and render progress belong above the fleet. Activity details are secondary to current work and computer participation.
-- Queue filtering changes the visible subset, not scheduling order, task identifiers, or participation choices.
-- Compact windows can scroll; controls and labels must stay inside the window width.
-- Slate surfaces, a restrained blue accent, and consistent border, spacing, and typography tokens keep the native components visually related.
-
-## Verification
-
-`src/interface/review.rs` contains isolated fixtures, pointer-driven navigation/filter checks, clipping regressions, theme switching, and modal checks. Debug capture mode (`EFFECTCRAFT_FARM_UI_CAPTURE`) renders the actual native UI in dark and light themes without opening user projects or connecting to the network.
-
-## Project-to-queue workflow
-
-Project selection opens an isolated composition-selection modal. Selecting one renderable composition sets its work area and a suggested MP4 path. Committing validates and adds a queue task; cancellation discards the draft. The queue defaults to cards, with a settings gear revealed on item hover (or keyboard focus). This modal opens the existing per-task render-property editor; running and completed tasks retain their existing editing restrictions.
+HeroUI는 Apache-2.0, [Lucide](https://lucide.dev/license)는 ISC, [Wanted Sans](../assets/ui/OFL.txt)는 SIL OFL 1.1을 따릅니다.

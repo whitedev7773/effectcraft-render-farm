@@ -74,27 +74,8 @@ pub fn detect(saved_cli: &str) -> Result<Installation, String> {
     if let Some(paths) = std::env::var_os("PATH") {
         candidates.extend(std::env::split_paths(&paths));
     }
-    first_installation(candidates).ok_or_else(|| {
-        "EffectCraft 설치 경로에서 effectcraft와 effectcraft-cli를 찾을 수 없습니다. EffectCraft를 설치하거나 복구한 뒤 Render Farm을 다시 실행하세요.".into()
-    })
-}
-
-pub fn guide_and_exit_reason(reason: &str) {
-    let result = rfd::MessageDialog::new()
-        .set_title("EffectCraft 설치 필요")
-        .set_description(format!("{reason}\n\nEffectCraft 공식 설치 페이지를 열까요?\n이 안내를 닫으면 Render Farm은 종료됩니다."))
-        .set_level(rfd::MessageLevel::Warning)
-        .set_buttons(rfd::MessageButtons::YesNo)
-        .show();
-    if result == rfd::MessageDialogResult::Yes
-        && let Err(error) = webbrowser::open(INSTALL_URL)
-    {
-        rfd::MessageDialog::new()
-            .set_title("EffectCraft 설치 안내")
-            .set_description(format!("설치 페이지를 열 수 없습니다: {error}\n\n브라우저에서 다음 주소를 여세요:\n{INSTALL_URL}"))
-            .set_level(rfd::MessageLevel::Error)
-            .show();
-    }
+    first_installation(candidates)
+        .ok_or_else(|| "EffectCraft와 effectcraft-cli를 함께 찾을 수 없습니다. EffectCraft를 설치하거나 복구한 뒤 설치 상태를 다시 확인하세요.".into())
 }
 
 #[cfg(test)]
