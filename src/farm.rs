@@ -1328,6 +1328,8 @@ fn serve_worker(mut stream: TcpStream, peer: SocketAddr, config: &Config, job: &
         } else if s.worker_info.values().any(|worker| worker.connected && worker.ip == ip) {
             Err("이 클라이언트는 이미 연결되어 있습니다")
         } else {
+            // A reconnect represents the same PC, not another fleet entry.
+            s.worker_info.retain(|_, worker| worker.connected || worker.ip != ip);
             if s.worker_info.len() >= 128 {
                 s.worker_info.retain(|_, info| info.connected);
             }
@@ -1436,7 +1438,10 @@ fn serve_worker(mut stream: TcpStream, peer: SocketAddr, config: &Config, job: &
                         }
                         None => {
                             let s = lock(state);
-                            let finished = s.dispatch_enabled && s.chunks.iter().all(|c| matches!(c.status, ChunkStatus::Done | ChunkStatus::Failed));
+                            let chunks_finished = s.dispatch_enabled && s.chunks.iter().all(|c| matches!(c.status, ChunkStatus::Done | ChunkStatus::Failed));
+                            // Queue clients reconnect after Finished for the next job. Keep
+                            // them attached while this job is still being assembled.
+                            let finished = chunks_finished && !(s.queue_session && s.assembly_started && s.final_result.is_none());
                             drop(s);
                             send(&mut stream, if finished { &Message::Finished } else { &Message::Wait })?;
                             if finished {
@@ -2716,12 +2721,35 @@ mod tests {
         assert_eq!(snapshot(&state).0, 1);
         assert_eq!(worker_snapshot(&state).0.first().unwrap().current_done, 1);
         send_test_frames(&mut client, 0, 2);
+        lock(&state).queue_session = true;
         send(&mut client, &Message::Complete { start: 0, end: 2, ok: true, detail: String::new() }).unwrap();
+        send(&mut client, &Message::Request).unwrap();
+        assert!(matches!(receive(&mut reader), Ok(Message::Wait)));
+        lock(&state).final_result = Some(Ok(()));
         send(&mut client, &Message::Request).unwrap();
         assert!(matches!(receive(&mut reader), Ok(Message::Finished)));
         assert!(server.join().unwrap().is_ok());
         assert_eq!(snapshot(&state).0, 2);
         assert_eq!(worker_snapshot(&state).0.first().unwrap().completed_frames, 2);
+        let mut client = TcpStream::connect(address).unwrap();
+        let (stream, peer) = listener.accept().unwrap();
+        let server_state = state.clone();
+        let server = thread::spawn(move || serve_worker(stream, peer, &config, &job, &server_state, &AtomicBool::new(false)));
+        let mut reader = BufReader::new(client.try_clone().unwrap());
+        send(
+            &mut client,
+            &Message::Hello {
+                token: "password".into(),
+                name: "test-worker".into(),
+                protocol: PROTOCOL_VERSION,
+                engine: EngineVersion { installed: "0.23.1".into(), latest: None },
+            },
+        )
+        .unwrap();
+        assert!(matches!(receive(&mut reader), Ok(Message::Ready { .. })));
+        assert_eq!(worker_snapshot(&state).0.len(), 1);
+        send(&mut client, &Message::Disconnect).unwrap();
+        assert!(server.join().unwrap().is_ok());
         std::fs::remove_dir_all(dir).unwrap();
     }
 
