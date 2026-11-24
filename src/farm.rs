@@ -831,29 +831,6 @@ fn prepare_output(job: &Job) -> Result<(), String> {
     std::fs::rename(&temporary, &path).map_err(|error| format!("작업 정보 확정: {error}"))
 }
 
-fn recover_legacy_frames(project: &Path, job: &Job, stop: &AtomicBool) {
-    let legacy = crate::settings::legacy_frame_output(project);
-    if read_manifest(&legacy.join("effectcraft-farm.json")).ok().flatten().as_ref() != Some(&Manifest::from(job)) {
-        return;
-    }
-
-    let temporary = job.output.join("legacy-frame.partial");
-    for frame in job.start..job.end {
-        if stop.load(Ordering::Relaxed) {
-            break;
-        }
-        let target = frame_path(&job.output, frame);
-        if valid_png(&target) {
-            continue;
-        }
-        let source = frame_path(&legacy, frame);
-        if valid_png(&source) && std::fs::copy(&source, &temporary).is_ok() && valid_png(&temporary) {
-            let _ = std::fs::rename(&temporary, target);
-        }
-    }
-    let _ = std::fs::remove_file(temporary);
-}
-
 fn frame_path(output: &Path, frame: i64) -> PathBuf {
     PathBuf::from(sequence_path(&output.join("frame_[#####].png").to_string_lossy(), frame))
 }
@@ -1037,7 +1014,6 @@ pub fn start_coordinator(config: Config, state: Shared, stop: Arc<AtomicBool>) -
     let output_guard = Arc::new(lock_output(&job.output)?);
     job.output_guard = Arc::downgrade(&output_guard);
     prepare_output(&job)?;
-    recover_legacy_frames(&project, &job, &stop);
     initialize_coordinator_state(&state, &config, &job, || {
         partition_frames(&job.output, job.start, job.end, config.chunk_frames, |checked| {
             if stop.load(Ordering::Relaxed) {
@@ -2568,7 +2544,7 @@ mod tests {
     }
 
     #[test]
-    fn managed_frames_isolate_projects_and_jobs_and_recover_only_matching_legacy_frames() {
+    fn managed_frames_isolate_projects_and_jobs() {
         let workspace = TempWorkspace::new().unwrap();
         let project = workspace.root.join("scene.v2.ecproj");
         let second_project = workspace.root.join("second.ecproj");
@@ -2603,25 +2579,59 @@ mod tests {
         let lock = lock_output(&job.output).unwrap();
         assert!(lock_output(&job.output).is_err());
         prepare_output(&job).unwrap();
-        let legacy = crate::settings::legacy_frame_output(&project);
-        std::fs::create_dir(&legacy).unwrap();
-        let legacy_job = Job { output: legacy.clone(), ..job.clone() };
-        let path = legacy.join("effectcraft-farm.json");
-        std::fs::write(&path, serde_json::to_vec(&Manifest::from(&Job { draft: true, ..job.clone() })).unwrap()).unwrap();
-        image::RgbImage::new(2, 2).save(frame_path(&legacy, 1)).unwrap();
-        std::fs::write(frame_path(&legacy, 2), b"not a PNG").unwrap();
-        let stop = AtomicBool::new(false);
-        recover_legacy_frames(&project, &job, &stop);
-        assert!(!frame_path(&job.output, 1).exists());
-
-        std::fs::write(&path, serde_json::to_vec(&Manifest::from(&legacy_job)).unwrap()).unwrap();
-        recover_legacy_frames(&project, &job, &stop);
-        assert!(valid_png(&frame_path(&legacy, 1)));
-        assert!(valid_png(&frame_path(&job.output, 1)));
-        assert!(!frame_path(&job.output, 2).exists());
         drop(lock);
         assert!(lock_output(&job.output).is_ok());
         assert_eq!(job.output, managed_output(&project, &manifest).unwrap());
+    }
+
+    #[test]
+    fn coordinator_ignores_legacy_frames_and_resumes_managed_frames() {
+        let workspace = TempWorkspace::new().unwrap();
+        let project_path = workspace.root.join("scene.ecproj");
+        let mut project = Project::default();
+        project.add_item("Test", Label::None, None, ItemKind::Comp(Arc::new(Comp::new(2, 2, FrameRate::FPS_60, FrameRate::FPS_60.tick_of(2)))));
+        std::fs::write(&project_path, project.to_json()).unwrap();
+        let config = Config {
+            engine: EngineVersion { installed: "0.23.1".into(), latest: None },
+            project: project_path.clone(),
+            cli: std::env::current_exe().unwrap(),
+            output: PathBuf::new(),
+            comp: "Test".into(),
+            address: "127.0.0.1:0".into(),
+            token: "password".into(),
+            gpu: false,
+            range_start: 0,
+            range_end: 2,
+            chunk_frames: 2,
+            max_workers: 1,
+            final_video: workspace.root.join("final.mp4"),
+            disabled_workers: Vec::new(),
+            render: RenderOptions::default(),
+        };
+        let mut job = read_job(&config).unwrap();
+        job.output = managed_output(&project_path.canonicalize().unwrap(), &Manifest::from(&job)).unwrap();
+        std::fs::create_dir_all(&job.output).unwrap();
+        prepare_output(&job).unwrap();
+        image::RgbImage::new(2, 2).save(frame_path(&job.output, 1)).unwrap();
+        let legacy = workspace.root.join("scene-frame-share");
+        std::fs::create_dir(&legacy).unwrap();
+        std::fs::write(legacy.join("effectcraft-farm.json"), serde_json::to_vec(&Manifest::from(&job)).unwrap()).unwrap();
+        image::RgbImage::new(2, 2).save(frame_path(&legacy, 0)).unwrap();
+
+        let state = Arc::new(Mutex::new(State::default()));
+        let stop = Arc::new(AtomicBool::new(false));
+        let started = start_coordinator(config, state.clone(), stop.clone()).unwrap();
+        let progress = progress_snapshot(&state);
+        let imported = frame_path(&started.output, 0).exists();
+        stop.store(true, Ordering::Relaxed);
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        while lock(&state).coordinator_active && std::time::Instant::now() < deadline {
+            thread::sleep(Duration::from_millis(10));
+        }
+        assert!(!lock(&state).coordinator_active);
+        assert_eq!((progress.0, progress.1), (1, 2));
+        assert!(!imported);
+        assert!(valid_png(&frame_path(&legacy, 0)));
     }
 
     #[test]

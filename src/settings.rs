@@ -178,13 +178,6 @@ impl Settings {
     }
 }
 
-/// The previous flat directory is only used to recover matching frames.
-pub fn legacy_frame_output(project: &std::path::Path) -> PathBuf {
-    let mut name = project.file_stem().unwrap_or_default().to_os_string();
-    name.push("-frame-share");
-    project.parent().unwrap_or_else(|| std::path::Path::new("")).join(name)
-}
-
 fn directory() -> Result<PathBuf, String> {
     #[cfg(windows)]
     let base = std::env::var_os("APPDATA").map(PathBuf::from);
@@ -285,15 +278,6 @@ fn save_to(dir: &std::path::Path, settings: &mut Settings) -> Result<(), String>
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn frame_directory_preserves_project_name_and_removes_only_last_extension() {
-        let parent = std::env::temp_dir().join("farm-projects");
-        for name in ["scene", "scene.v2", "한글 프로젝트", "scene.ecproj.backup"] {
-            let project = parent.join(format!("{name}.ecproj"));
-            assert_eq!(legacy_frame_output(&project), parent.join(format!("{name}-frame-share")));
-        }
-    }
 
     #[test]
     fn enables_gpu_on_upgrade_once_then_preserves_manual_cpu_choice() {
