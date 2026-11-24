@@ -121,6 +121,8 @@ pub struct Job {
     pub width: u32,
     pub height: u32,
     pub output: PathBuf,
+    // Lets assembly retain the lock even when started from the UI.
+    pub(crate) output_guard: std::sync::Weak<std::fs::File>,
 }
 
 #[derive(Clone, PartialEq, Serialize, Deserialize)]
@@ -453,9 +455,6 @@ fn read_job_impl(config: &Config, preflight: bool) -> Result<Job, String> {
     };
     let rate = comp.frame_rate;
     let total = comp_frame_count(rate, comp.duration)?;
-    if !config.output.is_dir() {
-        return Err(format!("프레임 저장 폴더가 없습니다: {}", config.output.display()));
-    }
     let start = config.range_start;
     let end = if config.range_end == 0 { total } else { config.range_end };
     if start < 0 || end <= start || end > total {
@@ -475,6 +474,7 @@ fn read_job_impl(config: &Config, preflight: bool) -> Result<Job, String> {
         width: comp.width,
         height: comp.height,
         output: config.output.clone(),
+        output_guard: Default::default(),
     })
 }
 
@@ -769,37 +769,89 @@ fn build_bundle(config: &Config, job: &Job) -> Result<TransferBundle, String> {
     Ok(TransferBundle { project_sha256: project_hash(&project), project, files: builder.files })
 }
 
+fn managed_output(project: &Path, manifest: &Manifest) -> Result<PathBuf, String> {
+    let directory = project.parent().ok_or("프로젝트 폴더를 찾을 수 없습니다")?;
+    let name = project.file_name().ok_or("프로젝트 파일 이름을 찾을 수 없습니다")?;
+    let job = serde_json::to_vec(manifest).map_err(|error| error.to_string())?;
+    Ok(directory.join(".effectcraft-farm").join("frames").join(project_hash(name.as_encoded_bytes())).join(project_hash(&job)))
+}
+
+fn lock_output(output: &Path) -> Result<std::fs::File, String> {
+    std::fs::create_dir_all(output).map_err(|error| format!("프레임 저장 폴더 만들기 ({}): {error}", output.display()))?;
+    let guard = std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create(true)
+        .truncate(false)
+        .open(output.join("render.lock"))
+        .map_err(|error| format!("프레임 폴더 잠금 파일 열기: {error}"))?;
+    guard.try_lock().map_err(|error| match error {
+        std::fs::TryLockError::WouldBlock => "동일한 렌더 작업의 프레임 폴더를 다른 호스트가 사용 중입니다".into(),
+        std::fs::TryLockError::Error(error) => format!("프레임 폴더 잠금: {error}"),
+    })?;
+    Ok(guard)
+}
+
+fn read_manifest(path: &Path) -> Result<Option<Manifest>, String> {
+    let file = match std::fs::File::open(path) {
+        Ok(file) => file,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => return Err(format!("작업 정보 읽기: {error}")),
+    };
+    let mut bytes = Vec::new();
+    file.take(128_001).read_to_end(&mut bytes).map_err(|error| format!("작업 정보 읽기: {error}"))?;
+    if bytes.len() > 128_000 {
+        return Err("작업 정보 파일이 너무 큽니다".into());
+    }
+    let mut manifest: Manifest = serde_json::from_slice(&bytes).map_err(|error| format!("작업 정보 파일 오류: {error}"))?;
+    if manifest.end == 0 {
+        manifest.end = manifest.frames;
+    }
+    Ok(Some(manifest))
+}
+
 fn prepare_output(job: &Job) -> Result<(), String> {
     let path = job.output.join("effectcraft-farm.json");
     let expected = Manifest::from(job);
-    if path.exists() {
-        if std::fs::metadata(&path).map_err(|e| format!("작업 정보 확인: {e}"))?.len() > 128_000 {
-            return Err("작업 정보 파일이 너무 큽니다".into());
-        }
-        let bytes = std::fs::read(&path).map_err(|e| format!("작업 정보 읽기: {e}"))?;
-        let mut existing: Manifest = serde_json::from_slice(&bytes).map_err(|e| format!("작업 정보 파일 오류: {e}"))?;
-        if existing.end == 0 {
-            existing.end = existing.frames;
-        }
+    if let Some(existing) = read_manifest(&path)? {
         if existing != expected {
-            return Err("프레임 저장 폴더에 다른 프로젝트의 렌더 결과가 있습니다".into());
+            return Err("프레임 저장 폴더에 다른 렌더 작업의 결과가 있습니다".into());
         }
-    } else {
-        let mut has_frames = false;
-        for entry in std::fs::read_dir(&job.output).map_err(|e| format!("출력 폴더 읽기: {e}"))? {
-            let entry = entry.map_err(|e| format!("출력 폴더 항목 읽기: {e}"))?;
-            if entry.file_name().to_string_lossy().starts_with("frame_") {
-                has_frames = true;
-                break;
-            }
-        }
-        if has_frames {
+        return Ok(());
+    }
+    for entry in std::fs::read_dir(&job.output).map_err(|error| format!("출력 폴더 읽기: {error}"))? {
+        let entry = entry.map_err(|error| format!("출력 폴더 항목 읽기: {error}"))?;
+        if entry.file_name().to_string_lossy().starts_with("frame_") {
             return Err("프레임 저장 폴더에 작업 정보 없는 기존 frame_ 파일이 있습니다".into());
         }
-        let bytes = serde_json::to_vec_pretty(&expected).map_err(|e| e.to_string())?;
-        std::fs::write(&path, bytes).map_err(|e| format!("작업 정보 저장: {e}"))?;
     }
-    Ok(())
+    let bytes = serde_json::to_vec_pretty(&expected).map_err(|error| error.to_string())?;
+    let temporary = path.with_extension("json.partial");
+    std::fs::write(&temporary, bytes).map_err(|error| format!("작업 정보 저장: {error}"))?;
+    std::fs::rename(&temporary, &path).map_err(|error| format!("작업 정보 확정: {error}"))
+}
+
+fn recover_legacy_frames(project: &Path, job: &Job, stop: &AtomicBool) {
+    let legacy = crate::settings::legacy_frame_output(project);
+    if read_manifest(&legacy.join("effectcraft-farm.json")).ok().flatten().as_ref() != Some(&Manifest::from(job)) {
+        return;
+    }
+
+    let temporary = job.output.join("legacy-frame.partial");
+    for frame in job.start..job.end {
+        if stop.load(Ordering::Relaxed) {
+            break;
+        }
+        let target = frame_path(&job.output, frame);
+        if valid_png(&target) {
+            continue;
+        }
+        let source = frame_path(&legacy, frame);
+        if valid_png(&source) && std::fs::copy(&source, &temporary).is_ok() && valid_png(&temporary) {
+            let _ = std::fs::rename(&temporary, target);
+        }
+    }
+    let _ = std::fs::remove_file(temporary);
 }
 
 fn frame_path(output: &Path, frame: i64) -> PathBuf {
@@ -823,9 +875,12 @@ fn chunk_complete(output: &Path, start: i64, end: i64) -> bool {
     (start..end).all(|frame| valid_png(&frame_path(output, frame)))
 }
 
-fn partition_frames(output: &Path, start: i64, end: i64, size: i64) -> Vec<Chunk> {
+fn partition_frames(output: &Path, start: i64, end: i64, size: i64, mut progress: impl FnMut(i64) -> bool) -> Result<Vec<Chunk>, String> {
     let mut chunks: Vec<Chunk> = Vec::new();
     for frame in start..end {
+        if (frame - start) % 64 == 0 && !progress(frame - start) {
+            return Err("호스트 준비가 취소되었습니다".into());
+        }
         let status = if valid_png(&frame_path(output, frame)) { ChunkStatus::Done } else { ChunkStatus::Pending };
         if let Some(last) = chunks.last_mut()
             && last.status == status
@@ -836,7 +891,10 @@ fn partition_frames(output: &Path, start: i64, end: i64, size: i64) -> Vec<Chunk
             chunks.push(Chunk { start: frame, end: frame + 1, status, attempts: 0, worker: String::new() });
         }
     }
-    chunks
+    if !progress(end - start) {
+        return Err("호스트 준비가 취소되었습니다".into());
+    }
+    Ok(chunks)
 }
 
 // Only frames already checksum-verified by receive_path may be retained here.
@@ -968,35 +1026,27 @@ pub fn start_coordinator(config: Config, state: Shared, stop: Arc<AtomicBool>) -
     if config.final_video.exists() {
         return Err("최종 MP4가 이미 있습니다. 기존 파일을 보호하려면 새 파일 이름을 선택하세요".into());
     }
-    let job = read_job(&config)?;
+    let project = config.project.canonicalize().map_err(|error| format!("프로젝트 경로 확인: {error}"))?;
+    let mut job = read_job(&config)?;
+    job.output = managed_output(&project, &Manifest::from(&job))?;
     if (job.end - job.start).saturating_add(config.chunk_frames - 1) / config.chunk_frames > 100_000 {
         return Err("작업 구간이 너무 많습니다. PC당 작업 구간 크기를 늘리세요".into());
     }
     let listener = TcpListener::bind(&config.address).map_err(|e| format!("서버 열기 {}: {e}", config.address))?;
     listener.set_nonblocking(true).map_err(|e| format!("서버 설정: {e}"))?;
+    let output_guard = Arc::new(lock_output(&job.output)?);
+    job.output_guard = Arc::downgrade(&output_guard);
     prepare_output(&job)?;
-    {
-        let mut s = lock(&state);
-        s.chunks = partition_frames(&job.output, job.start, job.end, config.chunk_frames);
-        s.total = job.end - job.start;
-        s.output = job.output.clone();
-        s.messages.clear();
-        s.workers = 0;
-        s.worker_info.clear();
-        s.max_workers = config.max_workers;
-        s.dispatch_enabled = false;
-        s.assembly_started = false;
-        s.final_status = "프레임 렌더링 대기".into();
-        s.disabled_workers = config.disabled_workers.clone();
-        s.bundle = Arc::new(OnceLock::new());
-        s.started = None;
-        s.finished_elapsed = None;
-        s.final_result = None;
-        s.coordinator_active = true;
-        s.local_preview = None;
-        s.latest_preview = None;
-        s.local_progress = None;
-    }
+    recover_legacy_frames(&project, &job, &stop);
+    initialize_coordinator_state(&state, &config, &job, || {
+        partition_frames(&job.output, job.start, job.end, config.chunk_frames, |checked| {
+            if stop.load(Ordering::Relaxed) {
+                return false;
+            }
+            lock(&state).final_status = format!("기존 프레임 확인 중 · {checked} / {}", job.end - job.start);
+            true
+        })
+    })?;
     log(&state, format!("호스트 시작: {} / {}–{}프레임", config.address, job.start, job.end));
     log(
         &state,
@@ -1037,7 +1087,9 @@ pub fn start_coordinator(config: Config, state: Shared, stop: Arc<AtomicBool>) -
                     let job = server_job.clone();
                     let config = host_config.clone();
                     let stop = server_stop.clone();
+                    let output_guard = output_guard.clone();
                     thread::spawn(move || {
+                        let _output_guard = output_guard;
                         if let Err(error) = serve_worker(stream, peer, &config, &job, &state, &stop) {
                             log(&state, format!("{peer}: {error}"));
                         }
@@ -1054,10 +1106,38 @@ pub fn start_coordinator(config: Config, state: Shared, stop: Arc<AtomicBool>) -
         if let Some(discovery) = discovery {
             let _ = discovery.join();
         }
+        drop(output_guard);
         lock(&server_state).coordinator_active = false;
         log(&server_state, "서버 종료");
     });
     Ok(job)
+}
+
+/// Frame validation may read tens of thousands of files. Keep it outside the
+/// shared-state lock so the UI and other threads can continue to make progress.
+fn initialize_coordinator_state(state: &Shared, config: &Config, job: &Job, scan: impl FnOnce() -> Result<Vec<Chunk>, String>) -> Result<(), String> {
+    let chunks = scan()?;
+    let mut s = lock(state);
+    s.chunks = chunks;
+    s.total = job.end - job.start;
+    s.output = job.output.clone();
+    s.messages.clear();
+    s.workers = 0;
+    s.worker_info.clear();
+    s.max_workers = config.max_workers;
+    s.dispatch_enabled = false;
+    s.assembly_started = false;
+    s.final_status = "프레임 렌더링 대기".into();
+    s.disabled_workers = config.disabled_workers.clone();
+    s.bundle = Arc::new(OnceLock::new());
+    s.started = None;
+    s.finished_elapsed = None;
+    s.final_result = None;
+    s.coordinator_active = true;
+    s.local_preview = None;
+    s.latest_preview = None;
+    s.local_progress = None;
+    Ok(())
 }
 
 fn receive(reader: &mut BufReader<TcpStream>) -> Result<Message, String> {
@@ -1897,10 +1977,12 @@ fn maybe_start_assembly(config: &Config, job: &Job, state: &Shared) {
     let config = config.clone();
     let job = job.clone();
     let state = state.clone();
+    let output_guard = job.output_guard.upgrade();
     thread::spawn(move || {
         log(&state, "최종 MP4 출력 시작 · PNG 검증 및 원본 오디오 구성");
         let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| assemble_final(&config, &job, &state)))
             .unwrap_or_else(|_| Err("최종 영상 합치기 중 예상하지 못한 오류가 발생했습니다".into()));
+        drop(output_guard);
         let mut s = lock(&state);
         s.finished_elapsed = s.started.map(|at| at.elapsed());
         s.final_result = Some(result.clone());
@@ -2192,6 +2274,71 @@ mod tests {
     use super::*;
 
     #[test]
+    fn coordinator_frame_scan_does_not_lock_shared_state() {
+        let state = Arc::new(Mutex::new(State::default()));
+        let config = Config {
+            engine: EngineVersion::default(),
+            project: PathBuf::new(),
+            cli: PathBuf::new(),
+            output: PathBuf::new(),
+            comp: "test".into(),
+            address: String::new(),
+            token: String::new(),
+            gpu: false,
+            range_start: 0,
+            range_end: 100,
+            chunk_frames: 100,
+            max_workers: 2,
+            final_video: PathBuf::new(),
+            disabled_workers: Vec::new(),
+            render: RenderOptions::default(),
+        };
+        let job = Job {
+            output_guard: Default::default(),
+            draft: false,
+            hash: String::new(),
+            comp: "test".into(),
+            rate: FrameRate::FPS_60,
+            total: 100,
+            start: 0,
+            end: 100,
+            width: 64,
+            height: 64,
+            output: PathBuf::new(),
+        };
+        let (entered_tx, entered_rx) = std::sync::mpsc::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel();
+        let background = state.clone();
+        let scan = thread::spawn(move || {
+            initialize_coordinator_state(&background, &config, &job, || {
+                entered_tx.send(()).unwrap();
+                release_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+                Ok(vec![Chunk { start: 0, end: 100, status: ChunkStatus::Pending, attempts: 0, worker: String::new() }])
+            })
+            .unwrap();
+        });
+        entered_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+        let state_available_during_scan = state.try_lock().is_ok();
+        release_tx.send(()).unwrap();
+        scan.join().unwrap();
+        assert!(state_available_during_scan, "the GUI must be able to read shared state while frames are being scanned");
+        assert_eq!(progress_snapshot(&state), (0, 100, 0, 0));
+        assert!(lock(&state).coordinator_active);
+    }
+
+    #[test]
+    fn frame_scan_reports_progress_and_can_be_cancelled() {
+        let workspace = TempWorkspace::new().unwrap();
+        let mut checkpoints = Vec::new();
+        let result = partition_frames(&workspace.root, 0, 200, 20, |checked| {
+            checkpoints.push(checked);
+            checked < 64
+        });
+        assert!(result.is_err());
+        assert_eq!(checkpoints, vec![0, 64]);
+    }
+
+    #[test]
     fn engine_handshake_notifies_only_the_required_computers_before_registering_workers() {
         for (host, client, host_latest, client_latest, host_update, client_update) in [
             ("0.22.0", "0.23.0", None, None, true, false),
@@ -2219,6 +2366,7 @@ mod tests {
                 render: RenderOptions::default(),
             };
             let job = Job {
+                output_guard: Default::default(),
                 draft: false,
                 hash: String::new(),
                 comp: "Test".into(),
@@ -2417,6 +2565,63 @@ mod tests {
         other.comp = "Other".into();
         assert!(prepare_output(&other).is_err());
         std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn managed_frames_isolate_projects_and_jobs_and_recover_only_matching_legacy_frames() {
+        let workspace = TempWorkspace::new().unwrap();
+        let project = workspace.root.join("scene.v2.ecproj");
+        let second_project = workspace.root.join("second.ecproj");
+        let other_parent = workspace.root.join("copy").join("scene.v2.ecproj");
+        let mut job = Job {
+            output_guard: Default::default(),
+            draft: false,
+            hash: "project version 1".into(),
+            comp: "Main / 테스트".into(),
+            rate: FrameRate::FPS_60,
+            total: 4,
+            start: 1,
+            end: 4,
+            width: 2,
+            height: 2,
+            output: PathBuf::new(),
+        };
+        let manifest = Manifest::from(&job);
+        job.output = managed_output(&project, &manifest).unwrap();
+        assert_ne!(job.output, managed_output(&second_project, &manifest).unwrap());
+        assert_ne!(job.output, managed_output(&other_parent, &manifest).unwrap());
+        for other in [
+            Job { hash: "project version 2".into(), ..job.clone() },
+            Job { comp: "Other".into(), ..job.clone() },
+            Job { start: 0, ..job.clone() },
+            Job { end: 3, ..job.clone() },
+            Job { draft: true, ..job.clone() },
+        ] {
+            assert_ne!(job.output, managed_output(&project, &Manifest::from(&other)).unwrap());
+        }
+
+        let lock = lock_output(&job.output).unwrap();
+        assert!(lock_output(&job.output).is_err());
+        prepare_output(&job).unwrap();
+        let legacy = crate::settings::legacy_frame_output(&project);
+        std::fs::create_dir(&legacy).unwrap();
+        let legacy_job = Job { output: legacy.clone(), ..job.clone() };
+        let path = legacy.join("effectcraft-farm.json");
+        std::fs::write(&path, serde_json::to_vec(&Manifest::from(&Job { draft: true, ..job.clone() })).unwrap()).unwrap();
+        image::RgbImage::new(2, 2).save(frame_path(&legacy, 1)).unwrap();
+        std::fs::write(frame_path(&legacy, 2), b"not a PNG").unwrap();
+        let stop = AtomicBool::new(false);
+        recover_legacy_frames(&project, &job, &stop);
+        assert!(!frame_path(&job.output, 1).exists());
+
+        std::fs::write(&path, serde_json::to_vec(&Manifest::from(&legacy_job)).unwrap()).unwrap();
+        recover_legacy_frames(&project, &job, &stop);
+        assert!(valid_png(&frame_path(&legacy, 1)));
+        assert!(valid_png(&frame_path(&job.output, 1)));
+        assert!(!frame_path(&job.output, 2).exists());
+        drop(lock);
+        assert!(lock_output(&job.output).is_ok());
+        assert_eq!(job.output, managed_output(&project, &manifest).unwrap());
     }
 
     #[test]
@@ -2920,7 +3125,7 @@ mod tests {
         for frame in [2, 3, 6] {
             image::RgbImage::new(2, 2).save(frame_path(&workspace.root, frame)).unwrap();
         }
-        let chunks = partition_frames(&workspace.root, 2, 8, 4);
+        let chunks = partition_frames(&workspace.root, 2, 8, 4, |_| true).unwrap();
         assert_eq!(chunks.iter().filter(|c| c.status == ChunkStatus::Done).map(|c| c.end - c.start).sum::<i64>(), 3);
         assert_eq!(chunks.first().unwrap().start, 2);
         assert_eq!(chunks.last().unwrap().end, 8);
@@ -2932,6 +3137,7 @@ mod tests {
         assert!(state.chunks.iter().any(|c| c.start == 4 && c.end == 5 && c.status == ChunkStatus::Done));
         assert!(state.chunks.iter().any(|c| c.start == 5 && c.end == 6 && c.status == ChunkStatus::Pending));
         let job = Job {
+            output_guard: Default::default(),
             draft: false,
             hash: "test".into(),
             comp: "Test".into(),

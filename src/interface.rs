@@ -5,9 +5,13 @@ pub(super) mod import;
 use buttons::{ButtonKind, ButtonSpec, button_at, dialog_header, footer_buttons, footer_status};
 mod dashboard;
 pub(crate) mod layout;
+mod motion;
+use motion::animated_modal;
 mod queue;
 mod shell;
+pub(super) mod theme_transition;
 mod updates;
+mod welcome;
 
 #[cfg(any(test, debug_assertions))]
 pub(super) mod review;
@@ -25,19 +29,22 @@ fn border(ui: &egui::Ui) -> egui::Color32 {
     ui.visuals().widgets.noninteractive.bg_stroke.color
 }
 fn muted(ui: &egui::Ui) -> egui::Color32 {
-    if ui.visuals().dark_mode { egui::Color32::from_rgb(151, 158, 168) } else { egui::Color32::from_rgb(105, 111, 119) }
+    layout::Palette::new(ui.visuals().dark_mode).muted
 }
 fn accent(ui: &egui::Ui) -> egui::Color32 {
-    if ui.visuals().dark_mode { egui::Color32::from_rgb(106, 170, 255) } else { egui::Color32::from_rgb(34, 102, 215) }
+    layout::Palette::new(ui.visuals().dark_mode).accent
 }
 fn success(ui: &egui::Ui) -> egui::Color32 {
-    if ui.visuals().dark_mode { egui::Color32::from_rgb(116, 200, 160) } else { egui::Color32::from_rgb(34, 126, 85) }
+    layout::Palette::new(ui.visuals().dark_mode).success
 }
 fn danger(ui: &egui::Ui) -> egui::Color32 {
-    if ui.visuals().dark_mode { egui::Color32::from_rgb(255, 150, 150) } else { egui::Color32::from_rgb(168, 36, 36) }
+    layout::Palette::new(ui.visuals().dark_mode).danger
 }
 fn warning(ui: &egui::Ui) -> egui::Color32 {
-    if ui.visuals().dark_mode { egui::Color32::from_rgb(245, 205, 120) } else { egui::Color32::from_rgb(135, 90, 0) }
+    layout::Palette::new(ui.visuals().dark_mode).warning
+}
+fn soft(color: egui::Color32) -> egui::Color32 {
+    color.gamma_multiply(0.12)
 }
 
 #[derive(Clone, Copy)]
@@ -76,6 +83,37 @@ fn icon_image(ui: &egui::Ui, icon: UiIcon) -> egui::Image<'static> {
     egui::Image::new((texture.id(), texture.size_vec2())).fit_to_exact_size(egui::vec2(18.0, 18.0)).tint(ui.visuals().text_color())
 }
 
+/// Rasterize the original Figma SVG at its intrinsic aspect ratio and cache it
+/// as a texture. The size specifies the actual slot in the design.
+fn figma_svg(ui: &egui::Ui, name: &'static str, bytes: &'static [u8], size: egui::Vec2) -> Option<egui::Image<'static>> {
+    let dark_symbol = ui.visuals().dark_mode && name != "icon" && name != "welcome-icon" && !name.starts_with("resize-");
+    let id = egui::Id::new(("figma-svg", name, dark_symbol));
+    let texture = if let Some(texture) = ui.ctx().data(|data| data.get_temp::<egui::TextureHandle>(id)) {
+        texture
+    } else {
+        let tree = resvg::usvg::Tree::from_data(bytes, &resvg::usvg::Options::default()).ok()?;
+        let dimensions = tree.size();
+        let scale = (size.x * 2.0 / dimensions.width()).min(size.y * 2.0 / dimensions.height());
+        let width = (dimensions.width() * scale).ceil().max(1.0) as u32;
+        let height = (dimensions.height() * scale).ceil().max(1.0) as u32;
+        let mut pixmap = resvg::tiny_skia::Pixmap::new(width, height)?;
+        resvg::render(&tree, resvg::tiny_skia::Transform::from_scale(scale, scale), &mut pixmap.as_mut());
+        if dark_symbol {
+            for pixel in pixmap.data_mut().chunks_exact_mut(4) {
+                let foreground = (u16::from(pixel[3]) * 252 / 255) as u8;
+                pixel[0] = foreground;
+                pixel[1] = foreground;
+                pixel[2] = foreground;
+            }
+        }
+        let color = egui::ColorImage::from_rgba_premultiplied([width as usize, height as usize], pixmap.data());
+        let texture = ui.ctx().load_texture(format!("figma-{name}"), color, egui::TextureOptions::LINEAR);
+        ui.ctx().data_mut(|data| data.insert_temp(id, texture.clone()));
+        texture
+    };
+    Some(egui::Image::new((texture.id(), texture.size_vec2())).max_size(size).maintain_aspect_ratio(true))
+}
+
 fn icon_button(ui: &mut egui::Ui, icon: UiIcon, label: &str) -> egui::Response {
     ui.add_sized([layout::CONTROL, layout::CONTROL], egui::Button::image(icon_image(ui, icon)).frame(false)).on_hover_text(label)
 }
@@ -83,25 +121,15 @@ fn icon_button(ui: &mut egui::Ui, icon: UiIcon, label: &str) -> egui::Response {
 fn card(ctx: &egui::Context) -> egui::Frame {
     let style = ctx.style_of(ctx.theme());
     let visuals = &style.visuals;
-    egui::Frame::new().fill(visuals.window_fill).stroke(visuals.widgets.noninteractive.bg_stroke).corner_radius(layout::RADIUS).inner_margin(layout::PADDING)
+    egui::Frame::new()
+        .fill(visuals.window_fill)
+        .stroke(visuals.widgets.noninteractive.bg_stroke)
+        .corner_radius(layout::DIALOG_RADIUS)
+        .inner_margin(layout::DIALOG_PADDING)
 }
 
 fn badge(ui: &mut egui::Ui, text: &str, color: egui::Color32) {
     components::status(ui, text, color);
-}
-
-fn animated_modal(ctx: &egui::Context, id: &str, open: bool, reduced: bool) -> Option<(egui::Modal, f32)> {
-    if !open {
-        ctx.data_mut(|data| data.insert_temp(egui::Id::new((id, "reveal")), Spring::default()));
-        return None;
-    }
-    let reveal = motion(ctx, egui::Id::new((id, "reveal")), f32::from(open), reduced);
-    if reveal < 0.001 {
-        return None;
-    }
-    let area = egui::Modal::default_area(egui::Id::new(id)).anchor(egui::Align2::CENTER_CENTER, egui::vec2(0.0, (1.0 - reveal) * 14.0));
-    let frame = card(ctx);
-    Some((egui::Modal::new(egui::Id::new(id)).area(area).frame(frame).backdrop_color(egui::Color32::from_black_alpha((160.0 * reveal) as u8)), reveal))
 }
 
 fn caption(ui: &mut egui::Ui, text: impl Into<String>) {
@@ -119,34 +147,6 @@ fn duration(seconds: f64) -> String {
     }
 }
 
-#[derive(Clone, Copy, Default)]
-struct Spring {
-    value: f32,
-    velocity: f32,
-}
-
-/// Closed-form critically damped spring: continuous velocity on retarget, no overshoot.
-fn motion(ctx: &egui::Context, id: egui::Id, target: f32, reduced: bool) -> f32 {
-    if reduced {
-        ctx.data_mut(|data| data.insert_temp(id, Spring { value: target, velocity: 0.0 }));
-        return target;
-    }
-    let dt = ctx.input(|input| input.stable_dt).clamp(0.001, 0.05);
-    let mut spring = ctx.data_mut(|data| data.get_temp::<Spring>(id).unwrap_or_default());
-    let displacement = spring.value - target;
-    let impulse = spring.velocity + 22.0 * displacement;
-    let decay = (-22.0 * dt).exp();
-    spring.value = target + (displacement + impulse * dt) * decay;
-    spring.velocity = (spring.velocity - 22.0 * impulse * dt) * decay;
-    if (spring.value - target).abs() > 0.001 || spring.velocity.abs() > 0.001 {
-        ctx.request_repaint_after(Duration::from_millis(16));
-    } else {
-        spring = Spring { value: target, velocity: 0.0 };
-    }
-    ctx.data_mut(|data| data.insert_temp(id, spring));
-    spring.value
-}
-
 fn metric(ui: &mut egui::Ui, label: &str, value: &str) {
     ui.vertical(|ui| {
         caption(ui, label);
@@ -155,37 +155,58 @@ fn metric(ui: &mut egui::Ui, label: &str, value: &str) {
 }
 
 impl App {
+    pub(super) fn draw_welcome(&mut self, root: &mut egui::Ui) {
+        let ctx = root.ctx().clone();
+        ctx.set_theme(self.settings.theme.egui());
+        motion::apply_style(&ctx, self.settings.reduced_motion);
+        egui::CentralPanel::default().frame(egui::Frame::NONE).show(root, |ui| {
+            if let Some(host) = welcome::show(ui, &mut self.settings.theme) {
+                self.settings.host = host;
+                self.show_welcome = false;
+                self.monitor = host;
+                self.queue_view = host;
+                ctx.send_viewport_cmd(egui::ViewportCommand::InnerSize(egui::vec2(1280.0, 720.0)));
+            }
+        });
+    }
+
     pub(super) fn draw_interface(&mut self, root: &mut egui::Ui) {
         let ctx = root.ctx().clone();
         ctx.set_theme(self.settings.theme.egui());
-        ctx.style_mut_of(self.settings.theme.egui(), |style| style.animation_time = if self.settings.reduced_motion { 0.0 } else { 0.24 });
-        let compact = ctx.content_rect().width() < 1000.0;
+        motion::apply_style(&ctx, self.settings.reduced_motion);
+        let compact = ctx.content_rect().width() < 720.0;
+        egui::Panel::top("workspace-topbar")
+            .resizable(false)
+            .default_size(52.0)
+            .min_size(52.0)
+            .max_size(52.0)
+            .show_separator_line(true)
+            .frame(egui::Frame::new().fill(surface(root)).inner_margin(egui::Margin::symmetric(layout::PAGE_PADDING, 10)))
+            .show(root, |ui| self.topbar(ui));
         if !compact {
             egui::Panel::left("workspace-sidebar")
                 .resizable(false)
-                .default_size(200.0)
-                .min_size(200.0)
-                .max_size(200.0)
+                .default_size(64.0)
+                .min_size(64.0)
+                .max_size(64.0)
                 .show_separator_line(false)
-                .frame(egui::Frame::new().fill(surface(root)).inner_margin(egui::Margin::symmetric(16, 20)))
+                .frame(egui::Frame::new().fill(surface(root)).stroke(egui::Stroke::new(1.0, border(root))).inner_margin(egui::Margin::symmetric(6, 8)))
                 .show(root, |ui| self.sidebar(ui));
         }
         egui::Panel::bottom("primary-actions")
-            .show_separator_line(false)
-            .frame(egui::Frame::new().fill(surface(root)).inner_margin(egui::Margin::symmetric(24, 14)))
-            .show(root, |ui| {
-                ui.painter().hline(ui.max_rect().x_range(), ui.max_rect().top() - 14.0, egui::Stroke::new(1.0, border(ui)));
-                self.action_bar(ui);
-            });
-        let padding = if compact { 16 } else { 24 };
-        egui::CentralPanel::default().frame(egui::Frame::new().fill(background(root)).inner_margin(padding)).show(root, |ui| {
-            self.page_heading(ui, compact);
+            .show_separator_line(true)
+            .frame(egui::Frame::new().fill(surface(root)).inner_margin(egui::Margin::symmetric(layout::PAGE_PADDING, 12)))
+            .show(root, |ui| self.action_bar(ui));
+        egui::CentralPanel::default().frame(egui::Frame::new().fill(background(root)).inner_margin(layout::PAGE_PADDING)).show(root, |ui| {
+            if !(self.settings.host && self.monitor && self.queue_view) {
+                self.page_heading(ui, compact);
+            }
             if compact {
                 self.workspace_tabs(ui);
                 ui.add_space(12.0);
             }
             if !self.last_error.is_empty() {
-                let error_fill = if ui.visuals().dark_mode { egui::Color32::from_rgb(58, 31, 36) } else { egui::Color32::from_rgb(255, 239, 239) };
+                let error_fill = soft(danger(ui));
                 egui::Frame::new().fill(error_fill).corner_radius(layout::RADIUS).inner_margin(12).show(ui, |ui| {
                     ui.horizontal_wrapped(|ui| {
                         ui.colored_label(danger(ui), &self.last_error);
@@ -256,7 +277,12 @@ impl App {
         let mut dismiss = None;
         let busy = self.pending_start.is_some() || self.stopping;
         let hint = if self.pending_start.is_some() {
-            "프로젝트와 소스를 준비하고 있습니다…".into()
+            dismiss = Some(ButtonSpec::new(if self.stopping { "취소 중…" } else { "준비 취소" }, ButtonKind::Normal, !self.stopping));
+            if self.stopping {
+                "호스트 준비를 취소하고 있습니다…".into()
+            } else {
+                self.state.lock().unwrap_or_else(std::sync::PoisonError::into_inner).final_status.clone()
+            }
         } else if !self.running {
             let blocker = self.start_blocker();
             let mut action = ButtonSpec::new(if self.settings.host { "호스트 열기" } else { "호스트에 연결" }, ButtonKind::Primary, blocker.is_none());
@@ -381,15 +407,15 @@ impl App {
     }
 
     fn settings_dialog(&mut self, ctx: &egui::Context) {
-        let Some((modal, reveal)) = animated_modal(ctx, "settings-dialog", self.settings_open, self.settings.reduced_motion) else {
+        let Some((modal, reveal)) = animated_modal(ctx, "settings-dialog", self.settings_open, self.settings.reduced_motion, card(ctx)) else {
             return;
         };
         let wide = ctx.content_rect().width() >= 1000.0;
         let width = (ctx.content_rect().width() - 64.0).clamp(280.0, if wide { 760.0 } else { 520.0 });
-        let body_height = (ctx.content_rect().height() - 240.0).clamp(160.0, 480.0);
+        let body_height = (ctx.content_rect().height() - 240.0).clamp(160.0, 400.0);
         let response = modal.show(ctx, |ui| {
             ui.set_width(width);
-            ui.set_opacity(reveal);
+            ui.multiply_opacity(reveal);
             ui.add_enabled_ui(self.settings_open, |ui| {
                 if dialog_header(ui, "설정", "설정 닫기") {
                     self.settings_open = false;
@@ -400,16 +426,17 @@ impl App {
                 if wide {
                     let (body, _) = ui.allocate_exact_size(egui::vec2(ui.available_width(), body_height), egui::Sense::hover());
                     let navigation = egui::Rect::from_min_size(body.min, egui::vec2(148.0, body.height()));
-                    ui.painter().rect_filled(navigation, 6, secondary(ui));
+                    ui.painter().rect_filled(navigation, layout::INSET_RADIUS, secondary(ui));
                     let mut nav = ui.new_child(
                         egui::UiBuilder::new().id_salt("settings-navigation").max_rect(navigation.shrink(8.0)).layout(egui::Layout::top_down(egui::Align::Min)),
                     );
                     for (tab, label) in tabs {
                         let (rect, response) = nav.allocate_exact_size(egui::vec2(nav.available_width(), 40.0), egui::Sense::click());
                         let selected = self.settings_tab == tab;
-                        if selected || response.hovered() {
-                            nav.painter().rect_filled(rect, 5, if selected { nav.visuals().selection.bg_fill } else { surface(&nav) });
-                        }
+                        let hovered = motion::highlight(&nav, response.id.with("hover"), response.hovered());
+                        let selection = motion::highlight(&nav, response.id.with("selected"), selected);
+                        let fill = surface(&nav).gamma_multiply(hovered).lerp_to_gamma(nav.visuals().selection.bg_fill, selection);
+                        nav.painter().rect_filled(rect, layout::CONTROL_RADIUS, fill);
                         nav.painter().text(
                             rect.left_center() + egui::vec2(12.0, 0.0),
                             egui::Align2::LEFT_CENTER,
@@ -421,7 +448,7 @@ impl App {
                             self.settings_tab = tab;
                         }
                     }
-                    let content = egui::Rect::from_min_max(egui::pos2(navigation.right() + 24.0, body.top()), body.max);
+                    let content = egui::Rect::from_min_max(egui::pos2(navigation.right() + layout::GAP, body.top()), body.max);
                     let mut page =
                         ui.new_child(egui::UiBuilder::new().id_salt("settings-page").max_rect(content).layout(egui::Layout::top_down(egui::Align::Min)));
                     page.set_clip_rect(content.intersect(ui.clip_rect()));
@@ -473,13 +500,18 @@ impl App {
         caption(ui, description);
         ui.add_space(layout::GAP);
         if self.settings_tab == 0 {
-            egui::Frame::new().fill(secondary(ui)).corner_radius(6).inner_margin(16).show(ui, |ui| {
+            egui::Frame::new().fill(secondary(ui)).corner_radius(layout::INSET_RADIUS).inner_margin(layout::PADDING).show(ui, |ui| {
                 ui.set_width(ui.available_width());
                 section_title(ui, "화면 동작");
                 ui.horizontal(|ui| {
                     ui.label("테마");
-                    ui.selectable_value(&mut self.settings.theme, settings::Theme::Dark, "다크");
-                    ui.selectable_value(&mut self.settings.theme, settings::Theme::Light, "라이트");
+                    for (label, theme) in [("다크", settings::Theme::Dark), ("라이트", settings::Theme::Light), ("시스템 설정", settings::Theme::System)]
+                    {
+                        let response = ui.selectable_label(self.settings.theme == theme, label);
+                        if response.clicked() {
+                            theme_transition::choose(ui.ctx(), &mut self.settings.theme, theme, response.rect.center());
+                        }
+                    }
                 });
                 ui.checkbox(&mut self.settings.reduced_motion, "동작 줄이기");
                 caption(ui, "화면 전환과 진행률 애니메이션을 끕니다.");
@@ -490,7 +522,7 @@ impl App {
             self.about_settings(ui);
         } else {
             if self.running || self.pending_start.is_some() {
-                egui::Frame::new().fill(ui.visuals().selection.bg_fill).corner_radius(6).inner_margin(12).show(ui, |ui| {
+                egui::Frame::new().fill(ui.visuals().selection.bg_fill).corner_radius(layout::INSET_RADIUS).inner_margin(12).show(ui, |ui| {
                     caption(ui, "작업을 종료하면 렌더링과 연결 설정을 변경할 수 있습니다.");
                 });
                 ui.add_space(layout::SPACE);
@@ -537,7 +569,7 @@ impl App {
                 options.ffmpeg = path.display().to_string();
             }
             ui.add_space(layout::SPACE);
-            caption(ui, format!("프레임 저장 폴더 · 자동: {}", settings::frame_output(&self.settings.project).display()));
+            caption(ui, "프레임 저장 폴더 · 프로젝트 및 렌더 작업별로 자동 관리");
             ui.add_space(layout::GAP);
             section_title(ui, "작업 분배와 복구");
             ui.horizontal_wrapped(|ui| {
@@ -632,11 +664,11 @@ impl App {
     }
 
     fn logs_dialog(&mut self, ctx: &egui::Context) {
-        let Some((modal, reveal)) = animated_modal(ctx, "logs-dialog", self.logs_open, self.settings.reduced_motion) else {
+        let Some((modal, reveal)) = animated_modal(ctx, "logs-dialog", self.logs_open, self.settings.reduced_motion, card(ctx)) else {
             return;
         };
         let response = modal.show(ctx, |ui| {
-            ui.set_opacity(reveal);
+            ui.multiply_opacity(reveal);
             if !self.logs_open {
                 ui.disable();
             }
@@ -648,7 +680,7 @@ impl App {
             ui.add_space(layout::SPACE);
             let wide = ui.available_width() >= 640.0;
             let mut copy = false;
-            egui::Frame::new().fill(secondary(ui)).corner_radius(6).inner_margin(12).show(ui, |ui| {
+            egui::Frame::new().fill(secondary(ui)).corner_radius(layout::INSET_RADIUS).inner_margin(12).show(ui, |ui| {
                 ui.set_width(ui.available_width());
                 if !wide {
                     ui.add_sized([ui.available_width(), layout::CONTROL], egui::TextEdit::singleline(&mut self.log_filter).hint_text("기록 검색"));
@@ -679,7 +711,7 @@ impl App {
                 });
             });
             let log_height = (ctx.content_rect().height() - if wide { 304.0 } else { 344.0 }).clamp(96.0, 440.0);
-            egui::Frame::new().fill(background(ui)).corner_radius(6).inner_margin(12).show(ui, |ui| {
+            egui::Frame::new().fill(background(ui)).corner_radius(layout::INSET_RADIUS).inner_margin(12).show(ui, |ui| {
                 ui.set_width(ui.available_width());
                 egui::ScrollArea::vertical().id_salt("log-body").max_height(log_height).min_scrolled_height(log_height).auto_shrink([false, false]).show(
                     ui,
@@ -748,11 +780,11 @@ impl App {
         if let Some(id) = self.worker_details {
             ctx.data_mut(|data| data.insert_temp(last_id, id));
         }
-        if let Some((modal, reveal)) = animated_modal(ctx, "worker-dialog", self.worker_details.is_some(), self.settings.reduced_motion) {
+        if let Some((modal, reveal)) = animated_modal(ctx, "worker-dialog", self.worker_details.is_some(), self.settings.reduced_motion, card(ctx)) {
             let id = ctx.data_mut(|data| data.get_temp::<u64>(last_id)).unwrap_or(0);
             let worker = farm::worker_snapshot(&self.state).0.into_iter().find(|worker| worker.id == id);
             let response = modal.show(ctx, |ui| {
-                ui.set_opacity(reveal);
+                ui.multiply_opacity(reveal);
                 if self.worker_details.is_none() {
                     ui.disable();
                 }
@@ -772,7 +804,7 @@ impl App {
                         .max_height((ctx.content_rect().height() - 270.0).clamp(160.0, 560.0))
                         .auto_shrink([false, true])
                         .show(ui, |ui| {
-                            egui::Frame::new().fill(secondary(ui)).corner_radius(6).inner_margin(14).show(ui, |ui| {
+                            egui::Frame::new().fill(secondary(ui)).corner_radius(layout::INSET_RADIUS).inner_margin(layout::PADDING).show(ui, |ui| {
                                 ui.set_width(ui.available_width());
                                 let mut enabled = worker.enabled;
                                 if ui.checkbox(&mut enabled, "이 PC를 렌더링에 사용").changed() {
@@ -781,10 +813,14 @@ impl App {
                                 if let Some((start, end)) = worker.assigned {
                                     caption(ui, format!("현재 구간 {start}–{end} · {} / {} 프레임", worker.current_done, end - start));
                                     ui.add(
-                                        egui::ProgressBar::new((worker.current_done as f32 / (end - start).max(1) as f32).clamp(0.0, 1.0))
-                                            .desired_width(ui.available_width())
-                                            .desired_height(4.0)
-                                            .fill(accent(ui)),
+                                        egui::ProgressBar::new(motion::progress(
+                                            ui,
+                                            (worker.id, start, end),
+                                            worker.current_done as f32 / (end - start).max(1) as f32,
+                                        ))
+                                        .desired_width(ui.available_width())
+                                        .desired_height(4.0)
+                                        .fill(accent(ui)),
                                     );
                                 } else {
                                     caption(
@@ -798,7 +834,7 @@ impl App {
                                 }
                             });
                             ui.add_space(layout::SPACE);
-                            egui::Frame::new().fill(secondary(ui)).corner_radius(6).inner_margin(14).show(ui, |ui| {
+                            egui::Frame::new().fill(secondary(ui)).corner_radius(layout::INSET_RADIUS).inner_margin(layout::PADDING).show(ui, |ui| {
                                 ui.set_width(ui.available_width());
                                 ui.columns(2, |columns| {
                                     metric(&mut columns[0], "누적 완료", &format!("{} 프레임", worker.completed_frames));
@@ -853,12 +889,12 @@ impl App {
     }
 
     fn preview_dialog(&mut self, ctx: &egui::Context) {
-        let Some((modal, reveal)) = animated_modal(ctx, "preview-dialog", self.preview_open, self.settings.reduced_motion) else {
+        let Some((modal, reveal)) = animated_modal(ctx, "preview-dialog", self.preview_open, self.settings.reduced_motion, card(ctx)) else {
             return;
         };
         let mut close = false;
         let response = modal.show(ctx, |ui| {
-            ui.set_opacity(reveal);
+            ui.multiply_opacity(reveal);
             if !self.preview_open {
                 ui.disable();
             }
@@ -874,7 +910,7 @@ impl App {
                     caption(ui, &self.preview_status);
                 }
                 if self.pending_preview.is_some() {
-                    ui.spinner();
+                    motion::busy_indicator(ui);
                 }
                 if let Some(preview) = self.inspected.clone() {
                     self.show_preview(ui, u64::MAX, &preview);

@@ -9,13 +9,15 @@ pub enum Theme {
     #[default]
     Dark,
     Light,
+    System,
 }
 
 impl Theme {
-    pub fn egui(self) -> eframe::egui::Theme {
+    pub fn egui(self) -> eframe::egui::ThemePreference {
         match self {
-            Self::Dark => eframe::egui::Theme::Dark,
-            Self::Light => eframe::egui::Theme::Light,
+            Self::Dark => eframe::egui::ThemePreference::Dark,
+            Self::Light => eframe::egui::ThemePreference::Light,
+            Self::System => eframe::egui::ThemePreference::System,
         }
     }
 }
@@ -147,10 +149,6 @@ impl Default for Settings {
 }
 
 impl Settings {
-    pub fn frame_output(&self) -> PathBuf {
-        frame_output(&self.project)
-    }
-
     pub fn effective_chunk_frames(&self, total_frames: i64) -> Result<i64, String> {
         let end = if self.range_end == 0 { total_frames } else { self.range_end };
         if !(1..=100_000).contains(&total_frames) || self.range_start < 0 || end <= self.range_start || end > total_frames {
@@ -180,9 +178,8 @@ impl Settings {
     }
 }
 
-/// Derive the host frame directory from the selected project, never from an MP4 or saved setting.
-pub fn frame_output(project: &str) -> PathBuf {
-    let project = std::path::Path::new(project);
+/// The previous flat directory is only used to recover matching frames.
+pub fn legacy_frame_output(project: &std::path::Path) -> PathBuf {
     let mut name = project.file_stem().unwrap_or_default().to_os_string();
     name.push("-frame-share");
     project.parent().unwrap_or_else(|| std::path::Path::new("")).join(name)
@@ -294,7 +291,7 @@ mod tests {
         let parent = std::env::temp_dir().join("farm-projects");
         for name in ["scene", "scene.v2", "한글 프로젝트", "scene.ecproj.backup"] {
             let project = parent.join(format!("{name}.ecproj"));
-            assert_eq!(frame_output(&project.to_string_lossy()), parent.join(format!("{name}-frame-share")));
+            assert_eq!(legacy_frame_output(&project), parent.join(format!("{name}-frame-share")));
         }
     }
 
@@ -360,7 +357,7 @@ mod tests {
     fn theme_is_saved_and_older_settings_keep_dark_mode() {
         let legacy: Settings = serde_json::from_str("{}").unwrap();
         assert_eq!(legacy.theme, Theme::Dark);
-        for theme in [Theme::Dark, Theme::Light] {
+        for theme in [Theme::Dark, Theme::Light, Theme::System] {
             let value = Settings { theme, ..Settings::default() };
             let bytes = serde_json::to_vec(&value).unwrap();
             let restored: Settings = serde_json::from_slice(&bytes).unwrap();

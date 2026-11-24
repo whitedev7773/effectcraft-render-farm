@@ -39,7 +39,7 @@ pub(super) fn button_at(ui: &mut egui::Ui, rect: egui::Rect, id: &str, spec: But
     }
     let button = match spec.kind {
         ButtonKind::Primary => primary_button(spec.label),
-        ButtonKind::Normal => egui::Button::new(spec.label),
+        ButtonKind::Normal => egui::Button::new(spec.label).corner_radius(layout::CONTROL_RADIUS),
         ButtonKind::Quiet => egui::Button::new(spec.label).frame(false),
         ButtonKind::Destructive => egui::Button::new(egui::RichText::new(spec.label).color(danger(ui))).frame(false),
     };
@@ -112,7 +112,7 @@ pub(super) fn dialog_header(ui: &mut egui::Ui, title: &str, close_label: &str) -
         let (rect, _) = ui.allocate_exact_size(egui::vec2(width, layout::CONTROL), egui::Sense::hover());
         let mut child = ui.new_child(egui::UiBuilder::new().max_rect(rect).layout(egui::Layout::left_to_right(egui::Align::Center)));
         child.set_clip_rect(rect.intersect(ui.clip_rect()));
-        child.add(egui::Label::new(egui::RichText::new(title).size(18.0).strong()).truncate()).on_hover_text(title);
+        child.add(egui::Label::new(egui::RichText::new(title).heading().size(20.0)).truncate()).on_hover_text(title);
         icon_button(ui, UiIcon::Close, close_label).clicked()
     })
     .inner

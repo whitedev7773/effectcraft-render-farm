@@ -104,10 +104,6 @@ impl Task {
         if video.exists() {
             return Err("최종 MP4가 이미 있습니다. 새 파일 이름을 선택하세요".into());
         }
-        let output = settings::frame_output(&self.project);
-        if !output.is_absolute() || output.is_file() {
-            return Err("프로젝트 폴더의 <프로젝트이름>-frame-share 경로를 확인하세요".into());
-        }
         Ok(())
     }
 }
@@ -125,9 +121,6 @@ fn path_key(value: &str) -> PathBuf {
 pub(crate) fn validate_unique(task: &Task, tasks: &[Task]) -> Result<(), String> {
     task.validate()?;
     for other in tasks.iter().filter(|other| other.id != task.id) {
-        if path_key(&settings::frame_output(&other.project).to_string_lossy()) == path_key(&settings::frame_output(&task.project).to_string_lossy()) {
-            return Err(format!("‘{}’ 작업과 프레임 폴더가 겹칩니다. 프로젝트 이름이나 저장 폴더를 바꾸세요.", other.composition.name));
-        }
         if path_key(&other.final_video) == path_key(&task.final_video) {
             return Err(format!("‘{}’ 작업과 최종 MP4 경로가 겹칩니다. 별도 MP4 이름을 지정하세요.", other.composition.name));
         }
@@ -373,6 +366,7 @@ mod tests {
         app.running = true;
         app.queue_active = Some(1);
         app.job = Some(Job {
+            output_guard: Default::default(),
             draft: false,
             hash: String::new(),
             comp: "Comp 1".into(),
@@ -549,7 +543,41 @@ mod tests {
     }
 
     #[test]
-    fn legacy_frame_paths_are_ignored_after_loading_and_switching_projects() {
+    fn cancelled_host_preparation_marks_the_task_interrupted() {
+        let mut app = app();
+        app.queue_active = Some(1);
+        app.settings.queue[0].status = Status::Preparing;
+        app.pending_config = Some(app.config());
+        let (tx, rx) = mpsc::channel();
+        app.pending_start = Some(rx);
+        app.stopping = true;
+        app.stop.store(true, Ordering::Relaxed);
+        tx.send(Err("호스트 준비가 취소되었습니다".into())).unwrap();
+        app.poll_start();
+        assert!(app.settings.queue[0].status == Status::Interrupted);
+        assert!(app.queue_active.is_none());
+        assert!(app.pending_start.is_none() && app.pending_config.is_none());
+        assert!(!app.running && !app.stopping && app.last_error.is_empty());
+    }
+
+    #[test]
+    fn cancelling_as_host_starts_does_not_launch_a_local_worker() {
+        let mut app = waiting_app();
+        app.running = false;
+        app.pending_config = Some(app.config());
+        let (tx, rx) = mpsc::channel();
+        app.pending_start = Some(rx);
+        app.stopping = true;
+        app.stop.store(true, Ordering::Relaxed);
+        tx.send(Ok(app.job.clone().unwrap())).unwrap();
+        app.poll_start();
+        assert!(app.running && app.stopping);
+        assert!(app.pending_start.is_none() && app.pending_config.is_none());
+        assert!(!app.worker_active.load(Ordering::Relaxed));
+    }
+
+    #[test]
+    fn legacy_manual_frame_paths_are_ignored_after_loading() {
         let project_dir = std::env::temp_dir().join("farm-project-a");
         let mut source = Settings { project: project_dir.join("scene.ecproj").display().to_string(), ..Settings::default() };
         source.queue.push(Task::capture(1, &source, task(1).composition));
@@ -559,10 +587,10 @@ mod tests {
         let loaded: Settings = serde_json::from_value(legacy).unwrap();
         let mut app = App::with_state(loaded, None, Arc::new(Mutex::new(State::default())));
         app.settings.project = std::env::temp_dir().join("farm-project-b/other.ecproj").display().to_string();
-        assert_eq!(app.config().output, std::env::temp_dir().join("farm-project-b/other-frame-share"));
+        assert!(app.config().output.as_os_str().is_empty());
         app.settings.queue[0].clone().apply(&mut app.settings);
         app.settings.final_video = std::env::temp_dir().join("elsewhere.mp4").display().to_string();
-        assert_eq!(app.config().output, project_dir.join("scene-frame-share"));
+        assert!(app.config().output.as_os_str().is_empty());
         let saved = serde_json::to_value(&app.settings).unwrap();
         assert!(saved.get("output").is_none());
         assert!(saved["queue"][0].get("output").is_none());
@@ -585,7 +613,7 @@ mod tests {
         second.id = 2;
         assert!(validate_unique(&second, &[first.clone()]).is_err());
         second.final_video = dir.join("two.mp4").display().to_string();
-        assert!(validate_unique(&second, &[first.clone()]).is_err());
+        assert!(validate_unique(&second, &[first.clone()]).is_ok());
         second.project = dir.join("second.ecproj").display().to_string();
         std::fs::write(&second.project, "fixture").unwrap();
         let mut same_video = second.clone();
@@ -698,11 +726,87 @@ mod tests {
         let job = app.job.as_ref().unwrap();
         assert_eq!(job.comp, "Comp 2");
         assert_eq!((job.start, job.end), (5, 60));
-        assert_eq!(job.output, dir.join("2/project-frame-share"));
+        let second_project = std::fs::canonicalize(dir.join("2")).unwrap();
+        assert!(job.output.starts_with(second_project.join(".effectcraft-farm").join("frames")));
         assert!(job.output.is_dir());
-        assert!(!dir.join("1/project-frame-share").exists());
+        assert!(!dir.join("1/.effectcraft-farm").exists());
         assert!(!app.state.lock().unwrap().dispatch_enabled);
         assert!(dir.canonicalize().unwrap().starts_with(std::env::temp_dir().canonicalize().unwrap()));
         std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn opening_host_with_local_worker_keeps_ui_responsive() {
+        use effectcraft_color::Label;
+        use effectcraft_project::{Comp, ItemKind, Project};
+        use effectcraft_time::{FrameRate, Tick};
+
+        // Run the actual host and local-worker handshake alongside GUI frames.
+        // A timeout reports a deadlock instead of hanging the whole test run.
+        let (tx, rx) = mpsc::channel();
+        thread::spawn(move || {
+            let result = (|| -> Result<(), String> {
+                let dir = std::env::temp_dir().join(format!(
+                    "farm-host-ui-{}-{}",
+                    std::process::id(),
+                    std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_err(|e| e.to_string())?.as_nanos()
+                ));
+                std::fs::create_dir(&dir).map_err(|e| e.to_string())?;
+                let mut project = Project::default();
+                let comp = Comp::new(1920, 1080, FrameRate::FPS_60, Tick::from_seconds_f64(1.5));
+                project.add_item("Comp 1", Label::None, None, ItemKind::Comp(Arc::new(comp)));
+                let project_file = dir.join("project.ecproj");
+                std::fs::write(&project_file, project.to_json()).map_err(|e| e.to_string())?;
+                let port = std::net::TcpListener::bind("127.0.0.1:0").map_err(|e| e.to_string())?.local_addr().map_err(|e| e.to_string())?.port();
+                let mut app = app();
+                app.settings.queue.truncate(1);
+                app.settings.queue[0].project = project_file.display().to_string();
+                app.settings.queue[0].final_video = dir.join("output.mp4").display().to_string();
+                app.settings.cli = std::env::current_exe().map_err(|e| e.to_string())?.display().to_string();
+                app.settings.host_address = format!("127.0.0.1:{port}");
+                app.settings.token = "local-test-password".into();
+                app.settings.local_worker = true;
+                app.settings.reduced_motion = true;
+                let ctx = egui::Context::default();
+                install_ui_font(&ctx)?;
+                app.start_next_queued();
+                let deadline = Instant::now() + Duration::from_secs(10);
+                let mut connected_frames = 0;
+                while Instant::now() < deadline && connected_frames < 8 {
+                    app.poll_start();
+                    app.poll_engine_update();
+                    app.poll_queue();
+                    let input =
+                        egui::RawInput { screen_rect: Some(egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(1280.0, 720.0))), ..Default::default() };
+                    ctx.run_ui(input, |ui| app.draw_interface(ui)).drop_without_applying_deltas();
+                    if app.running && !app.connected_render_workers().is_empty() {
+                        connected_frames += 1;
+                    }
+                    if !app.last_error.is_empty() {
+                        return Err(app.last_error.clone());
+                    }
+                    thread::sleep(Duration::from_millis(30));
+                }
+                app.stop.store(true, Ordering::Relaxed);
+                let stop_deadline = Instant::now() + Duration::from_secs(5);
+                while (app.worker_active.load(Ordering::Relaxed) || app.state.lock().unwrap_or_else(std::sync::PoisonError::into_inner).coordinator_active)
+                    && Instant::now() < stop_deadline
+                {
+                    thread::sleep(Duration::from_millis(20));
+                }
+                if connected_frames < 8 {
+                    return Err(format!("local worker connected for only {connected_frames} frames"));
+                }
+                if app.worker_active.load(Ordering::Relaxed) {
+                    return Err("local worker did not stop".into());
+                }
+                if dir.canonicalize().map_err(|e| e.to_string())?.starts_with(std::env::temp_dir().canonicalize().map_err(|e| e.to_string())?) {
+                    std::fs::remove_dir_all(&dir).map_err(|e| e.to_string())?;
+                }
+                Ok(())
+            })();
+            let _ = tx.send(result);
+        });
+        rx.recv_timeout(Duration::from_secs(20)).expect("host startup or UI rendering stopped responding").expect("host startup failed");
     }
 }

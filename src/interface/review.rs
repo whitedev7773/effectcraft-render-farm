@@ -65,6 +65,7 @@ fn fixture() -> App {
         work_end: 240,
     }];
     app.job = Some(Job {
+        output_guard: Default::default(),
         draft: false,
         hash: String::new(),
         comp: app.settings.comp.clone(),
@@ -119,6 +120,13 @@ pub(crate) fn run_requested() -> bool {
         eprintln!("UI capture folder: {error}");
         return true;
     }
+    let filter = std::env::var("EFFECTCRAFT_FARM_UI_CAPTURE_ONLY").unwrap_or_default();
+    let names: Vec<_> = filter.split(',').map(str::trim).filter(|name| !name.is_empty()).collect();
+    let cases: Vec<_> = CASES.iter().copied().filter(|(name, _, _)| names.is_empty() || names.contains(name)).collect();
+    if cases.is_empty() {
+        eprintln!("UI capture: no matching cases");
+        return true;
+    }
     let options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default().with_title("Render Farm · UI review").with_inner_size([1440.0, 940.0]),
         ..Default::default()
@@ -128,7 +136,7 @@ pub(crate) fn run_requested() -> bool {
         options,
         Box::new(move |cc| {
             let _ = install_ui_font(&cc.egui_ctx);
-            Ok(Box::new(Capture { app: fixture(), directory, stage: 0, frames: 0, requested: false, started: Instant::now() }))
+            Ok(Box::new(Capture { app: fixture(), directory, cases, stage: 0, frames: 0, requested: false, started: Instant::now() }))
         }),
     );
     if let Err(error) = result {
@@ -141,6 +149,7 @@ pub(crate) fn run_requested() -> bool {
 struct Capture {
     app: App,
     directory: PathBuf,
+    cases: Vec<(&'static str, f32, f32)>,
     stage: usize,
     frames: u32,
     requested: bool,
@@ -149,6 +158,9 @@ struct Capture {
 
 #[cfg(debug_assertions)]
 const CASES: &[(&str, f32, f32)] = &[
+    ("welcome", 550.0, 558.0),
+    ("queue-list", 1440.0, 940.0),
+    ("host-scan", 1280.0, 720.0),
     ("desktop", 1440.0, 940.0),
     ("fleet-filtered", 1440.0, 940.0),
     ("wide", 1920.0, 1080.0),
@@ -164,7 +176,6 @@ const CASES: &[(&str, f32, f32)] = &[
     ("preview-compact", 780.0, 850.0),
     ("queue-cards", 1440.0, 940.0),
     ("queue-cards-compact", 560.0, 740.0),
-    ("queue-list", 1440.0, 940.0),
     ("queue-list-compact", 560.0, 740.0),
     ("queue-filtered", 1440.0, 940.0),
     ("queue-no-results", 560.0, 740.0),
@@ -200,8 +211,8 @@ impl eframe::App for Capture {
             ctx.input(|input| input.events.iter().find_map(|event| if let egui::Event::Screenshot { image, .. } = event { Some(image.clone()) } else { None }));
         if let Some(image) = captured {
             let bytes: Vec<u8> = image.pixels.iter().flat_map(|pixel| pixel.to_array()).collect();
-            let theme = if self.stage < CASES.len() { "dark" } else { "light" };
-            let path = self.directory.join(format!("{}-{}.png", theme, CASES[self.stage % CASES.len()].0));
+            let theme = if self.stage < self.cases.len() { "dark" } else { "light" };
+            let path = self.directory.join(format!("{}-{}.png", theme, self.cases[self.stage % self.cases.len()].0));
             if let Err(error) = image::save_buffer(&path, &bytes, image.width() as u32, image.height() as u32, image::ColorType::Rgba8) {
                 eprintln!("UI capture save: {error}");
             }
@@ -210,12 +221,12 @@ impl eframe::App for Capture {
             self.frames = 0;
             self.requested = false;
         }
-        if self.stage >= CASES.len() * 2 {
+        if self.stage >= self.cases.len() * 2 {
             ctx.send_viewport_cmd(egui::ViewportCommand::Close);
             return;
         }
         if self.frames == 0 {
-            let (name, width, height) = CASES[self.stage % CASES.len()];
+            let (name, width, height) = self.cases[self.stage % self.cases.len()];
             self.app = fixture();
             ctx.send_viewport_cmd(egui::ViewportCommand::InnerSize(egui::vec2(width, height)));
             self.app.monitor = name != "compact-project";
@@ -242,6 +253,13 @@ impl eframe::App for Capture {
             self.app.preview_open = name == "preview-compact";
             self.app.settings.queue_cards = name.starts_with("queue-cards");
             self.app.queue_detail = name.starts_with("queue-detail").then_some(2);
+            if name == "host-scan" {
+                let (_tx, rx) = mpsc::channel();
+                self.app.pending_start = Some(rx);
+                self.app.running = false;
+                self.app.queue_view = true;
+                self.app.state.lock().unwrap_or_else(std::sync::PoisonError::into_inner).final_status = "기존 프레임 확인 중 · 512 / 15754".into();
+            }
             if name.starts_with("import-") {
                 self.app.running = false;
                 self.app.monitor = true;
@@ -295,9 +313,13 @@ impl eframe::App for Capture {
                     self.app.state.lock().unwrap_or_else(std::sync::PoisonError::into_inner).worker_info.values().find_map(|worker| worker.preview.clone())
                 })
                 .flatten();
-            self.app.settings.theme = if self.stage < CASES.len() { settings::Theme::Dark } else { settings::Theme::Light };
+            self.app.settings.theme = if self.stage < self.cases.len() { settings::Theme::Dark } else { settings::Theme::Light };
         }
-        self.app.draw_interface(ui);
+        if self.cases[self.stage % self.cases.len()].0 == "welcome" {
+            self.app.draw_welcome(ui);
+        } else {
+            self.app.draw_interface(ui);
+        }
         if self.app.updater.prompt {
             self.app.farm_update_ui(ui, true);
         }
@@ -398,9 +420,10 @@ mod tests {
             install_ui_font(&ctx).unwrap();
             settled_frame(&mut app, &ctx).drop_without_applying_deltas();
             assert!(app.project_import.as_ref().unwrap().selected.is_none());
-            click_label(&mut app, &ctx, "큐에 추가");
+            click_label(&mut app, &ctx, "대기열에 추가");
             assert!(app.settings == before, "disabled add must not enqueue the first composition implicitly");
             assert!(app.project_import.as_ref().unwrap().selected.is_none());
+            click_label(&mut app, &ctx, "선택하세요");
             click_label(&mut app, &ctx, "메인 타이틀");
             assert_eq!(app.project_import.as_ref().unwrap().selected, Some(1));
             assert_eq!((app.project_import.as_ref().unwrap().range_start, app.project_import.as_ref().unwrap().range_end), (24, 360));
@@ -429,15 +452,16 @@ mod tests {
         app.project_import = Some(import::ProjectImport::ready(files.project.display().to_string(), import_compositions(), app.settings.render.clone()));
         let ctx = egui::Context::default();
         install_ui_font(&ctx).unwrap();
+        click_label(&mut app, &ctx, "선택하세요");
         click_label(&mut app, &ctx, "메인 타이틀");
         let output = app.project_import.as_ref().unwrap().output.clone();
         app.project_import.as_mut().unwrap().output = files.directory.join("missing-directory/render.mp4").display().to_string();
-        click_label(&mut app, &ctx, "큐에 추가");
+        click_label(&mut app, &ctx, "대기열에 추가");
         assert!(app.settings == before);
         assert!(!app.project_import.as_ref().unwrap().error.is_empty(), "invalid output keeps the modal open and reports the error");
         app.project_import.as_mut().unwrap().output = output.clone();
         app.project_import.as_mut().unwrap().render.draft = true;
-        click_label(&mut app, &ctx, "큐에 추가");
+        click_label(&mut app, &ctx, "대기열에 추가");
         assert!(app.project_import.is_none());
         assert_eq!(app.settings.queue.len(), before.queue.len() + 1);
         let task = app.settings.queue.last().unwrap();
@@ -483,8 +507,9 @@ mod tests {
         assert_eq!(app.project_import.as_ref().unwrap().compositions.len(), 2);
         assert!(app.project_import.as_ref().unwrap().selected.is_none(), "loading metadata must not select or queue the first composition");
         assert!(app.settings == before);
+        click_label(&mut app, &ctx, "선택하세요");
         click_label(&mut app, &ctx, "Imported Main");
-        click_label(&mut app, &ctx, "큐에 추가");
+        click_label(&mut app, &ctx, "대기열에 추가");
         assert!(app.project_import.is_none());
         assert_eq!(app.settings.queue.len(), before.queue.len() + 1);
         let task = app.settings.queue.last().unwrap();
@@ -512,7 +537,7 @@ mod tests {
         }
         assert!(!app.project_import.as_ref().unwrap().error.is_empty());
         assert!(app.project_import.as_ref().unwrap().compositions.is_empty());
-        click_label(&mut app, &ctx, "큐에 추가");
+        click_label(&mut app, &ctx, "대기열에 추가");
         assert!(app.settings == before);
         click_label(&mut app, &ctx, "취소");
         assert!(app.project_import.is_none());
@@ -530,8 +555,9 @@ mod tests {
         app.project_import = Some(import::ProjectImport::ready(files.project.display().to_string(), import_compositions(), app.settings.render.clone()));
         let ctx = egui::Context::default();
         install_ui_font(&ctx).unwrap();
+        click_label(&mut app, &ctx, "선택하세요");
         click_label(&mut app, &ctx, "메인 타이틀");
-        click_label(&mut app, &ctx, "큐에 추가");
+        click_label(&mut app, &ctx, "대기열에 추가");
         assert_eq!(app.settings.queue.len(), 1);
         settled_frame(&mut app, &ctx).drop_without_applying_deltas();
         let gear = ctx.read_response(egui::Id::new(("queue-settings", app.settings.queue[0].id))).unwrap().rect.center();
@@ -642,7 +668,12 @@ mod tests {
         fn assert_tasks(app: &mut App, ctx: &egui::Context, expected: &[u64]) {
             let output = settle(app, ctx);
             for task in &app.settings.queue {
-                let visible = output.shapes.iter().any(|shape| visible_text_rect(&shape.shape, shape.clip_rect, &task.composition.name).is_some());
+                // The current composition also appears in the independent live
+                // status card below the list. Filter assertions concern rows.
+                let visible = output
+                    .shapes
+                    .iter()
+                    .any(|shape| visible_text_rect(&shape.shape, shape.clip_rect, &task.composition.name).is_some_and(|rect| rect.center().y < 580.0));
                 assert_eq!(visible, expected.contains(&task.id), "visibility of {}", task.composition.name);
             }
             assert_eq!(app.settings.queue.iter().map(|task| task.id).collect::<Vec<_>>(), vec![1, 2, 3, 4]);
@@ -674,15 +705,27 @@ mod tests {
     }
 
     #[test]
-    fn closed_modal_does_not_leave_an_invisible_overlay() {
+    fn modal_opening_stays_in_sync_and_closing_clears_the_overlay() {
         let ctx = egui::Context::default();
-        for _ in 0..6 {
-            ctx.run_ui(egui::RawInput::default(), |_| {
-                let _ = animated_modal(&ctx, "closing-regression", true, false);
+        let check_frame = |time, open, reduced| {
+            let mut opacity = None;
+            ctx.run_ui(egui::RawInput { time: Some(time), ..Default::default() }, |_| {
+                if let Some((modal, reveal)) = animated_modal(&ctx, "closing-regression", open, reduced, card(&ctx)) {
+                    assert!(modal.backdrop_color.a().abs_diff((160.0 * reveal).round() as u8) <= 1);
+                    assert_eq!(modal.frame.unwrap().fill, card(&ctx).fill.gamma_multiply(reveal));
+                    modal.show(&ctx, |ui| ui.label("Dialog"));
+                    opacity = Some(reveal);
+                }
             })
             .drop_without_applying_deltas();
-        }
-        assert!(animated_modal(&ctx, "closing-regression", false, false).is_none());
+            opacity
+        };
+        assert_eq!(check_frame(0.0, true, false), Some(0.0));
+        assert!((0.0..1.0).contains(&check_frame(0.05, true, false).unwrap()));
+        assert_eq!(check_frame(0.25, true, false), Some(1.0));
+        assert_eq!(check_frame(0.26, false, false), None);
+        assert_eq!(check_frame(0.27, true, false), Some(0.0));
+        assert_eq!(check_frame(0.28, true, true), Some(1.0));
     }
 
     #[test]
@@ -692,6 +735,7 @@ mod tests {
         app.monitor = false;
         app.settings.reduced_motion = true;
         let ctx = egui::Context::default();
+        install_ui_font(&ctx).unwrap();
         let mut labels = String::new();
         fn collect(shape: &egui::Shape, labels: &mut String) {
             match shape {
@@ -714,7 +758,7 @@ mod tests {
             output.drop_without_applying_deltas();
         }
         assert!(labels.contains("프로젝트 준비"));
-        assert!(labels.contains("프로젝트 추가"));
+        assert!(labels.contains("컴포지션 추가"));
         assert!(!labels.contains("컴포지션 선택"));
         assert!(!labels.contains("최종 MP4"));
         assert!(!labels.contains("상세 설정"));
@@ -745,7 +789,8 @@ mod tests {
                 events,
                 ..Default::default()
             };
-            for (label, monitor, queue_view) in [("렌더 큐", true, true), ("프로젝트 준비", false, false), ("렌더 모니터", true, false)] {
+            let labels = if width < 720.0 { ["렌더 큐", "프로젝트 준비", "렌더 모니터"] } else { ["목록", "연결", "모니터"] };
+            for (label, monitor, queue_view) in [(labels[0], true, true), (labels[1], false, false), (labels[2], true, false)] {
                 let mut position = None;
                 for _ in 0..3 {
                     let output = ctx.run_ui(input(Vec::new()), |ui| app.draw_interface(ui));
@@ -858,6 +903,25 @@ mod tests {
     }
 
     #[test]
+    fn host_preparation_displays_scan_progress_and_can_be_cancelled() {
+        let mut app = fixture();
+        app.running = false;
+        app.queue_view = true;
+        app.settings.reduced_motion = true;
+        let (_tx, rx) = mpsc::channel();
+        app.pending_start = Some(rx);
+        app.state.lock().unwrap().final_status = "기존 프레임 확인 중 · 64 / 100".into();
+        let ctx = egui::Context::default();
+        install_ui_font(&ctx).unwrap();
+        let output = settled_frame(&mut app, &ctx);
+        assert!(output.shapes.iter().any(|shape| visible_text_rect(&shape.shape, shape.clip_rect, "기존 프레임 확인 중 · 64 / 100").is_some()));
+        assert!(output.shapes.iter().any(|shape| visible_text_rect(&shape.shape, shape.clip_rect, "렌더링 준비 중").is_some()));
+        output.drop_without_applying_deltas();
+        click_label(&mut app, &ctx, "준비 취소");
+        assert!(app.stopping && app.stop.load(Ordering::Relaxed));
+    }
+
+    #[test]
     fn responsive_views_and_modals_fit_at_supported_sizes() {
         let prototype = fixture();
         for theme in [settings::Theme::Dark, settings::Theme::Light] {
@@ -892,7 +956,7 @@ mod tests {
                             app.draw_interface(ui);
                             assert!(ui.min_rect().width() <= width + 1.0, "horizontal overflow at {width}, view {view}: {:?}", ui.min_rect());
                         });
-                        assert_eq!(ctx.theme(), theme.egui());
+                        assert_eq!(ctx.theme(), if theme == settings::Theme::Dark { egui::Theme::Dark } else { egui::Theme::Light });
                         assert!(!output.shapes.is_empty());
                         output.drop_without_applying_deltas();
                     }
@@ -925,9 +989,13 @@ mod tests {
         app.settings.theme = settings::Theme::Dark;
         let ctx = egui::Context::default();
         install_ui_font(&ctx).unwrap();
-        let input =
-            |events| egui::RawInput { screen_rect: Some(egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(1200.0, 800.0))), events, ..Default::default() };
-        for (label, expected) in [("라이트", settings::Theme::Light), ("다크", settings::Theme::Dark)] {
+        let input = |events| egui::RawInput {
+            screen_rect: Some(egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(1200.0, 800.0))),
+            system_theme: Some(egui::Theme::Light),
+            events,
+            ..Default::default()
+        };
+        for (label, expected) in [("라이트", settings::Theme::Light), ("다크", settings::Theme::Dark), ("시스템 설정", settings::Theme::System)] {
             let mut point = None;
             for _ in 0..3 {
                 let output = ctx.run_ui(input(Vec::new()), |ui| app.draw_interface(ui));
@@ -942,8 +1010,9 @@ mod tests {
             ctx.run_ui(input(Vec::new()), |ui| app.draw_interface(ui)).drop_without_applying_deltas();
             let output = ctx.run_ui(input(Vec::new()), |ui| app.draw_interface(ui));
             assert_eq!(app.settings.theme, expected);
-            assert_eq!(ctx.theme(), expected.egui());
-            let expected_background = ctx.style_of(expected.egui()).visuals.panel_fill;
+            let resolved = if expected == settings::Theme::Dark { egui::Theme::Dark } else { egui::Theme::Light };
+            assert_eq!(ctx.theme(), resolved);
+            let expected_background = ctx.style_of(resolved).visuals.panel_fill;
             assert!(output.shapes.iter().any(|shape| contains_fill(&shape.shape, expected_background)));
             output.drop_without_applying_deltas();
         }

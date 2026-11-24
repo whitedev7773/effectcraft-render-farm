@@ -15,10 +15,65 @@ fn fleet_columns(rect: egui::Rect, wide: bool) -> Vec<egui::Rect> {
         .collect()
 }
 
+fn resize_handle(ui: &mut egui::Ui, bounds: egui::Rect, id: &'static str, horizontal: bool) -> egui::Response {
+    let response = ui.interact(bounds, ui.id().with(id), egui::Sense::click_and_drag());
+    let reveal = motion::highlight(ui, response.id.with("hover"), response.hovered() || response.dragged());
+    let (name, bytes, size): (&str, &[u8], egui::Vec2) = match horizontal {
+        true => ("resize-horizontal-active", include_bytes!("../../assets/ui/figma/resize-horizontal-active.svg"), egui::vec2(60.0, 10.0)),
+        false => ("resize-vertical-active", include_bytes!("../../assets/ui/figma/resize-vertical-active.svg"), egui::vec2(10.0, 100.0)),
+    };
+    if reveal > 0.0
+        && let Some(icon) = figma_svg(ui, name, bytes, size)
+    {
+        icon.tint(egui::Color32::WHITE.gamma_multiply(reveal)).paint_at(ui, egui::Rect::from_center_size(bounds.center(), size));
+    }
+    response.on_hover_cursor(if horizontal { egui::CursorIcon::ResizeVertical } else { egui::CursorIcon::ResizeHorizontal })
+}
+
+fn overview_chip(ui: &mut egui::Ui, label: &str, color: egui::Color32) {
+    let font = figma_font(12.0, false);
+    let galley = ui.painter().layout_no_wrap(label.to_owned(), font, color);
+    let (rect, _) = ui.allocate_exact_size(egui::vec2(galley.size().x + 16.0, 24.0), egui::Sense::hover());
+    ui.painter().rect_filled(rect, layout::CONTROL_RADIUS, soft(color));
+    ui.painter().galley(rect.center() - galley.size() / 2.0, galley, color);
+}
+
+fn elapsed_clock(seconds: f64) -> String {
+    let seconds = seconds.max(0.0) as u64;
+    format!("{:02}:{:02}:{:02}", seconds / 3600, seconds % 3600 / 60, seconds % 60)
+}
+
 impl App {
     pub(super) fn workspace_grid(&mut self, ui: &mut egui::Ui, viewport_height: f32) {
         if self.monitor && self.queue_view && self.settings.host {
-            self.queue_panel(ui, viewport_height.max(440.0));
+            if ui.available_width() >= 900.0 && viewport_height >= 500.0 {
+                // The queue scrolls independently so the live status cards remain
+                // visible beneath it, as in the host window design.
+                let size_id = egui::Id::new("queue-overview-height");
+                let gaps = ui.spacing().item_spacing.y * 2.0;
+                let max_height = (viewport_height - 240.0 - gaps).max(200.0);
+                let card_height = ui.ctx().data(|data| data.get_temp::<f32>(size_id).unwrap_or(260.0)).clamp(200.0, max_height);
+                let queue_height = (viewport_height - card_height - layout::GAP - gaps).max(230.0);
+                egui::ScrollArea::vertical()
+                    .id_salt("queue-overview-scroll")
+                    .auto_shrink([false, false])
+                    .max_height(queue_height)
+                    .show(ui, |ui| self.queue_panel(ui, queue_height));
+                let (handle, _) = ui.allocate_exact_size(egui::vec2(ui.available_width(), layout::GAP), egui::Sense::hover());
+                let response = resize_handle(ui, handle, "queue-height-resize", true).on_hover_text("위아래로 끌어 패널 높이 조절 · 두 번 클릭해 초기화");
+                if response.double_clicked() {
+                    ui.ctx().data_mut(|data| data.remove::<f32>(size_id));
+                } else if response.dragged() {
+                    let height = (card_height - response.drag_delta().y).clamp(200.0, max_height);
+                    ui.ctx().data_mut(|data| data.insert_temp(size_id, height));
+                    ui.ctx().request_repaint();
+                }
+                self.queue_overview_cards(ui, card_height);
+            } else {
+                self.queue_panel(ui, viewport_height.max(440.0));
+                ui.add_space(8.0);
+                self.queue_overview_cards(ui, 260.0);
+            }
         } else if ui.available_width() >= 900.0 {
             let (rect, _) = ui.allocate_exact_size(egui::vec2(ui.available_width(), viewport_height.max(680.0)), egui::Sense::hover());
             if !self.monitor {
@@ -58,6 +113,207 @@ impl App {
             ui.add_space(SPACE);
             flow_tile(ui, 256.0, "activity", |ui| self.activity_content(ui, &workers));
         }
+    }
+
+    fn queue_overview_cards(&mut self, ui: &mut egui::Ui, height: f32) {
+        let workers = if self.pending_start.is_some() { Vec::new() } else { farm::worker_snapshot(&self.state).0 };
+        let wide = ui.available_width() >= 700.0;
+        let width = ui.available_width();
+        if wide {
+            let size_id = egui::Id::new("queue-overview-pc-width");
+            let default_width = (width * 0.255).clamp(240.0, 300.0);
+            let max_width = (width - 370.0).clamp(240.0, 480.0);
+            let right_width = ui.ctx().data(|data| data.get_temp::<f32>(size_id).unwrap_or(default_width)).clamp(240.0, max_width);
+            let (bounds, _) = ui.allocate_exact_size(egui::vec2(width, height), egui::Sense::hover());
+            let left = egui::Rect::from_min_max(bounds.min, egui::pos2(bounds.right() - right_width - layout::GAP, bounds.bottom()));
+            let right = egui::Rect::from_min_max(egui::pos2(left.right() + layout::GAP, bounds.top()), bounds.max);
+            tile(ui, left, "queue-render-status", false, |ui| self.queue_status_content(ui, &workers, height - PADDING as f32 * 2.0));
+            tile(ui, right, "queue-connected-pcs", false, |ui| self.queue_workers_content(ui, &workers, height - PADDING as f32 * 2.0));
+            let handle = egui::Rect::from_min_max(egui::pos2(left.right(), bounds.top()), egui::pos2(right.left(), bounds.bottom()));
+            let response = resize_handle(ui, handle, "queue-pc-width-resize", false).on_hover_text("좌우로 끌어 PC 패널 너비 조절 · 두 번 클릭해 초기화");
+            if response.double_clicked() {
+                ui.ctx().data_mut(|data| data.remove::<f32>(size_id));
+            } else if response.dragged() {
+                let right_width = (right_width - response.drag_delta().x).clamp(240.0, max_width);
+                ui.ctx().data_mut(|data| data.insert_temp(size_id, right_width));
+                ui.ctx().request_repaint();
+            }
+        } else {
+            flow_tile(ui, 260.0, "queue-render-status", |ui| self.queue_status_content(ui, &workers, 260.0 - PADDING as f32 * 2.0));
+            ui.add_space(8.0);
+            flow_tile(ui, 260.0, "queue-connected-pcs", |ui| self.queue_workers_content(ui, &workers, 260.0 - PADDING as f32 * 2.0));
+        }
+    }
+
+    fn queue_status_content(&mut self, ui: &mut egui::Ui, workers: &[farm::WorkerInfo], height: f32) {
+        if self.pending_start.is_some() {
+            ui.allocate_ui_with_layout(egui::vec2(ui.available_width(), height), egui::Layout::top_down(egui::Align::Center), |ui| {
+                ui.add_space(((height - 80.0) / 2.0).max(0.0));
+                ui.add_sized([24.0, 24.0], egui::Spinner::new());
+                ui.label(egui::RichText::new("렌더링 준비 중").font(figma_font(16.0, false)));
+                caption(ui, "기존 프레임 확인이 끝나면 PC를 연결할 수 있습니다.");
+            });
+            return;
+        }
+        let (done, total, _, failed) = farm::progress_snapshot(&self.state);
+        let (started, finished_elapsed, local_progress, final_result, live_preview) = {
+            let state = self.state.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+            (
+                state.started,
+                state.finished_elapsed,
+                state.local_progress,
+                state.final_result.clone(),
+                state.latest_preview.clone().or_else(|| state.local_preview.clone()),
+            )
+        };
+        let elapsed = finished_elapsed.map(|elapsed| elapsed.as_secs_f64()).or_else(|| {
+            (self.running && !self.stopping && failed == 0 && final_result.is_none()).then(|| started.map(|at| at.elapsed().as_secs_f64())).flatten()
+        });
+        if started.is_none() && local_progress.is_none() {
+            let (rect, _) = ui.allocate_exact_size(egui::vec2(ui.available_width(), height), egui::Sense::hover());
+            let center = rect.center();
+            let color = muted(ui);
+            if let Some(icon) =
+                figma_svg(ui, "status-empty-broadcast", include_bytes!("../../assets/ui/figma/status-empty-broadcast.svg"), egui::vec2(28.0, 28.0))
+            {
+                icon.paint_at(ui, egui::Rect::from_center_size(center - egui::vec2(0.0, 30.0), egui::vec2(28.0, 28.0)));
+            }
+            ui.painter().text(
+                center + egui::vec2(0.0, 4.0),
+                egui::Align2::CENTER_CENTER,
+                "렌더중인 컴포지션 없음",
+                egui::FontId::proportional(14.0),
+                ui.visuals().text_color(),
+            );
+            ui.painter().text(
+                center + egui::vec2(0.0, 25.0),
+                egui::Align2::CENTER_CENTER,
+                "렌더링이 시작되면 여기에 정보가 표시됩니다.",
+                egui::FontId::proportional(12.0),
+                color,
+            );
+            return;
+        }
+        ui.horizontal(|ui| {
+            ui.label(egui::RichText::new("렌더링 상태").font(figma_font(16.0, false)).extra_letter_spacing(-0.4));
+            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                let (label, color) = match &final_result {
+                    Some(Ok(())) => ("완료", success(ui)),
+                    Some(Err(_)) => ("실패", danger(ui)),
+                    None if failed > 0 => ("실패", danger(ui)),
+                    None if self.stopping => ("중단 중", muted(ui)),
+                    None if self.running => ("렌더링 중", accent(ui)),
+                    None => ("중단", muted(ui)),
+                };
+                overview_chip(ui, label, color);
+            });
+        });
+        let preview = live_preview.or_else(|| workers.iter().filter_map(|w| w.preview.clone()).max_by_key(|p| p.frame));
+        let content_width = ui.available_width();
+        let image_width = (content_width * 0.42).min(356.0);
+        let image_height = (image_width * 9.0 / 16.0).min((height - CONTROL - SPACE).max(0.0));
+        ui.horizontal_top(|ui| {
+            ui.allocate_ui_with_layout(egui::vec2(image_width, image_height), egui::Layout::top_down(egui::Align::Min), |ui| {
+                let image_rect = egui::Rect::from_min_size(ui.cursor().min, egui::vec2(image_width, image_height));
+                self.dashboard_image(ui, u64::MAX - 2, preview.as_ref(), image_height);
+                let response = ui.interact(image_rect, ui.id().with("queue-status-preview"), egui::Sense::click());
+                response.widget_info(|| egui::WidgetInfo::labeled(egui::WidgetType::Button, ui.is_enabled(), "프레임 탐색"));
+                if response.on_hover_text("완료 프레임 탐색 / 시험 렌더").clicked() {
+                    self.preview_open = true;
+                }
+            });
+            ui.vertical(|ui| {
+                ui.add(
+                    egui::Label::new(egui::RichText::new(if self.settings.comp.is_empty() { "컴포지션" } else { &self.settings.comp }).size(14.0).strong())
+                        .truncate(),
+                );
+                let file = std::path::Path::new(&self.settings.project).file_name().unwrap_or_default().to_string_lossy();
+                caption(ui, file.as_ref());
+                ui.add_space(8.0);
+                let speed: f64 = workers
+                    .iter()
+                    .filter(|w| w.connected && w.assigned.is_some())
+                    .map(|w| w.started.map_or(w.fps, |at| w.current_done as f64 / at.elapsed().as_secs_f64().max(0.001)))
+                    .sum();
+                let eta = if speed > 0.0 { format!("약 {}", duration((total - done).max(0) as f64 / speed)) } else { "—".into() };
+                let remaining = self.settings.queue.iter().filter(|task| task.status == crate::queue::Status::Pending).count();
+                ui.columns(4, |cols| {
+                    for (column, (label, value)) in cols.iter_mut().zip([
+                        ("소요 시간", elapsed.map(elapsed_clock).unwrap_or_else(|| "—".into())),
+                        ("예상 남은 시간", eta),
+                        ("남은 컴포지션", format!("{remaining}개")),
+                        ("초당 프레임", format!("{speed:.1} fps")),
+                    ]) {
+                        column.spacing_mut().item_spacing.y = 2.0;
+                        column.add(
+                            egui::Label::new(egui::RichText::new(label).size(12.0).line_height(Some(16.0)).extra_letter_spacing(-0.4).color(muted(column)))
+                                .truncate(),
+                        );
+                        column.add(
+                            egui::Label::new(egui::RichText::new(value).font(figma_font(14.0, false)).line_height(Some(20.0)).extra_letter_spacing(-0.4))
+                                .truncate(),
+                        );
+                    }
+                });
+                ui.add_space(8.0);
+                let fraction = if total > 0 { (done as f32 / total as f32).clamp(0.0, 1.0) } else { 0.0 };
+                ui.horizontal(|ui| {
+                    caption(ui, format!("{done} / {total} 프레임"));
+                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                        ui.label(egui::RichText::new(format!("{:.0}%", fraction * 100.0)).size(12.0).color(accent(ui)));
+                    });
+                });
+                ui.add(
+                    egui::ProgressBar::new(motion::progress(ui, ("overview", self.queue_active), fraction))
+                        .fill(accent(ui))
+                        .desired_width(ui.available_width())
+                        .desired_height(4.0),
+                );
+            });
+        });
+    }
+
+    fn queue_workers_content(&mut self, ui: &mut egui::Ui, workers: &[farm::WorkerInfo], height: f32) {
+        let connected: Vec<_> = workers.iter().filter(|worker| worker.connected).collect();
+        if connected.is_empty() {
+            let (rect, _) = ui.allocate_exact_size(egui::vec2(ui.available_width(), height), egui::Sense::click());
+            if let Some(icon) = figma_svg(ui, "pc-link-slash", include_bytes!("../../assets/ui/figma/pc-link-slash.svg"), egui::vec2(28.0, 28.0)) {
+                icon.paint_at(ui, egui::Rect::from_center_size(rect.center() - egui::vec2(0.0, 22.0), egui::vec2(28.0, 28.0)));
+            }
+            ui.painter().text(
+                rect.center() + egui::vec2(0.0, 14.0),
+                egui::Align2::CENTER_CENTER,
+                "연결된 PC 없음",
+                egui::FontId::proportional(16.0),
+                muted(ui),
+            );
+            return;
+        }
+        ui.horizontal(|ui| {
+            ui.label(egui::RichText::new("연결된 PC").font(figma_font(16.0, false)).extra_letter_spacing(-0.4));
+            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                overview_chip(ui, &format!("{}대", connected.len()), success(ui));
+            });
+        });
+        egui::ScrollArea::vertical().id_salt("connected-pc-list").max_height((height - 32.0).max(0.0)).show(ui, |ui| {
+            for worker in connected {
+                let name = worker.label.split(" @ ").next().unwrap_or(&worker.label);
+                let (rect, response) = ui.allocate_exact_size(egui::vec2(ui.available_width(), 44.0), egui::Sense::click());
+                let hover = motion::highlight(ui, ui.id().with(("connected-hover", worker.id)), response.hovered());
+                ui.painter().rect_filled(rect, layout::CONTROL_RADIUS, secondary(ui).gamma_multiply(hover));
+                // The wire protocol does not report a worker OS, so use the
+                // design's generic display icon rather than guessing one.
+                if let Some(icon) = figma_svg(ui, "pc-display", include_bytes!("../../assets/ui/figma/pc-display.svg"), egui::vec2(12.0, 12.0)) {
+                    icon.paint_at(ui, egui::Rect::from_min_size(rect.min + egui::vec2(8.0, 16.0), egui::vec2(12.0, 12.0)));
+                }
+                ui.painter().text(rect.min + egui::vec2(30.0, 7.0), egui::Align2::LEFT_TOP, name, egui::FontId::proportional(12.0), ui.visuals().text_color());
+                ui.painter().text(rect.min + egui::vec2(30.0, 23.0), egui::Align2::LEFT_TOP, &worker.ip, egui::FontId::proportional(12.0), muted(ui));
+                ui.painter().hline(rect.x_range(), rect.bottom(), egui::Stroke::new(1.0, border(ui)));
+                if response.on_hover_text("PC 상세 정보").clicked() {
+                    self.worker_details = Some(worker.id);
+                }
+            }
+        });
     }
 
     fn project_grid(&mut self, ui: &mut egui::Ui, rect: egui::Rect) {
@@ -238,7 +494,7 @@ impl App {
                 ui.label(egui::RichText::new(if waiting { "대기".into() } else { format!("{:.0}%", progress * 100.0) }).size(30.0).strong());
             });
         });
-        let animated = motion(ui.ctx(), ui.id().with("total-progress"), progress, self.settings.reduced_motion);
+        let animated = motion::progress(ui, ("total", self.queue_active), progress);
         ui.add(egui::ProgressBar::new(animated.clamp(0.0, 1.0)).fill(accent(ui)).desired_width(ui.available_width()).desired_height(4.0));
         let progress_label = if failed > 0 { format!("{text} · 실패 {failed}구간") } else { text };
         ui.add(egui::Label::new(egui::RichText::new(progress_label).size(11.0).color(muted(ui))).truncate()).on_hover_text(if status.is_empty() {
@@ -319,25 +575,15 @@ impl App {
     pub(super) fn dashboard_image(&mut self, ui: &mut egui::Ui, key: u64, preview: Option<&farm::Preview>, height: f32) {
         let (rect, _) = ui.allocate_exact_size(egui::vec2(ui.available_width(), height), egui::Sense::hover());
         let painter = ui.painter().with_clip_rect(rect.intersect(ui.clip_rect()));
-        painter.rect_filled(rect, 4, background(ui));
+        painter.rect_filled(rect, layout::INSET_RADIUS, secondary(ui));
         if let Some(preview) = preview
             && let Some(texture) = self.preview_texture(ui, key, preview)
         {
             let size = texture.size_vec2();
             let scale = (rect.width() / size.x).min(rect.height() / size.y);
             let fitted = egui::Rect::from_center_size(rect.center(), size * scale);
-            painter.image(texture.id(), fitted, egui::Rect::from_min_max(egui::Pos2::ZERO, egui::pos2(1.0, 1.0)), egui::Color32::WHITE);
+            egui::Image::new((texture.id(), size)).corner_radius(layout::INSET_RADIUS).paint_at(ui, fitted);
         } else {
-            let stroke = egui::Stroke::new(1.0, border(ui).gamma_multiply(0.4));
-            let spacing = 32.0;
-            for column in 1..(rect.width() / spacing).ceil() as usize {
-                let x = rect.left() + column as f32 * spacing;
-                painter.line_segment([egui::pos2(x, rect.top()), egui::pos2(x, rect.bottom())], stroke);
-            }
-            for row in 1..(rect.height() / spacing).ceil() as usize {
-                let y = rect.top() + row as f32 * spacing;
-                painter.line_segment([egui::pos2(rect.left(), y), egui::pos2(rect.right(), y)], stroke);
-            }
             if rect.height() > 128.0 && rect.width() > 240.0 {
                 let center = rect.center() - egui::vec2(0.0, 24.0);
                 let monitor = egui::Rect::from_center_size(center, egui::vec2(42.0, 28.0));
@@ -419,7 +665,7 @@ impl App {
         let spacing = ui.spacing().item_spacing.y;
         ui.spacing_mut().item_spacing.y = 0.0;
         let (header, _) = ui.allocate_exact_size(egui::vec2(ui.available_width(), 26.0), egui::Sense::hover());
-        ui.painter().rect_filled(header, 3, secondary(ui));
+        ui.painter().rect_filled(header, layout::CONTROL_RADIUS, secondary(ui));
         let columns = fleet_columns(header, wide);
         for (rect, label) in columns.iter().zip(if wide {
             vec!["컴퓨터", "상태", "현재 구간", "처리 속도", "참여", ""]
@@ -430,9 +676,8 @@ impl App {
         }
         for worker in &filtered {
             let (row, response) = ui.allocate_exact_size(egui::vec2(ui.available_width(), 40.0), egui::Sense::hover());
-            if response.hovered() {
-                ui.painter().rect_filled(row, 0, secondary(ui));
-            }
+            let hover = motion::highlight(ui, ui.id().with(("fleet-hover", worker.id)), response.contains_pointer());
+            ui.painter().rect_filled(row, 0, secondary(ui).gamma_multiply(hover));
             self.worker_row(ui, worker, row, wide);
             ui.painter().hline(row.x_range(), row.bottom(), egui::Stroke::new(1.0, border(ui).gamma_multiply(0.65)));
         }
@@ -498,7 +743,7 @@ impl App {
         ui.painter().text(progress_rect.min + egui::vec2(0.0, 5.0), egui::Align2::LEFT_TOP, detail, egui::FontId::proportional(10.0), muted(ui));
         let track = egui::Rect::from_min_size(progress_rect.min + egui::vec2(0.0, 25.0), egui::vec2(progress_rect.width(), 4.0));
         ui.painter().rect_filled(track, 2, border(ui));
-        let animated = motion(ui.ctx(), ui.id().with(("fleet-progress", worker.id, worker.assigned)), fraction, self.settings.reduced_motion);
+        let animated = motion::progress(ui, (worker.id, worker.assigned), fraction);
         if animated > 0.0 {
             ui.painter().rect_filled(egui::Rect::from_min_size(track.min, egui::vec2(track.width() * animated.clamp(0.0, 1.0), track.height())), 2, accent(ui));
         }

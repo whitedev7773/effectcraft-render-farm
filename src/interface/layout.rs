@@ -6,7 +6,72 @@ pub(crate) const PADDING: i8 = 16;
 pub(crate) const CONTROL: f32 = 32.0;
 pub(crate) const PRIMARY_CONTROL: f32 = 36.0;
 pub(crate) const COMPACT_CONTROL: f32 = 28.0;
-pub(crate) const RADIUS: u8 = 8;
+pub(crate) const RADIUS: u8 = 14;
+pub(crate) const CONTROL_RADIUS: u8 = 8;
+pub(super) const INSET_RADIUS: u8 = 10;
+pub(crate) const DIALOG_RADIUS: u8 = 20;
+pub(crate) const DIALOG_PADDING: i8 = 20;
+pub(crate) const PAGE_PADDING: i8 = 16;
+pub(crate) const PRIMARY_FILL: egui::Color32 = egui::Color32::from_rgb(36, 92, 211);
+pub(crate) const ON_PRIMARY: egui::Color32 = egui::Color32::WHITE;
+
+pub(crate) struct Palette {
+    pub canvas: egui::Color32,
+    pub surface: egui::Color32,
+    pub inset: egui::Color32,
+    pub field: egui::Color32,
+    pub hover: egui::Color32,
+    pub pressed: egui::Color32,
+    pub border: egui::Color32,
+    pub text: egui::Color32,
+    pub muted: egui::Color32,
+    pub accent: egui::Color32,
+    pub success: egui::Color32,
+    pub danger: egui::Color32,
+    pub warning: egui::Color32,
+    pub selection: egui::Color32,
+}
+
+impl Palette {
+    pub fn new(dark: bool) -> Self {
+        let rgb = egui::Color32::from_rgb;
+        if dark {
+            Self {
+                canvas: rgb(15, 18, 24),
+                surface: rgb(24, 28, 37),
+                inset: rgb(31, 36, 47),
+                field: rgb(35, 41, 54),
+                hover: rgb(43, 51, 66),
+                pressed: rgb(49, 59, 77),
+                border: rgb(49, 56, 70),
+                text: rgb(240, 243, 249),
+                muted: rgb(169, 179, 197),
+                accent: rgb(125, 177, 255),
+                success: rgb(103, 218, 167),
+                danger: rgb(255, 149, 156),
+                warning: rgb(247, 200, 119),
+                selection: rgb(38, 57, 88),
+            }
+        } else {
+            Self {
+                canvas: rgb(242, 245, 250),
+                surface: rgb(255, 255, 255),
+                inset: rgb(239, 243, 249),
+                field: rgb(247, 249, 252),
+                hover: rgb(229, 236, 247),
+                pressed: rgb(219, 229, 244),
+                border: rgb(211, 220, 233),
+                text: rgb(26, 34, 49),
+                muted: rgb(81, 96, 119),
+                accent: rgb(34, 81, 174),
+                success: rgb(12, 104, 72),
+                danger: rgb(167, 44, 62),
+                warning: rgb(122, 76, 13),
+                selection: rgb(221, 233, 253),
+            }
+        }
+    }
+}
 
 #[derive(Clone, Copy, Debug)]
 pub(super) struct DashboardGrid {
@@ -36,9 +101,20 @@ pub(super) fn tile<R>(
     secondary: bool,
     content: impl FnOnce(&mut egui::Ui) -> R,
 ) -> R {
+    tile_padded(ui, rect, id, secondary, PADDING as f32, content)
+}
+
+pub(super) fn tile_padded<R>(
+    ui: &mut egui::Ui,
+    rect: egui::Rect,
+    id: impl std::hash::Hash + std::fmt::Debug,
+    secondary: bool,
+    padding: f32,
+    content: impl FnOnce(&mut egui::Ui) -> R,
+) -> R {
     ui.painter().rect_filled(rect, RADIUS, if secondary { super::secondary(ui) } else { surface(ui) });
     ui.painter().rect_stroke(rect, RADIUS, egui::Stroke::new(1.0, border(ui)), egui::StrokeKind::Inside);
-    let inner = rect.shrink(PADDING as f32);
+    let inner = rect.shrink(padding);
     // The caller has allocated the outer rectangle. A child must not advance
     // the parent cursor again using its smaller padded content rectangle.
     let mut child = ui.new_child(egui::UiBuilder::new().id_salt(id).max_rect(inner).layout(egui::Layout::top_down(egui::Align::Min)));

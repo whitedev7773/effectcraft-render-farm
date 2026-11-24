@@ -26,53 +26,116 @@ use settings::{Distribution, Settings};
 fn install_ui_font(ctx: &egui::Context) -> Result<(), String> {
     let mut fonts = FontDefinitions::default();
     fonts.font_data.insert("wanted-sans".into(), std::sync::Arc::new(FontData::from_static(include_bytes!("../assets/ui/WantedSans-Regular.ttf"))));
+    fonts.font_data.insert("wanted-medium".into(), std::sync::Arc::new(FontData::from_static(include_bytes!("../assets/ui/WantedSans-Medium.ttf"))));
+    fonts.font_data.insert("wanted-bold".into(), std::sync::Arc::new(FontData::from_static(include_bytes!("../assets/ui/WantedSans-Bold.ttf"))));
+    fonts.families.insert(FontFamily::Name("wanted-medium".into()), vec!["wanted-medium".into()]);
+    fonts.families.insert(FontFamily::Name("wanted-bold".into()), vec!["wanted-bold".into()]);
     fonts.families.entry(FontFamily::Proportional).or_default().insert(0, "wanted-sans".into());
     ctx.set_fonts(fonts);
+    use interface::layout::{CONTROL_RADIUS, DIALOG_PADDING, DIALOG_RADIUS, Palette};
     for theme in [egui::Theme::Dark, egui::Theme::Light] {
         let mut style = (*ctx.style_of(theme)).clone();
-        let dark = theme == egui::Theme::Dark;
-        let rgb = egui::Color32::from_rgb;
-        let (canvas, surface, field, hovered, active, border, text) = if dark {
-            (rgb(16, 19, 24), rgb(23, 27, 34), rgb(29, 34, 42), rgb(39, 46, 57), rgb(34, 55, 85), rgb(45, 53, 65), rgb(231, 237, 246))
-        } else {
-            (rgb(246, 248, 251), rgb(255, 255, 255), rgb(250, 251, 253), rgb(239, 243, 249), rgb(225, 235, 251), rgb(222, 228, 238), rgb(31, 42, 59))
-        };
-        let accent = if dark { rgb(106, 170, 255) } else { rgb(34, 102, 215) };
+        let palette = Palette::new(theme == egui::Theme::Dark);
         style.spacing.item_spacing = egui::vec2(interface::layout::SPACE, interface::layout::SPACE);
         style.spacing.button_padding = egui::vec2(12.0, 6.0);
         style.spacing.interact_size.y = interface::layout::CONTROL;
-        style.spacing.window_margin = egui::Margin::same(24);
-        style.visuals.panel_fill = canvas;
-        style.visuals.window_fill = surface;
-        style.visuals.extreme_bg_color = field;
-        style.visuals.faint_bg_color = if dark { rgb(28, 33, 42) } else { rgb(245, 247, 251) };
+        style.spacing.window_margin = egui::Margin::same(DIALOG_PADDING);
+        style.visuals.window_corner_radius = egui::CornerRadius::same(DIALOG_RADIUS);
+        style.visuals.menu_corner_radius = egui::CornerRadius::same(CONTROL_RADIUS);
+        style.visuals.panel_fill = palette.canvas;
+        style.visuals.window_fill = palette.surface;
+        style.visuals.window_stroke = egui::Stroke::new(1.0, palette.border);
+        style.visuals.extreme_bg_color = palette.inset;
+        style.visuals.text_edit_bg_color = Some(palette.field);
+        style.visuals.faint_bg_color = palette.inset;
         style.visuals.override_text_color = None;
-        style.visuals.widgets.noninteractive.fg_stroke.color = text;
-        style.visuals.widgets.inactive.fg_stroke.color = text;
-        style.visuals.widgets.hovered.fg_stroke.color = text;
-        style.visuals.widgets.active.fg_stroke.color = text;
-        style.visuals.widgets.inactive.bg_fill = field;
-        style.visuals.widgets.inactive.weak_bg_fill = field;
-        style.visuals.widgets.hovered.bg_fill = hovered;
-        style.visuals.widgets.hovered.weak_bg_fill = hovered;
-        style.visuals.widgets.active.bg_fill = active;
-        style.visuals.widgets.active.weak_bg_fill = active;
-        style.visuals.widgets.noninteractive.bg_stroke = egui::Stroke::new(1.0, border);
-        style.visuals.widgets.inactive.bg_stroke = egui::Stroke::new(1.0, border);
-        style.visuals.widgets.hovered.bg_stroke = egui::Stroke::new(1.0, egui::Color32::from_gray(if dark { 0x70 } else { 0xb2 }));
-        style.visuals.widgets.active.bg_stroke = egui::Stroke::new(1.0, accent);
-        style.visuals.widgets.inactive.corner_radius = egui::CornerRadius::same(6);
-        style.visuals.widgets.hovered.corner_radius = egui::CornerRadius::same(6);
-        style.visuals.widgets.active.corner_radius = egui::CornerRadius::same(6);
+        let widgets = &mut style.visuals.widgets;
+        for (widget, fill, stroke) in [
+            (&mut widgets.noninteractive, palette.inset, palette.border),
+            (&mut widgets.inactive, palette.field, palette.border),
+            (&mut widgets.hovered, palette.hover, palette.accent),
+            (&mut widgets.active, palette.pressed, palette.accent),
+            (&mut widgets.open, palette.hover, palette.accent),
+        ] {
+            widget.corner_radius = egui::CornerRadius::same(CONTROL_RADIUS);
+            widget.fg_stroke.color = palette.text;
+            widget.bg_fill = fill;
+            widget.weak_bg_fill = fill;
+            widget.bg_stroke = egui::Stroke::new(1.0, stroke);
+            widget.expansion = 0.0;
+        }
         style.text_styles.insert(egui::TextStyle::Body, egui::FontId::proportional(14.0));
-        style.text_styles.insert(egui::TextStyle::Button, egui::FontId::proportional(14.0));
+        style.text_styles.insert(egui::TextStyle::Button, figma_font(14.0, false));
+        style.text_styles.insert(egui::TextStyle::Heading, figma_font(24.0, true));
         style.text_styles.insert(egui::TextStyle::Small, egui::FontId::proportional(12.0));
-        style.visuals.selection.bg_fill = if dark { rgb(31, 48, 72) } else { rgb(229, 239, 255) };
-        style.visuals.selection.stroke = egui::Stroke::new(1.0, text);
-        style.visuals.hyperlink_color = accent;
+        style.visuals.selection.bg_fill = palette.selection;
+        style.visuals.selection.stroke = egui::Stroke::new(1.0, palette.text);
+        style.visuals.weak_text_color = Some(palette.muted);
+        style.visuals.hyperlink_color = palette.accent;
+        style.visuals.warn_fg_color = palette.warning;
+        style.visuals.error_fg_color = palette.danger;
         ctx.set_style_of(theme, style);
     }
     Ok(())
+}
+
+fn figma_font(size: f32, bold: bool) -> egui::FontId {
+    egui::FontId::new(size, FontFamily::Name(if bold { "wanted-bold" } else { "wanted-medium" }.into()))
+}
+
+fn window_resize_direction(rect: egui::Rect, pos: egui::Pos2) -> Option<egui::ResizeDirection> {
+    if !rect.contains(pos) {
+        return None;
+    }
+    let left = pos.x < rect.left() + 6.0;
+    let right = pos.x > rect.right() - 6.0;
+    let top = pos.y < rect.top() + 6.0;
+    let bottom = pos.y > rect.bottom() - 6.0;
+    match (left, right, top, bottom) {
+        (true, _, true, _) => Some(egui::ResizeDirection::NorthWest),
+        (_, true, true, _) => Some(egui::ResizeDirection::NorthEast),
+        (true, _, _, true) => Some(egui::ResizeDirection::SouthWest),
+        (_, true, _, true) => Some(egui::ResizeDirection::SouthEast),
+        (true, _, _, _) => Some(egui::ResizeDirection::West),
+        (_, true, _, _) => Some(egui::ResizeDirection::East),
+        (_, _, true, _) => Some(egui::ResizeDirection::North),
+        (_, _, _, true) => Some(egui::ResizeDirection::South),
+        _ => None,
+    }
+}
+
+fn handle_window_resize(ctx: &egui::Context) {
+    let (pointer, pressed, maximized) =
+        ctx.input(|input| (input.pointer.hover_pos(), input.pointer.primary_pressed(), input.viewport().maximized.unwrap_or(false)));
+    if maximized {
+        return;
+    }
+    if let Some(direction) = pointer.and_then(|pos| window_resize_direction(ctx.content_rect(), pos)) {
+        let cursor = match direction {
+            egui::ResizeDirection::North | egui::ResizeDirection::South => egui::CursorIcon::ResizeVertical,
+            egui::ResizeDirection::East | egui::ResizeDirection::West => egui::CursorIcon::ResizeHorizontal,
+            egui::ResizeDirection::NorthWest | egui::ResizeDirection::SouthEast => egui::CursorIcon::ResizeNwSe,
+            egui::ResizeDirection::NorthEast | egui::ResizeDirection::SouthWest => egui::CursorIcon::ResizeNeSw,
+        };
+        ctx.set_cursor_icon(cursor);
+        if pressed {
+            ctx.send_viewport_cmd(egui::ViewportCommand::BeginResize(direction));
+        }
+    }
+}
+
+#[cfg(test)]
+mod window_tests {
+    use super::*;
+
+    #[test]
+    fn borderless_window_has_resize_edges_and_corners() {
+        let rect = egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(550.0, 558.0));
+        assert_eq!(window_resize_direction(rect, egui::pos2(1.0, 1.0)), Some(egui::ResizeDirection::NorthWest));
+        assert_eq!(window_resize_direction(rect, egui::pos2(549.0, 557.0)), Some(egui::ResizeDirection::SouthEast));
+        assert_eq!(window_resize_direction(rect, egui::pos2(275.0, 1.0)), Some(egui::ResizeDirection::North));
+        assert_eq!(window_resize_direction(rect, rect.center()), None);
+    }
 }
 
 fn path_row(ui: &mut egui::Ui, label: &str, value: &mut String) -> bool {
@@ -96,7 +159,10 @@ fn section_title(ui: &mut egui::Ui, title: &str) {
 }
 
 fn primary_button(label: &str) -> egui::Button<'_> {
-    egui::Button::new(egui::RichText::new(label).strong().color(egui::Color32::WHITE)).fill(egui::Color32::from_rgb(39, 106, 224))
+    egui::Button::new(egui::RichText::new(label).strong().color(interface::layout::ON_PRIMARY))
+        .fill(interface::layout::PRIMARY_FILL)
+        .stroke(egui::Stroke::NONE)
+        .corner_radius(interface::layout::CONTROL_RADIUS)
 }
 
 #[derive(Clone, Copy)]
@@ -116,25 +182,13 @@ fn range_bar(ui: &mut egui::Ui, start: &mut i64, end: &mut i64, total: i64, work
     let x = |frame: i64| left + width * (frame.clamp(0, total) as f32 / total as f32);
     let center = rect.center().y;
     let painter = ui.painter();
-    let dark = ui.visuals().dark_mode;
-    painter.rect_filled(
-        egui::Rect::from_min_max(egui::pos2(left, center - 5.0), egui::pos2(right, center + 5.0)),
-        5.0,
-        egui::Color32::from_gray(if dark { 67 } else { 220 }),
-    );
-    painter.rect_filled(
-        egui::Rect::from_min_max(egui::pos2(x(work.0), center - 5.0), egui::pos2(x(work.1), center + 5.0)),
-        5.0,
-        egui::Color32::from_gray(if dark { 110 } else { 180 }),
-    );
-    painter.rect_filled(
-        egui::Rect::from_min_max(egui::pos2(x(*start), center - 5.0), egui::pos2(x(*end), center + 5.0)),
-        5.0,
-        egui::Color32::from_rgb(89, 152, 242),
-    );
+    let palette = interface::layout::Palette::new(ui.visuals().dark_mode);
+    painter.rect_filled(egui::Rect::from_min_max(egui::pos2(left, center - 5.0), egui::pos2(right, center + 5.0)), 5.0, palette.inset);
+    painter.rect_filled(egui::Rect::from_min_max(egui::pos2(x(work.0), center - 5.0), egui::pos2(x(work.1), center + 5.0)), 5.0, palette.border);
+    painter.rect_filled(egui::Rect::from_min_max(egui::pos2(x(*start), center - 5.0), egui::pos2(x(*end), center + 5.0)), 5.0, interface::layout::PRIMARY_FILL);
     for frame in [*start, *end] {
         painter.circle_filled(egui::pos2(x(frame), center), 9.0, egui::Color32::WHITE);
-        painter.circle_stroke(egui::pos2(x(frame), center), 9.0, egui::Stroke::new(2.0, egui::Color32::from_rgb(39, 106, 224)));
+        painter.circle_stroke(egui::pos2(x(frame), center), 9.0, egui::Stroke::new(2.0, interface::layout::PRIMARY_FILL));
     }
     if (response.drag_started() || response.clicked())
         && let Some(pointer) = response.interact_pointer_pos()
@@ -156,6 +210,7 @@ fn range_bar(ui: &mut egui::Ui, start: &mut i64, end: &mut i64, total: i64, work
 }
 
 struct App {
+    show_welcome: bool,
     #[cfg(test)]
     settings_in_memory: bool,
     queue_active: Option<u64>,
@@ -243,6 +298,7 @@ impl App {
         let catalog_path = settings.project.clone();
         let catalog_changed = (!catalog_path.is_empty()).then(Instant::now);
         Self {
+            show_welcome: false,
             #[cfg(test)]
             settings_in_memory: false,
             queue_active: None,
@@ -527,7 +583,7 @@ impl App {
             },
             project: PathBuf::from(&s.project),
             cli: PathBuf::from(&s.cli),
-            output: s.frame_output(),
+            output: PathBuf::new(),
             comp: s.comp.clone(),
             address: if s.host { s.host_address.clone() } else { s.client_address.clone() },
             token: s.token.clone(),
@@ -550,14 +606,6 @@ impl App {
         self.textures.clear();
         self.inspected = None;
         if self.settings.host {
-            let output = self.settings.frame_output();
-            if output.is_absolute()
-                && !output.exists()
-                && let Err(error) = std::fs::create_dir_all(&output)
-            {
-                self.last_error = format!("프레임 저장 폴더 만들기: {error}");
-                return;
-            }
             let missing = self.missing_host_settings();
             if !missing.is_empty() {
                 self.last_error = format!("호스트 설정을 완료하세요: {}", missing.join(", "));
@@ -589,7 +637,11 @@ impl App {
         self.stop = Arc::new(AtomicBool::new(false));
         self.stopping = false;
         if self.settings.host {
-            self.state.lock().unwrap_or_else(std::sync::PoisonError::into_inner).queue_session = self.queue_active.is_some();
+            {
+                let mut state = self.state.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+                state.queue_session = self.queue_active.is_some();
+                state.final_status = "프로젝트와 소스를 준비하고 있습니다…".into();
+            }
             let (sender, receiver) = mpsc::channel();
             self.pending_config = Some(config.clone());
             self.pending_start = Some(receiver);
@@ -623,7 +675,9 @@ impl App {
                 self.job = Some(job);
                 self.running = true;
                 let pending_config = self.pending_config.take();
-                if self.settings.local_worker
+                if self.stop.load(Ordering::Relaxed) {
+                    self.stopping = true;
+                } else if self.settings.local_worker
                     && let Some(mut local) = pending_config
                 {
                     let port = local.address.rsplit_once(':').map(|(_, port)| port).unwrap_or("9778");
@@ -634,10 +688,23 @@ impl App {
                 }
             }
             Err(e) => {
-                self.last_error = e.clone();
                 self.pending_config = None;
-                if self.queue_active.is_some() {
-                    self.fail_queued(e);
+                if self.stop.load(Ordering::Relaxed) {
+                    if let Some(id) = self.queue_active.take()
+                        && let Some(task) = self.settings.queue.iter_mut().find(|task| task.id == id)
+                    {
+                        task.status = queue::Status::Interrupted;
+                        task.detail = "호스트 준비가 취소되었습니다. 재대기하면 기존 프레임을 다시 확인합니다.".into();
+                    }
+                    self.queue_automatic = false;
+                    self.stopping = false;
+                    self.last_error.clear();
+                    self.save_settings();
+                } else {
+                    self.last_error = e.clone();
+                    if self.queue_active.is_some() {
+                        self.fail_queued(e);
+                    }
                 }
             }
         }
@@ -701,6 +768,7 @@ impl App {
 
 impl eframe::App for App {
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
+        handle_window_resize(ui.ctx());
         ui.ctx().request_repaint_after(Duration::from_millis(500));
         self.poll_engine_update();
         self.poll_start();
@@ -738,7 +806,7 @@ impl eframe::App for App {
         {
             self.start_discovery();
         }
-        if self.stopping {
+        if self.stopping && self.pending_start.is_none() {
             let connected = farm::progress_snapshot(&self.state).2;
             let state = self.state.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
             let host_stopped = !self.settings.host || (!state.coordinator_active && (!state.assembly_started || state.final_result.is_some()));
@@ -750,9 +818,15 @@ impl eframe::App for App {
         }
         self.poll_queue();
         let before = self.settings.clone();
-        self.draw_interface(ui);
+        interface::theme_transition::advance(ui, &mut self.settings.theme, self.settings.reduced_motion);
+        if self.show_welcome {
+            self.draw_welcome(ui);
+        } else {
+            self.draw_interface(ui);
+        }
         self.update_ui(ui);
         self.engine_update_ui(ui);
+        interface::theme_transition::paint(ui.ctx(), self.settings.reduced_motion);
         if self.last_error != self.last_logged_error {
             if !self.last_error.is_empty() && !self.last_error.starts_with("클라이언트 오류:") {
                 self.state.lock().unwrap_or_else(std::sync::PoisonError::into_inner).note(format!("화면 오류: {}", self.last_error));
@@ -789,16 +863,18 @@ fn main() {
     let options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
             .with_title("EffectCraft Render Farm")
+            .with_decorations(false)
             .with_icon(icon)
-            .with_inner_size([1440.0, 940.0])
-            .with_min_inner_size([560.0, 520.0]),
+            .with_inner_size([550.0, 558.0])
+            .with_min_inner_size([550.0, 520.0]),
+        centered: true,
         ..Default::default()
     };
     if let Err(e) = eframe::run_native(
         "EffectCraft Render Farm",
         options,
         Box::new(move |cc| {
-            let mut app = App::default();
+            let mut app = App { show_welcome: true, ..App::default() };
             app.settings.cli = installation.cli.display().to_string();
             app.engine_updater.check(installation.cli.clone());
             app.state.lock().unwrap_or_else(std::sync::PoisonError::into_inner).note(format!("설치된 EffectCraft 감지: {}", installation.root.display()));

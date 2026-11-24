@@ -1,7 +1,7 @@
 use super::*;
 
 fn version_comparison(ui: &mut egui::Ui, current: &str, target: &str) {
-    egui::Frame::new().fill(secondary(ui)).corner_radius(8).inner_margin(layout::PADDING).show(ui, |ui| {
+    egui::Frame::new().fill(secondary(ui)).corner_radius(layout::INSET_RADIUS).inner_margin(layout::PADDING).show(ui, |ui| {
         ui.set_width(ui.available_width());
         ui.columns(2, |columns| {
             caption(&mut columns[0], "이 PC의 버전");
@@ -25,7 +25,10 @@ impl App {
         let mut consent = false;
         let mut cancel = false;
         let mut close = false;
-        let response = egui::Modal::new(egui::Id::new("effectcraft-update")).frame(card(ui.ctx())).show(ui.ctx(), |ui| {
+        let ctx = ui.ctx();
+        let (modal, reveal) = motion::opening_modal(ctx, egui::Id::new("effectcraft-update"), self.settings.reduced_motion, card(ctx));
+        let response = modal.show(ctx, |ui| {
+            ui.multiply_opacity(reveal);
             ui.set_width((ui.ctx().content_rect().width() - 88.0).clamp(280.0, 460.0));
             close = dialog_header(ui, "EffectCraft 업데이트", "업데이트 창 닫기");
             caption(ui, "같은 버전으로 맞추면 함께 렌더링할 수 있습니다.");
@@ -50,12 +53,12 @@ impl App {
                     caption(ui, "공식 설치 파일을 자동으로 받아 설치 프로그램을 실행합니다.");
                     if pending {
                         ui.horizontal_wrapped(|ui| {
-                            ui.spinner();
+                            motion::busy_indicator(ui);
                             ui.label("진행 중인 작업을 마친 뒤 업데이트합니다.");
                         });
                     } else if installing {
                         ui.horizontal_wrapped(|ui| {
-                            ui.spinner();
+                            motion::busy_indicator(ui);
                             ui.label("다운로드 및 설치 진행 중");
                         });
                         caption(
@@ -126,7 +129,10 @@ impl App {
         let Some(release) = self.updater.available.clone() else { return };
         let mut consent = false;
         let mut close = false;
-        let response = egui::Modal::new(egui::Id::new("update-consent")).frame(card(ui.ctx())).show(ui.ctx(), |ui| {
+        let ctx = ui.ctx();
+        let (modal, reveal) = motion::opening_modal(ctx, egui::Id::new("update-consent"), self.settings.reduced_motion, card(ctx));
+        let response = modal.show(ctx, |ui| {
+            ui.multiply_opacity(reveal);
             ui.set_width((ui.ctx().content_rect().width() - 88.0).clamp(280.0, 460.0));
             close = dialog_header(ui, "Render Farm 업데이트", "업데이트 창 닫기");
             caption(ui, "연결할 모든 PC의 Render Farm을 같은 버전으로 맞추세요.");
