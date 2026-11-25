@@ -11,7 +11,7 @@ import { NodesPage, SettingsPage, UpdateDialog, type SettingsTab } from "./setti
 import { ImportDialog, QueuePage, TaskDialog } from "./tasks";
 import { Welcome, WorkspaceShell } from "./workspace";
 import { transitionView, type ChangeTheme } from "./motion";
-import { cornerRadius } from "./window-geometry.json";
+import { applyWindowGeometry, scheduleWindowCornerColor } from "./window-geometry";
 import brand from "../../assets/app-icon/farm-256.png";
 import "./styles.css";
 import "./reference.css";
@@ -113,6 +113,7 @@ function App() {
       root.classList.toggle("dark", dark);
       root.classList.toggle("light", !dark);
       root.dataset.theme = next;
+      scheduleWindowCornerColor();
     };
     if (!root.dataset.theme || !anchor) {
       apply();
@@ -267,5 +268,5 @@ function SessionBar({ data, act, navigate, closing }: { data: Snapshot; act: Act
 }
 
 const root = document.getElementById("root");
-document.documentElement.style.setProperty("--window-radius", `${cornerRadius}px`);
+applyWindowGeometry();
 if (root) createRoot(root).render(<App />);

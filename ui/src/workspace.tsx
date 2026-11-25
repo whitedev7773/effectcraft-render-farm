@@ -75,10 +75,12 @@ function WindowButtons({ control, maximized, compact }: WindowProps & { compact?
   </div>;
 }
 
-function DragRegion({ control, className, canMaximize }: { control: WindowProps["control"]; className?: string; canMaximize?: boolean }) {
-  return <div aria-hidden="true" className={className} onPointerDown={(event) => {
-    if (event.button === 0) control("drag");
-  }} onDoubleClick={() => { if (canMaximize) control("maximize"); }} />;
+function workspaceDragTarget(target: EventTarget) {
+  if (!(target instanceof Element)) return false;
+  const area = target.closest("[data-window-drag]");
+  if (!area) return false;
+  if (area.getAttribute("data-window-drag") === "self") return target === area;
+  return !target.closest("button, a, input, select, textarea, [contenteditable], [role='button']");
 }
 
 export function ResizeEdges({ control, maximized }: WindowProps) {
@@ -93,7 +95,9 @@ export function Welcome({ data, act, chooseRole, showUpdate, changeTheme, contro
   data: Snapshot; act: Action; chooseRole: (host: boolean) => void; showUpdate: () => void;
 } & WindowProps & Pick<ThemeProps, "changeTheme">) {
   return <div className="reference-welcome" data-maximized={maximized || undefined}>
-    <DragRegion className="welcome-drag" control={control} />
+    <div aria-hidden="true" className="welcome-drag" onPointerDown={(event) => {
+      if (event.button === 0) control("drag");
+    }} />
     <div className="welcome-window-controls"><WindowButtons control={control} maximized={maximized} compact /></div>
     <header className="welcome-brand">
       <AppIcon size={96} />
@@ -143,9 +147,13 @@ export function WorkspaceShell({ data, page, navigate, homeAction, showFarmUpdat
     { id: "settings", label: "설정", image: settings },
   ] as const;
   const active = page === "queue_tools" ? "queue" : page === "logs" || (page === "nodes" && data.settings.host) ? "settings" : page;
-  return <div className="reference-workspace" data-maximized={maximized || undefined}>
-    <header className="reference-topbar">
-      <DragRegion control={control} canMaximize className="workspace-drag" />
+  return <div className="reference-workspace" data-maximized={maximized || undefined}
+    onPointerDown={(event) => {
+      if (event.isPrimary && event.button === 0 && workspaceDragTarget(event.target)) control("drag");
+    }} onDoubleClick={(event) => {
+      if (event.target instanceof Element && event.target.closest(".reference-topbar") && workspaceDragTarget(event.target)) control("maximize");
+    }}>
+    <header className="reference-topbar" data-window-drag="area">
       <div className="reference-top-left">
         <Button variant="outline" className="reference-home" onPress={homeAction} aria-label="시작 화면" isDisabled={data.locked || Boolean(data.import)}>
           <Graphic src={back} /><Graphic src={home} />
@@ -159,8 +167,8 @@ export function WorkspaceShell({ data, page, navigate, homeAction, showFarmUpdat
         <WindowButtons control={control} maximized={maximized} />
       </div>
     </header>
-    <div className="reference-body">
-      <Surface className="reference-navigation">
+    <div className="reference-body" data-window-drag="self">
+      <Surface className="reference-navigation" data-window-drag="self">
         <nav aria-label="작업 공간 메뉴">
           {tabs.map(({ id, label, image }) => <div key={id} className="reference-nav-item">
             {id === "settings" && <Separator />}

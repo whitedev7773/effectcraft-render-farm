@@ -87,6 +87,7 @@ body {
   color: var(--foreground); font: 400 14px/1.5 var(--font-sans); letter-spacing: var(--letter-spacing);
   overflow: hidden; clip-path: inset(0 round var(--window-radius));
 }
+body:has(.reference-welcome, .startup) { clip-path: var(--welcome-window-clip); }
 body:has(:is(.reference-welcome, .reference-workspace)[data-maximized]) { clip-path: none; }
 button, input { font-family: inherit; }
 button svg { flex: none; }

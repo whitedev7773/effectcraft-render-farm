@@ -86,7 +86,6 @@
 
 .reference-workspace { display: grid; grid-template-rows: 52px minmax(0, 1fr); }
 .reference-topbar { position: relative; display: flex; justify-content: space-between; gap: 10px; align-items: center; padding: 0 10px; }
-.workspace-drag { position: absolute; inset: 3px 5px 0; }
 .reference-top-left, .reference-top-end { position: relative; display: flex; align-items: center; gap: 8px; z-index: 1; pointer-events: none; }
 .reference-top-left button, .reference-top-end button { pointer-events: auto; }
 .reference-top-end { gap: 10px; }

@@ -11,6 +11,10 @@ use tao::window::WindowBuilder;
 use wry::http::{Request, Response, StatusCode};
 
 #[cfg(windows)]
+mod window_corners;
+#[cfg(windows)]
+mod window_shadow;
+#[cfg(windows)]
 mod window_shape;
 
 include!(concat!(env!("OUT_DIR"), "/web_assets.rs"));
@@ -78,36 +82,96 @@ struct RequestMessage {
 #[derive(Deserialize)]
 #[serde(tag = "action", rename_all = "snake_case")]
 enum Command {
-    Snapshot { logs: bool },
+    Snapshot {
+        logs: bool,
+    },
     DismissError,
     OpenProject,
     CloseImport,
-    SelectComposition { index: usize },
-    ConfigureImport { options: Box<TaskOptions>, commit: bool, preview: bool },
-    PickOutput { suggested: String },
+    SelectComposition {
+        index: usize,
+    },
+    ConfigureImport {
+        options: Box<TaskOptions>,
+        commit: bool,
+        preview: bool,
+    },
+    PickOutput {
+        suggested: String,
+    },
     PickFfmpeg,
-    SaveTask { id: u64, options: Box<TaskOptions>, retry: bool },
-    RemoveTask { id: u64 },
-    RemoveTasks { ids: Vec<u64> },
-    MoveTask { id: u64, direction: i8 },
-    QueueView { cards: bool },
-    SetConnection { host: bool, address: String, token: String, local_worker: bool },
-    SetAppearance { theme: settings::Theme, reduced_motion: bool, check_updates: bool },
-    SetRender { render: settings::RenderOptions, gpu: bool, distribution: Distribution, chunk_frames: i64, chunk_percent: f64, max_workers: usize },
+    SaveTask {
+        id: u64,
+        options: Box<TaskOptions>,
+        retry: bool,
+    },
+    RemoveTask {
+        id: u64,
+    },
+    RemoveTasks {
+        ids: Vec<u64>,
+    },
+    MoveTask {
+        id: u64,
+        direction: i8,
+    },
+    QueueView {
+        cards: bool,
+    },
+    SetConnection {
+        host: bool,
+        address: String,
+        token: String,
+        local_worker: bool,
+    },
+    SetAppearance {
+        theme: settings::Theme,
+        reduced_motion: bool,
+        check_updates: bool,
+    },
+    SetRender {
+        render: settings::RenderOptions,
+        gpu: bool,
+        distribution: Distribution,
+        chunk_frames: i64,
+        chunk_percent: f64,
+        max_workers: usize,
+    },
     Discover,
     Connect,
     Disconnect,
     CloseWhenIdle,
-    Window { operation: WindowOperation },
+    Window {
+        operation: WindowOperation,
+    },
+    WindowCornerColor {
+        color: [u8; 3],
+        #[cfg(windows)]
+        reveal: Option<window_corners::CornerReveal>,
+    },
     Render,
-    WorkerParticipation { id: u64, enabled: bool },
-    Inspect { frame: i64, render: bool },
+    WorkerParticipation {
+        id: u64,
+        enabled: bool,
+    },
+    Inspect {
+        frame: i64,
+        render: bool,
+    },
     CheckEngine,
     CheckApp,
-    UpdatePrompt { engine: bool, open: bool },
+    UpdatePrompt {
+        engine: bool,
+        open: bool,
+    },
     CancelEngineUpdate,
-    InstallUpdate { engine: bool },
-    OpenLocation { location: Location, task: Option<u64> },
+    InstallUpdate {
+        engine: bool,
+    },
+    OpenLocation {
+        location: Location,
+        task: Option<u64>,
+    },
 }
 
 #[derive(Deserialize)]
@@ -398,6 +462,9 @@ impl App {
             Command::Disconnect => self.disconnect(),
             Command::CloseWhenIdle => self.disconnect(),
             Command::Window { .. } => {}
+            Command::WindowCornerColor { color, .. } => {
+                let _ = color;
+            }
             Command::Render => self.begin_current_render(),
             Command::WorkerParticipation { id, enabled } => {
                 if !self.settings.host || self.stopping {
@@ -763,6 +830,8 @@ pub fn run() -> Result<(), Box<dyn std::error::Error>> {
         shape
     };
     window.set_visible(true);
+    #[cfg(windows)]
+    window_shape.update(&window, true);
     let mut next_tick = Instant::now();
     let mut close_when_idle = false;
     event_loop.run(move |event, _, flow| {
@@ -771,21 +840,23 @@ pub fn run() -> Result<(), Box<dyn std::error::Error>> {
             next_tick = Instant::now() + Duration::from_millis(150);
         }
         *flow = ControlFlow::WaitUntil(next_tick);
-        if app.updater.restarting {
-            *flow = ControlFlow::Exit;
-            return;
-        }
-        if close_when_idle && app.safe_to_close() {
-            app.save_settings();
+        let close_requested = matches!(
+            &event,
+            Event::WindowEvent { event: WindowEvent::CloseRequested, .. }
+                | Event::UserEvent(DesktopEvent::Request(RequestMessage { command: Command::Window { operation: WindowOperation::Close }, .. }))
+        );
+        if app.updater.restarting || ((close_when_idle || close_requested) && app.safe_to_close()) {
+            #[cfg(windows)]
+            window_shape.hide_for_close(&window);
+            if !app.updater.restarting {
+                app.save_settings();
+            }
             *flow = ControlFlow::Exit;
             return;
         }
         match event {
             Event::WindowEvent { event: WindowEvent::CloseRequested, .. } => {
-                if app.safe_to_close() {
-                    app.save_settings();
-                    *flow = ControlFlow::Exit;
-                } else if !close_when_idle {
+                if !close_when_idle {
                     let _ = webview.evaluate_script("window.dispatchEvent(new Event('farm:close-request'))");
                 }
             }
@@ -800,20 +871,31 @@ pub fn run() -> Result<(), Box<dyn std::error::Error>> {
                 let maximized = window.is_maximized();
                 let _ = webview.evaluate_script(&format!("window.dispatchEvent(new CustomEvent('farm:window-mode', {{detail:{maximized}}}))"));
             }
+            #[cfg(windows)]
+            Event::WindowEvent { event: WindowEvent::Moved(_) | WindowEvent::Focused(_), .. } => {
+                window_shape.update(&window, true);
+            }
             Event::UserEvent(DesktopEvent::Request(request)) => {
                 close_when_idle |= matches!(request.command, Command::CloseWhenIdle);
+                #[cfg(windows)]
+                if let Command::WindowCornerColor { color, reveal } = &request.command {
+                    window_shape.set_color(&window, *color, *reveal);
+                }
                 if let Command::Window { operation } = &request.command {
                     match operation {
-                        WindowOperation::Close if app.safe_to_close() => {
-                            app.save_settings();
-                            *flow = ControlFlow::Exit;
-                            return;
-                        }
                         WindowOperation::Close if !close_when_idle => {
                             let _ = webview.evaluate_script("window.dispatchEvent(new Event('farm:close-request'))");
                         }
                         WindowOperation::Close => {}
-                        mode => control_window(&window, *mode),
+                        mode => {
+                            control_window(&window, *mode);
+                            #[cfg(windows)]
+                            match mode {
+                                WindowOperation::Welcome => window_shape.set_welcome(&window, true),
+                                WindowOperation::Workspace => window_shape.set_welcome(&window, false),
+                                _ => {}
+                            }
+                        }
                     }
                 }
                 let payload = match app.handle(request.command, &media, &window) {

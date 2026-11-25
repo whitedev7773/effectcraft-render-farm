@@ -7,6 +7,7 @@ import { Minus, Plus, type LucideIcon } from "lucide-react";
 import { count, type Preview, type Task } from "./api";
 import emptyFrame from "../../assets/ui/figma/status-empty-broadcast.svg";
 import closeIcon from "../../assets/ui/figma/window-close.svg";
+import { followWindowCornerBackdrop, scheduleWindowCornerColor } from "./window-geometry";
 
 export function Graphic({ src, className = "" }: { src: string; className?: string }) {
   return <img src={src} alt="" draggable={false} className={`figma-graphic ${className}`} />;
@@ -147,6 +148,8 @@ export function Dialog({ title, description, children, footer, onClose, wide, lo
 }) {
   const [dismissing, setDismissing] = useState(false);
   const backdrop = useRef<HTMLDivElement>(null);
+  useEffect(() => followWindowCornerBackdrop(backdrop.current), [dismissing]);
+  useEffect(() => scheduleWindowCornerColor, []);
   const dismiss = () => { if (!locked) setDismissing(true); };
   const finishDismissal = useEffectEvent(async () => {
     try { if (!locked) await onClose(); }

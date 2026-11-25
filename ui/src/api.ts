@@ -59,6 +59,9 @@ export type Snapshot = {
   update: { target: string | null; body: string | null; prompt: boolean; status: string; busy: boolean; installing: boolean; bytes: number };
 };
 
+export type WindowCornerColor = [number, number, number];
+export type WindowCornerReveal = { from: WindowCornerColor; x: number; y: number; radius: number };
+
 export type Command =
   | { action: "snapshot"; logs: boolean }
   | { action: "dismiss_error" | "open_project" | "close_import" | "pick_ffmpeg" | "discover" |
@@ -79,6 +82,7 @@ export type Command =
   | { action: "update_prompt"; engine: boolean; open: boolean }
   | { action: "install_update"; engine: boolean }
   | { action: "window"; operation: WindowOperation }
+  | { action: "window_corner_color"; color: WindowCornerColor; reveal?: WindowCornerReveal }
   | { action: "open_location"; location: "engine_source" | "engine_release" | "farm_release" | "log_directory" | "output_directory" | "project_directory" | "frame_directory"; task?: number };
 
 export type Action = <T = null>(command: Command, success?: string) => Promise<T | undefined>;
