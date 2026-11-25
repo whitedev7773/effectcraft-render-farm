@@ -10,6 +10,9 @@ use tao::event_loop::{ControlFlow, EventLoopBuilder};
 use tao::window::WindowBuilder;
 use wry::http::{Request, Response, StatusCode};
 
+#[cfg(windows)]
+mod window_shape;
+
 include!(concat!(env!("OUT_DIR"), "/web_assets.rs"));
 
 const START_URL: &str = if cfg!(windows) { "http://farm-ui.localhost/" } else { "farm-ui://localhost/" };
@@ -704,15 +707,20 @@ pub fn run() -> Result<(), Box<dyn std::error::Error>> {
     let image = image::load_from_memory(include_bytes!("../assets/app-icon/farm-256.png"))?.to_rgba8();
     let (width, height) = image.dimensions();
     let icon = tao::window::Icon::from_rgba(image.into_raw(), width, height)?;
-    let window = WindowBuilder::new()
+    let window_builder = WindowBuilder::new()
         .with_title("EffectCraft Render Farm")
         .with_inner_size(LogicalSize::new(550.0, 558.0))
         .with_min_inner_size(LogicalSize::new(500.0, 500.0))
         .with_window_icon(Some(icon))
         .with_decorations(false)
         .with_transparent(true)
-        .with_visible(false)
-        .build(&event_loop)?;
+        .with_visible(false);
+    #[cfg(windows)]
+    let window_builder = {
+        use tao::platform::windows::WindowBuilderExtWindows;
+        window_builder.with_undecorated_shadow(false)
+    };
+    let window = window_builder.build(&event_loop)?;
     let media = Arc::new(Mutex::new(Media::default()));
     let protocol_media = media.clone();
     let ipc = event_loop.create_proxy();
@@ -748,6 +756,12 @@ pub fn run() -> Result<(), Box<dyn std::error::Error>> {
     #[cfg(not(target_os = "linux"))]
     let webview = builder.build(&window)?;
 
+    #[cfg(windows)]
+    let mut window_shape = {
+        let mut shape = window_shape::WindowShape::new(&window)?;
+        shape.update(&window, false);
+        shape
+    };
     window.set_visible(true);
     let mut next_tick = Instant::now();
     let mut close_when_idle = false;
@@ -780,7 +794,9 @@ pub fn run() -> Result<(), Box<dyn std::error::Error>> {
                     app.begin_project_import(path);
                 }
             }
-            Event::WindowEvent { event: WindowEvent::Resized(_), .. } => {
+            Event::WindowEvent { event: WindowEvent::Resized(_) | WindowEvent::ScaleFactorChanged { .. }, .. } => {
+                #[cfg(windows)]
+                window_shape.update(&window, true);
                 let maximized = window.is_maximized();
                 let _ = webview.evaluate_script(&format!("window.dispatchEvent(new CustomEvent('farm:window-mode', {{detail:{maximized}}}))"));
             }

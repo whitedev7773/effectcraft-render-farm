@@ -191,7 +191,7 @@ export function ImportDialog({ draft, act, done, nativeBusy }: { draft: ImportDr
   const options = edited ?? draft.options;
   const [sending, setSending] = useState(false);
   const locked = sending || draft.preview_busy;
-  const close = () => void act({ action: "close_import" });
+  const close = async () => { await act({ action: "close_import" }); };
   async function submit(commit: boolean) {
     setSending(true);
     const saved = await act({ action: "configure_import", options, commit, preview: !commit }, commit ? "작업을 대기열에 추가했습니다." : undefined);
@@ -199,8 +199,8 @@ export function ImportDialog({ draft, act, done, nativeBusy }: { draft: ImportDr
     if (commit && saved !== undefined) done();
   }
   return <Dialog title="프로젝트 추가" description={filename(draft.project)} wide locked={locked} onClose={close}
-    footer={<>
-      <Button variant="ghost" onPress={close} isDisabled={locked}>취소</Button>
+    footer={(dismiss) => <>
+      <Button variant="ghost" onPress={dismiss} isDisabled={locked}>취소</Button>
       <Button variant="primary" isDisabled={!comp || locked || !options.final_video.trim()} onPress={() => void submit(true)}>
         <Plus size={17} /> 대기열에 추가
       </Button>
@@ -252,14 +252,14 @@ export function TaskDialog({ task, act, close, active }: { task: Task; act: Acti
     else close();
   }
   if (confirm) return <Dialog title="작업을 제거할까요?" description={task.composition.name} locked={busy} onClose={() => setConfirm(false)}
-    footer={<><Button variant="secondary" isDisabled={busy} onPress={() => setConfirm(false)}>돌아가기</Button>
+    footer={(dismiss) => <><Button variant="secondary" isDisabled={busy} onPress={dismiss}>돌아가기</Button>
       <Button variant="danger" isDisabled={busy} onPress={() => void remove()}><Trash2 size={16} /> 제거</Button></>}>
     <p>대기열에서 이 항목을 제거합니다. 저장된 프레임과 MP4 파일은 보관됩니다.</p>
   </Dialog>;
   return <Dialog title={task.composition.name} description={filename(task.project)} onClose={close} wide locked={busy}
-    footer={<>
+    footer={(dismiss) => <>
       {!active && !isActive(task.status) && <Button variant="ghost" className="remove-button" isDisabled={busy} onPress={() => setConfirm(true)}><Trash2 size={16} /> 제거</Button>}
-      <Button variant="secondary" isDisabled={busy} onPress={close}>{editable ? "취소" : "닫기"}</Button>
+      <Button variant="secondary" isDisabled={busy} onPress={dismiss}>{editable ? "취소" : "닫기"}</Button>
       {editable && <Button variant="primary" isDisabled={busy} onPress={() => void save()}>{retry ? "저장 후 재대기" : "설정 저장"}</Button>}
     </>}>
     <div className="composition-summary">

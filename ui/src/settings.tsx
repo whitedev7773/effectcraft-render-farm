@@ -1,10 +1,11 @@
 import { Button, Chip, Separator, Spinner, Tabs, ToggleButton, ToggleButtonGroup } from "@heroui/react";
 import { ArrowDownToLine, ArrowUpRight, Check, Cpu, Eye, EyeOff, FolderCog, Globe2, Network, Radio, RefreshCw, Server, SunMoon, Terminal } from "lucide-react";
-import { useState } from "react";
+import { useRef, useState } from "react";
 import { sizeMiB, type Action, type Appearance, type Page, type RenderDefaults, type Snapshot, type Theme } from "./api";
 import { Choice, Dialog, Empty, Field, Graphic, IconButton, Notice, PageHeading, Panel, Toggle } from "./components";
 import { RenderFields } from "./tasks";
 import { WorkerList } from "./operations";
+import type { ChangeTheme } from "./motion";
 import serverIcon from "../../assets/ui/figma-welcome/server.svg";
 import nodeIcon from "../../assets/ui/figma-welcome/node.svg";
 import pcIcon from "../../assets/ui/figma/pc-display.svg";
@@ -100,8 +101,9 @@ function Discovery({ data, selectedHost, chooseHost }: { data: Snapshot; selecte
 
 export type SettingsTab = "appearance" | "render" | "about";
 
-export function SettingsPage({ data, act, showUpdate, navigate, tab, changeTab }: Props & {
+export function SettingsPage({ data, act, showUpdate, navigate, tab, changeTab, changeTheme }: Props & {
   showUpdate: (engine: boolean) => void; navigate: (page: Page) => void; tab: SettingsTab; changeTab: (tab: SettingsTab) => void;
+  changeTheme: ChangeTheme;
 }) {
   const s = data.settings;
   const renderKey = JSON.stringify([s.render, s.distribution, s.chunk_frames, s.chunk_percent, s.gpu, s.max_workers]);
@@ -117,19 +119,20 @@ export function SettingsPage({ data, act, showUpdate, navigate, tab, changeTab }
         <Tabs.Tab id="render"><Cpu size={16} /> 렌더 기본값<Tabs.Indicator /></Tabs.Tab>
         <Tabs.Tab id="about"><ArrowDownToLine size={16} /> 앱 및 업데이트<Tabs.Indicator /></Tabs.Tab>
       </Tabs.List></Tabs.ListContainer>
-      <Tabs.Panel id="appearance" className="tab-panel"><AppearanceForm data={data} act={act} /></Tabs.Panel>
+      <Tabs.Panel id="appearance" className="tab-panel"><AppearanceForm data={data} act={act} changeTheme={changeTheme} /></Tabs.Panel>
       <Tabs.Panel id="render" className="tab-panel"><RenderForm key={renderKey} data={data} act={act} /></Tabs.Panel>
       <Tabs.Panel id="about" className="tab-panel"><About data={data} act={act} showUpdate={showUpdate} /></Tabs.Panel>
     </Tabs>
   </div>;
 }
 
-function AppearanceForm({ data, act }: Props) {
+function AppearanceForm({ data, act, changeTheme }: Props & { changeTheme: ChangeTheme }) {
   const { theme, reduced_motion, check_updates } = data.settings;
+  const themeTrigger = useRef<HTMLButtonElement>(null);
   const save = (options: Partial<Appearance>) => void act({ action: "set_appearance", theme, reduced_motion, check_updates, ...options });
   return <Panel title="테마 및 동작" icon={SunMoon} className="appearance-panel">
     <div className="stack form-stack appearance-fields">
-      <Choice label="테마" value={theme} onChange={(value) => save({ theme: value as Theme })}
+      <Choice label="테마" value={theme} triggerRef={themeTrigger} onChange={(value) => changeTheme(value as Theme, themeTrigger.current)}
         options={[{ value: "dark", label: "다크" }, { value: "light", label: "라이트" }, { value: "system", label: "시스템 설정" }]} />
       <Toggle label="동작 줄이기" description="화면과 모달 전환에 사용되는 애니메이션을 줄입니다." enabled={reduced_motion} onChange={(value) => save({ reduced_motion: value })} />
       <Toggle label="Render Farm 업데이트 자동 확인" description="앱을 시작할 때 새 버전을 확인합니다." enabled={check_updates} onChange={(value) => save({ check_updates: value })} />
@@ -184,9 +187,9 @@ export function UpdateDialog({ data, act, engine, close }: Props & { engine: boo
   const checking = engine ? data.engine.checking : data.update.busy;
   return <Dialog title={engine ? "EffectCraft 업데이트" : "Render Farm 업데이트"} onClose={close} locked={installing}
     description={engine ? "렌더에 참여하는 PC의 엔진 버전을 맞추세요." : "업데이트를 설치한 뒤 앱을 다시 시작합니다."}
-    footer={<>
+    footer={(dismiss) => <>
       {queued ? <Button variant="secondary" onPress={() => void act({ action: "cancel_engine_update" })}>설치 요청 취소</Button> :
-        <Button variant="secondary" onPress={close} isDisabled={installing}>나중에</Button>}
+        <Button variant="secondary" onPress={dismiss} isDisabled={installing}>나중에</Button>}
       {!queued && !installing && <Button variant="primary" isDisabled={!data.windows || !update.target || checking || (engine ? data.update.busy : data.locked)}
         onPress={() => void act({ action: "install_update", engine })}>
         <ArrowDownToLine size={16} /> {data.locked && engine ? "연결 종료 후 설치" : engine ? "다운로드 및 설치" : "업데이트 및 재시작"}

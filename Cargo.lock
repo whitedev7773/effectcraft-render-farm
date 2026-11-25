@@ -540,7 +540,7 @@ dependencies = [
 
 [[package]]
 name = "effectcraft-farm"
-version = "0.13.0"
+version = "0.13.1"
 dependencies = [
  "craft-docpath",
  "effectcraft-color",
@@ -557,6 +557,7 @@ dependencies = [
  "sha2",
  "tao",
  "webbrowser",
+ "windows-sys 0.61.2",
  "winreg",
  "winresource",
  "wry",

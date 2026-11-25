@@ -1,0 +1,104 @@
+:root {
+  --motion-quick: 130ms;
+  --motion-panel: 210ms;
+  --motion-out: cubic-bezier(.2, .7, .25, 1);
+  --role-hover-offset: -2px;
+}
+
+/* Keep active input on the live UI while the browser presents the snapshots. */
+:root::view-transition { pointer-events: none; }
+
+/* HeroUI leaves the document out of view transitions by default. */
+:root[data-view-motion="theme"] { view-transition-name: root; }
+:root[data-view-motion="theme"]::view-transition-old(root),
+:root[data-view-motion="theme"]::view-transition-new(root) {
+  animation: none;
+  mix-blend-mode: normal;
+}
+:root[data-view-motion="theme"] :is(.dropdown__popover, .select__popover)[data-exiting] {
+  visibility: hidden;
+}
+
+:root[data-view-motion="page"] .reference-main { view-transition-name: farm-workspace; }
+:root::view-transition-group(farm-workspace) {
+  animation-duration: var(--motion-panel);
+  overflow: clip;
+}
+:root::view-transition-old(farm-workspace) {
+  animation: panel-leave var(--motion-quick) ease-in both;
+  mix-blend-mode: normal;
+}
+:root::view-transition-new(farm-workspace) {
+  animation: panel-enter var(--motion-panel) var(--motion-out) both;
+  mix-blend-mode: normal;
+}
+
+@keyframes panel-enter {
+  from { opacity: 0; transform: translateY(6px); }
+  to { opacity: 1; transform: none; }
+}
+@keyframes panel-leave {
+  to { opacity: 0; transform: translateY(-3px); }
+}
+@keyframes control-icon-in {
+  from { opacity: .45; transform: scale(.85) rotate(-12deg); }
+}
+
+.welcome-brand { animation: panel-enter 260ms var(--motion-out) both; }
+.welcome-roles { animation: panel-enter 240ms var(--motion-out) 24ms both; }
+.welcome-footer { animation: panel-enter 200ms var(--motion-out) 40ms both; }
+.reference-workspace > .reference-topbar,
+.reference-workspace > .reference-body,
+.farm-tabs .tab-panel { animation: panel-enter var(--motion-panel) var(--motion-out) both; }
+.theme-switch .figma-graphic { animation: control-icon-in 190ms var(--motion-out) both; }
+
+.welcome-role-card.card {
+  transition: translate var(--motion-panel) var(--motion-out), box-shadow var(--motion-panel) var(--motion-out);
+}
+.welcome-role-card:has(.welcome-role-button[data-hovered]:not([data-pressed])) {
+  translate: 0 var(--role-hover-offset);
+  box-shadow: 0 4px 10px color-mix(in srgb, var(--foreground) 10%, transparent);
+}
+.reference-nav-item .figma-graphic, .queue-inline-actions {
+  transition: opacity var(--motion-quick) var(--motion-out);
+}
+.reference-nav-item .button {
+  transition: background-color var(--motion-quick) var(--motion-out), color var(--motion-quick) var(--motion-out),
+    box-shadow var(--motion-panel) var(--motion-out), transform var(--motion-quick) var(--motion-out);
+}
+.reference-table-content td, .farm-table .table__row, .timeline > span {
+  transition: background-color var(--motion-quick) var(--motion-out);
+}
+
+.modal__container[data-entering]:has(.farm-dialog) { animation: dialog-enter var(--motion-panel) var(--motion-out); }
+.modal__backdrop[data-entering]:has(.farm-dialog) { animation-duration: var(--motion-panel); }
+.modal__backdrop[data-dismissing] .modal__container:has(.farm-dialog) {
+  animation: dialog-leave var(--motion-quick) ease-in both;
+}
+.modal__backdrop[data-dismissing] .farm-dialog {
+  pointer-events: none;
+}
+.modal__backdrop[data-dismissing]:has(.farm-dialog) { animation: backdrop-leave var(--motion-quick) ease-in both; }
+@keyframes dialog-enter {
+  from { opacity: 0; transform: translateY(7px) scale(.987); }
+  to { opacity: 1; transform: none; }
+}
+@keyframes dialog-leave {
+  to { opacity: 0; transform: translateY(4px) scale(.993); }
+}
+@keyframes backdrop-leave {
+  to { opacity: 0; }
+}
+
+@supports not (view-transition-name: farm-workspace) {
+  .reference-main > :is(.reference-queue-view, .workspace-page) { animation: panel-enter var(--motion-panel) var(--motion-out) both; }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  :root { --role-hover-offset: 0px; }
+  *, *::before, *::after { animation-delay: 0s !important; animation-duration: .01ms !important; transition-duration: .01ms !important; }
+}
+:root[data-reduce-motion] { --role-hover-offset: 0px; }
+:root[data-reduce-motion] *, :root[data-reduce-motion] *::before, :root[data-reduce-motion] *::after {
+  animation-delay: 0s !important; animation-duration: .01ms !important; transition-duration: .01ms !important;
+}

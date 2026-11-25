@@ -98,7 +98,7 @@ export function WorkerDialog({ worker, data, act, close }: Props & { worker: Wor
     ["현재 구간 경과", elapsed(worker.elapsed)],
   ];
   return <Dialog title={worker.label} description={worker.profile || undefined} onClose={close} wide
-    footer={<Button variant="secondary" onPress={close}>닫기</Button>}>
+    footer={(dismiss) => <Button variant="secondary" onPress={dismiss}>닫기</Button>}>
     <div className="actions"><WorkerStatus worker={worker} />{worker.range && <span className="muted">구간 {count(worker.range[0])}–{count(worker.range[1])}</span>}</div>
     <FrameImage preview={worker.preview} />
     <dl className="detail-grid">{values.map(([label, value]) => <div key={label}><dt>{label}</dt><dd>{value}</dd></div>)}</dl>

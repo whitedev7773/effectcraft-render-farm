@@ -17,9 +17,7 @@
   isolation: isolate;
   overflow: hidden;
   background: var(--background);
-  border-radius: var(--window-radius);
 }
-.reference-welcome[data-maximized], .reference-workspace[data-maximized] { border-radius: 0; }
 .reference-welcome {
   display: flex;
   flex-direction: column;
@@ -116,7 +114,7 @@
 .edge-south, .edge-south_west, .edge-south_east { bottom: 0; }
 .edge-west, .edge-north_west, .edge-south_west { left: 0; }
 .edge-east, .edge-north_east, .edge-south_east { right: 0; }
-.edge-north_west, .edge-south_east, .edge-north_east, .edge-south_west { width: 9px; height: 9px; }
+.edge-north_west, .edge-south_east, .edge-north_east, .edge-south_west { width: 14px; height: 14px; }
 .edge-north_west, .edge-south_east { cursor: nwse-resize; }
 .edge-north_east, .edge-south_west { cursor: nesw-resize; }
 

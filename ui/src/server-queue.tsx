@@ -144,7 +144,7 @@ export function ServerQueue({ data, act, navigate, openTask, openWorker }: Queue
       </Card>
     </div>
     {confirm && <Dialog title="선택한 작업을 제거할까요?" locked={removing} onClose={() => setConfirm(false)}
-      footer={<><Button variant="secondary" onPress={() => setConfirm(false)} isDisabled={removing}>취소</Button>
+      footer={(dismiss) => <><Button variant="secondary" onPress={dismiss} isDisabled={removing}>취소</Button>
         <Button variant="danger" onPress={() => void remove()} isDisabled={!removable || removing}>{selected.length}개 제거</Button></>}>
       <p>대기열에서 작업을 제거합니다. 저장된 프레임과 MP4 파일은 보관됩니다.</p>
     </Dialog>}

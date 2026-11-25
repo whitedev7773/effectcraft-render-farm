@@ -1,7 +1,8 @@
 import { Button, Card, Dropdown, Label, ProgressCircle, Separator, Surface, Tooltip } from "@heroui/react";
-import type { ComponentProps, CSSProperties, ReactNode } from "react";
+import { useRef, type ComponentProps, type CSSProperties, type ReactNode } from "react";
 import type { Action, Page, Snapshot, Theme, WindowOperation } from "./api";
 import { Graphic } from "./components";
+import type { ChangeTheme } from "./motion";
 import logoArt from "../../assets/ui/figma-welcome/icon-art.svg";
 import home from "../../assets/ui/figma/topbar-home.svg";
 import back from "../../assets/ui/figma/topbar-back.svg";
@@ -35,16 +36,17 @@ function PictureButton({ icon, label, ...props }: PictureButtonProps) {
   </Tooltip>;
 }
 
-type ThemeProps = { theme: Theme; changeTheme: (theme: Theme) => void };
+type ThemeProps = { theme: Theme; changeTheme: ChangeTheme };
 function ThemePicker({ theme, changeTheme }: ThemeProps) {
+  const trigger = useRef<HTMLButtonElement>(null);
   const themes = [
     { id: "light", name: "라이트", icon: sun },
     { id: "dark", name: "다크", icon: moon },
     { id: "system", name: "시스템 설정", icon: system },
   ] as const;
   return <Dropdown>
-    <Button variant="secondary" isIconOnly aria-label="화면 테마" className="reference-square theme-switch">
-      <Graphic src={themes.find(({ id }) => id === theme)?.icon ?? moon} />
+    <Button ref={trigger} variant="secondary" isIconOnly aria-label="화면 테마" className="reference-square theme-switch">
+      <Graphic key={theme} src={themes.find(({ id }) => id === theme)?.icon ?? moon} />
     </Button>
     <Dropdown.Popover>
       <Dropdown.Menu aria-label="화면 테마 선택" selectionMode="single" disallowEmptySelection selectedKeys={new Set([theme])}
@@ -52,7 +54,7 @@ function ThemePicker({ theme, changeTheme }: ThemeProps) {
           if (selected !== "all") {
             const key = [...selected][0];
             const target = themes.find(({ id }) => id === key);
-            if (target) changeTheme(target.id);
+            if (target) changeTheme(target.id, trigger.current);
           }
         }}>
         {themes.map(({ id, name, icon }) => <Dropdown.Item key={id} id={id} textValue={name}>
@@ -131,8 +133,8 @@ function RoleCard({ host = false, onPress }: { host?: boolean; onPress: () => vo
   </Card>;
 }
 
-export function WorkspaceShell({ data, page, navigate, homeAction, showUpdate, focus, children, changeTheme, control, maximized }: {
-  data: Snapshot; page: Page; navigate: (page: Page) => void; homeAction: () => void; showUpdate: () => void;
+export function WorkspaceShell({ data, page, navigate, homeAction, showFarmUpdate, focus, children, changeTheme, control, maximized }: {
+  data: Snapshot; page: Page; navigate: (page: Page) => void; homeAction: () => void; showFarmUpdate: () => void;
   focus: React.Ref<HTMLElement>; children: ReactNode;
 } & WindowProps & Pick<ThemeProps, "changeTheme">) {
   const tabs = [
@@ -140,7 +142,6 @@ export function WorkspaceShell({ data, page, navigate, homeAction, showUpdate, f
     { id: "monitor", label: "모니터", image: monitor },
     { id: "settings", label: "설정", image: settings },
   ] as const;
-  const hasUpdate = Boolean(data.engine.target || data.update.target || data.update.installing || data.engine.installing);
   const active = page === "queue_tools" ? "queue" : page === "logs" || (page === "nodes" && data.settings.host) ? "settings" : page;
   return <div className="reference-workspace" data-maximized={maximized || undefined}>
     <header className="reference-topbar">
@@ -152,8 +153,8 @@ export function WorkspaceShell({ data, page, navigate, homeAction, showUpdate, f
         <div className="reference-brand"><AppIcon size={20} /><span>EffectCraft Render Farm</span><span className="reference-version">R.{data.version}</span></div>
       </div>
       <div className="reference-top-end">
-        <PictureButton variant="primary" className="reference-square"
-          icon={update} label={hasUpdate ? "업데이트 보기" : "업데이트 상태"} onPress={showUpdate} />
+        {data.update.target && <PictureButton variant="primary" className="reference-square"
+          icon={update} label="Render Farm 업데이트 보기" onPress={showFarmUpdate} />}
         <ThemePicker theme={data.settings.theme} changeTheme={changeTheme} />
         <WindowButtons control={control} maximized={maximized} />
       </div>

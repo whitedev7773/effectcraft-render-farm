@@ -1,6 +1,7 @@
 import { Button, Spinner, Toast, toast } from "@heroui/react";
 import { CircleHelp, Play, Server, Square, X } from "lucide-react";
-import { useCallback, useEffect, useRef, useState } from "react";
+import { useCallback, useEffect, useLayoutEffect, useRef, useState } from "react";
+import { flushSync } from "react-dom";
 import { createRoot } from "react-dom/client";
 import { message, request, type Action, type Command, type Page, type Snapshot, type Theme, type WindowOperation } from "./api";
 import { Dialog, IconButton, Notice } from "./components";
@@ -9,9 +10,12 @@ import { ServerQueue } from "./server-queue";
 import { NodesPage, SettingsPage, UpdateDialog, type SettingsTab } from "./settings";
 import { ImportDialog, QueuePage, TaskDialog } from "./tasks";
 import { Welcome, WorkspaceShell } from "./workspace";
+import { transitionView, type ChangeTheme } from "./motion";
+import { cornerRadius } from "./window-geometry.json";
 import brand from "../../assets/app-icon/farm-256.png";
 import "./styles.css";
 import "./reference.css";
+import "./motion.css";
 
 function App() {
   const [welcome, setWelcome] = useState(true);
@@ -32,7 +36,10 @@ function App() {
   const picker = useRef(false);
   const choosingRole = useRef(false);
   const focus = useRef<HTMLElement>(null);
-  const dark = data?.settings.theme === "system" ? systemDark : data?.settings.theme === "dark";
+  const themeAnchor = useRef<{ theme: Theme; element: HTMLElement | null }>(null);
+  const theme = data?.settings.theme;
+  const reducedMotion = Boolean(data?.settings.reduced_motion);
+  const dark = theme === "system" ? systemDark : theme === "dark";
 
   const refresh = useCallback(async () => {
     if (picker.current) return;
@@ -43,11 +50,16 @@ function App() {
     setLoadError("");
   }, []);
 
-  const navigate = (next: Page, tab?: SettingsTab) => {
+  const navigate = (next: Page) => {
+    const shouldAnimate = !welcome && pageRef.current !== next && focus.current;
     pageRef.current = next;
-    if (next === "settings" && tab) setSettingsTab(tab);
-    setPage(next);
-    focus.current?.focus({ preventScroll: true });
+    const commit = () => {
+      if (pageRef.current !== next) return;
+      flushSync(() => setPage(next));
+      focus.current?.focus({ preventScroll: true });
+    };
+    if (shouldAnimate) transitionView(commit);
+    else commit();
     void refresh().catch(() => undefined);
   };
 
@@ -85,13 +97,30 @@ function App() {
     };
   }, []);
 
-  useEffect(() => {
+  useLayoutEffect(() => {
     const root = document.documentElement;
-    root.classList.toggle("dark", dark);
-    root.classList.toggle("light", !dark);
-    root.dataset.theme = dark ? "dark" : "light";
-    root.toggleAttribute("data-reduce-motion", Boolean(data?.settings.reduced_motion));
-  }, [dark, data?.settings.reduced_motion]);
+    root.toggleAttribute("data-reduce-motion", reducedMotion);
+    if (!theme) return;
+
+    const requested = themeAnchor.current?.theme === theme ? themeAnchor.current : null;
+    if (requested) themeAnchor.current = null;
+    const next = dark ? "dark" : "light";
+    if (root.dataset.theme === next) return;
+    const anchor = requested?.element?.isConnected ? requested.element : document.querySelector<HTMLElement>(".theme-switch");
+    let current = true;
+    const apply = () => {
+      if (!current) return;
+      root.classList.toggle("dark", dark);
+      root.classList.toggle("light", !dark);
+      root.dataset.theme = next;
+    };
+    if (!root.dataset.theme || !anchor) {
+      apply();
+      return;
+    }
+    const transition = transitionView(apply, anchor);
+    return () => { current = false; transition?.skipTransition(); };
+  }, [dark, reducedMotion, theme]);
 
   const act: Action = async <T,>(command: Command, success?: string) => {
     const choosing = ["open_project", "pick_ffmpeg", "pick_output"].includes(command.action);
@@ -124,13 +153,19 @@ function App() {
   const worker = data.workers.find((item) => item.id === workerId);
   const updateOpen = update ?? (data.engine.peer && data.engine.prompt && !data.import && !task && !worker && !inspect && !closeRequested ? "engine" : undefined);
   const showUpdate = (engine: boolean) => setUpdate(engine ? "engine" : "farm");
+  const showFarmUpdate = () => showUpdate(false);
   const closeUpdate = () => {
     if (updateOpen) void act({ action: "update_prompt", engine: updateOpen === "engine", open: false });
     setUpdate(undefined);
   };
 
-  const changeTheme = (theme: Theme) => void act({ action: "set_appearance", theme,
-    reduced_motion: data.settings.reduced_motion, check_updates: data.settings.check_updates });
+  const changeTheme: ChangeTheme = (next, element) => {
+    if (next === theme) return;
+    const pending = { theme: next, element };
+    themeAnchor.current = pending;
+    void act({ action: "set_appearance", theme: next, reduced_motion: reducedMotion, check_updates: data.settings.check_updates })
+      .then((saved) => { if (saved === undefined && themeAnchor.current === pending) themeAnchor.current = null; });
+  };
   const enterWorkspace = (start: Page) => {
     setWelcome(false);
     control("workspace");
@@ -153,11 +188,6 @@ function App() {
     setWelcome(true);
     control("welcome");
   };
-  const showWorkspaceUpdate = () => {
-    if (data.engine.installing || (data.engine.target && (data.engine.prompt || !data.update.target))) showUpdate(true);
-    else if (data.update.target || data.update.installing) showUpdate(false);
-    else navigate("settings", "about");
-  };
   const notices = <>
     {loadError && <Notice title="연결 상태를 새로 고치지 못했습니다" danger>{loadError}</Notice>}
     {data.error && <div className="dismissible-alert"><Notice title="작업을 확인해 주세요" danger>{data.error}</Notice>
@@ -170,10 +200,10 @@ function App() {
   </>;
 
   return <>
-    {welcome ? <Welcome data={data} act={act} chooseRole={(host) => void chooseRole(host)} showUpdate={() => showUpdate(false)}
+    {welcome ? <Welcome data={data} act={act} chooseRole={(host) => void chooseRole(host)} showUpdate={showFarmUpdate}
       changeTheme={changeTheme} control={control} maximized={maximized} /> :
       <WorkspaceShell data={data} page={page} navigate={navigate} homeAction={homeAction}
-        showUpdate={showWorkspaceUpdate} changeTheme={changeTheme} control={control} maximized={maximized} focus={focus}>
+        showFarmUpdate={showFarmUpdate} changeTheme={changeTheme} control={control} maximized={maximized} focus={focus}>
         {page === "queue" && data.settings.host ? <div className="reference-queue-view">
           <div className="reference-notices">{notices}</div>
           <ServerQueue data={data} act={act} navigate={navigate} openTask={setTaskId} openWorker={setWorkerId} />
@@ -185,7 +215,7 @@ function App() {
             {page === "nodes" && <NodesPage data={data} act={act} openWorker={setWorkerId} />}
             {page === "logs" && <LogsPage data={data} act={act} />}
             {page === "settings" && <SettingsPage data={data} act={act} showUpdate={showUpdate}
-              navigate={navigate} tab={settingsTab} changeTab={setSettingsTab} />}
+              navigate={navigate} tab={settingsTab} changeTab={setSettingsTab} changeTheme={changeTheme} />}
           </div>
           {(!data.settings.host || data.locked) && <SessionBar data={data} navigate={navigate} act={act} closing={closing} />}
         </div>}
@@ -199,7 +229,7 @@ function App() {
     {inspect && !data.import && !updateOpen && <InspectDialog key={`${data.inspect.start}-${data.inspect.end}`} data={data} act={act} close={() => setInspect(false)} />}
     {updateOpen && !closeRequested && <UpdateDialog data={data} act={act} engine={updateOpen === "engine"} close={closeUpdate} />}
     {closeRequested && <Dialog title="Render Farm을 종료할까요?" onClose={() => setCloseRequested(false)}
-      footer={<><Button variant="secondary" onPress={() => setCloseRequested(false)}>계속 사용</Button>
+      footer={(dismiss) => <><Button variant="secondary" onPress={dismiss}>계속 사용</Button>
         <Button variant="danger" onPress={() => { setClosing(true); setCloseRequested(false); void act({ action: "close_when_idle" }); }}>작업 정리 후 종료</Button></>}>
       <p>연결을 닫고 진행 중인 구간, 출력 또는 설치가 정리되면 앱을 종료합니다.</p>
     </Dialog>}
@@ -237,4 +267,5 @@ function SessionBar({ data, act, navigate, closing }: { data: Snapshot; act: Act
 }
 
 const root = document.getElementById("root");
+document.documentElement.style.setProperty("--window-radius", `${cornerRadius}px`);
 if (root) createRoot(root).render(<App />);

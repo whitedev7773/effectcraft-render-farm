@@ -2,7 +2,7 @@ import {
   Alert, Button, Card, Chip, EmptyState, Input, Label, ListBox, Modal, NumberField, ProgressBar, SearchField,
   Select, Switch, Table, TextField, Tooltip,
 } from "@heroui/react";
-import { useState, type ComponentProps, type ReactNode } from "react";
+import { useEffect, useEffectEvent, useRef, useState, type ComponentProps, type ReactNode, type Ref } from "react";
 import { Minus, Plus, type LucideIcon } from "lucide-react";
 import { count, type Preview, type Task } from "./api";
 import emptyFrame from "../../assets/ui/figma/status-empty-broadcast.svg";
@@ -87,14 +87,14 @@ export function Search({ label, value, onChange }: { label: string; value: strin
   </SearchField>;
 }
 
-export function Choice({ label, value, options, onChange, disabled, compact = false }: {
+export function Choice({ label, value, options, onChange, disabled, compact = false, triggerRef }: {
   label: string; value: string | null; options: { value: string; label: string }[];
-  onChange: (value: string) => void; disabled?: boolean; compact?: boolean;
+  onChange: (value: string) => void; disabled?: boolean; compact?: boolean; triggerRef?: Ref<HTMLButtonElement>;
 }) {
   return <Select aria-label={label} value={value} onChange={(key) => { if (key !== null) onChange(String(key)); }}
     isDisabled={disabled} placeholder="선택하세요" className={compact ? "compact-choice" : "farm-field"}>
     {!compact && <Label>{label}</Label>}
-    <Select.Trigger><Select.Value /><Select.Indicator /></Select.Trigger>
+    <Select.Trigger ref={triggerRef}><Select.Value /><Select.Indicator /></Select.Trigger>
     <Select.Popover>
       <ListBox>{options.map((option) => <ListBox.Item key={option.value} id={option.value} textValue={option.label}>
         {option.label}<ListBox.ItemIndicator />
@@ -142,10 +142,30 @@ export function Notice({ title, children, danger = false }: { title: string; chi
 }
 
 export function Dialog({ title, description, children, footer, onClose, wide, locked }: {
-  title: string; description?: string; children: ReactNode; footer?: ReactNode; onClose: () => void; wide?: boolean; locked?: boolean;
+  title: string; description?: string; children: ReactNode; footer?: ReactNode | ((dismiss: () => void) => ReactNode);
+  onClose: () => void | Promise<void>; wide?: boolean; locked?: boolean;
 }) {
+  const [dismissing, setDismissing] = useState(false);
+  const backdrop = useRef<HTMLDivElement>(null);
+  const dismiss = () => { if (!locked) setDismissing(true); };
+  const finishDismissal = useEffectEvent(async () => {
+    try { if (!locked) await onClose(); }
+    finally { setDismissing(false); }
+  });
+  useEffect(() => {
+    if (!dismissing) return;
+    let mounted = true;
+    const animations = backdrop.current?.getAnimations() ?? [];
+    void Promise.allSettled(animations.map((animation) => animation.finished)).then(() => {
+      if (mounted) void finishDismissal();
+    });
+    return () => { mounted = false; };
+  }, [dismissing]);
+
   return <Modal>
-    <Modal.Backdrop isOpen isDismissable={!locked} isKeyboardDismissDisabled={locked} onOpenChange={(open) => { if (!open && !locked) onClose(); }}>
+    <Modal.Backdrop ref={backdrop} isOpen isDismissable={!locked && !dismissing} isKeyboardDismissDisabled={locked || dismissing}
+      data-dismissing={dismissing || undefined}
+      onOpenChange={(open) => { if (!open) dismiss(); }}>
       <Modal.Container placement="center" size={wide ? "lg" : "md"} scroll="inside">
         <Modal.Dialog className="farm-dialog">
           <Modal.Header>
@@ -154,7 +174,7 @@ export function Dialog({ title, description, children, footer, onClose, wide, lo
             {!locked && <Modal.CloseTrigger aria-label="닫기" className="farm-dialog-close"><Graphic src={closeIcon} /></Modal.CloseTrigger>}
           </Modal.Header>
           <Modal.Body>{children}</Modal.Body>
-          {footer && <Modal.Footer>{footer}</Modal.Footer>}
+          {footer && <Modal.Footer>{typeof footer === "function" ? footer(dismiss) : footer}</Modal.Footer>}
         </Modal.Dialog>
       </Modal.Container>
     </Modal.Backdrop>
